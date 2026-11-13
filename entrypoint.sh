@@ -45,5 +45,5 @@ echo "Starting server with Granian..."
 # socket is dual-stack (IPV6_V6ONLY defaults to 0), so IPv4 traffic from the public
 # edge is still accepted; that dual behaviour is the thing to re-check if the public
 # site ever stops responding after a base-image change.
-uv run granian gotta_bike_platform.wsgi:application --interface wsgi --host :: --port "${PORT:-8000}" \
-  --workers "${WEB_WORKERS:-2}" --blocking-threads "${WEB_BLOCKING_THREADS:-2}"
+uv run granian gotta_bike_platform.wsgi:application --interface wsgi --host 0.0.0.0 --port "${PORT:-8000}" \
+  --workers "${WEB_WORKERS:-1}" --blocking-threads "${WEB_BLOCKING_THREADS:-1}"
