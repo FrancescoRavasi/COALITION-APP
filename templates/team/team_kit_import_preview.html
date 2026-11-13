@@ -1,0 +1,244 @@
+{% extends "base.html" %}
+
+{% block title %}Import preview - Team Kit - {{ config.TEAM_NAME }}{% endblock %}
+
+{% block content %}
+{% comment %}
+  The preview of a team kit CSV import (apps.team.kit_views.team_kit_import). Nothing has been
+  written when this renders. The confirm button posts back the preview's token, so it can only
+  apply the file shown here -- see team_kit_import_confirm.
+{% endcomment %}
+<div class="max-w-4xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body gap-4">
+      <div>
+        <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50">Team Kit import</p>
+        <h2 class="card-title text-2xl">Check the changes before applying them</h2>
+        <p class="text-sm text-base-content/70 font-mono break-all mt-1">{{ filename }}</p>
+      </div>
+
+      <div class="flex flex-wrap gap-2">
+        <span class="badge badge-primary">
+          {{ plan.changes|length }} change{{ plan.changes|length|pluralize }}{% if plan.changes %} for {{ plan.member_count }} member{{ plan.member_count|pluralize }}{% endif %}
+        </span>
+        <span class="badge badge-ghost">{{ plan.unchanged }} already match{{ plan.unchanged|pluralize:"es," }}</span>
+        {% if plan.conflicts %}
+        <span class="badge badge-warning">{{ plan.conflicts|length }} conflict{{ plan.conflicts|length|pluralize }}</span>
+        {% endif %}
+        {% if plan.refused_row_count %}
+        <span class="badge badge-error">{{ plan.refused_row_count }} row{{ plan.refused_row_count|pluralize }} not used</span>
+        {% endif %}
+      </div>
+
+      {% if plan.kept_newer %}
+      <p class="text-sm">
+        {{ plan.kept_newer }} status{{ plan.kept_newer|pluralize:"es" }} changed after this file was exported, in
+        cells you did not edit. {{ plan.kept_newer|pluralize:"It stays,They stay" }} as {{ plan.kept_newer|pluralize:"it is,they are" }} now.
+      </p>
+      {% endif %}
+
+      <p class="text-sm">
+        Kits in this file:
+        {% for kit in plan.kits %}<span class="font-semibold">{{ kit.name }}</span>{% if not forloop.last %}, {% endif %}{% endfor %}.
+      </p>
+
+      {% if plan.unknown_kit_columns %}
+      <div class="alert alert-warning">
+        <span>
+          No kit has these slugs, so these columns were not read:
+          {% for name in plan.unknown_kit_columns %}<code>{{ name }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.
+        </span>
+      </div>
+      {% endif %}
+
+      {% if plan.ignored_columns %}
+      <div class="alert">
+        <span>
+          Not used:
+          {% for name in plan.ignored_columns %}<code>{{ name }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}.
+          Only <code>user_id</code>, <code>zwid</code> and <code>kit:</code> columns are read.
+        </span>
+      </div>
+      {% endif %}
+
+      {% if plan.errors %}
+      <div class="card bg-base-300 p-4">
+        <h3 class="font-semibold mb-2">Rows not used</h3>
+        <ul class="list-disc list-inside text-sm space-y-1">
+          {% for error in shown_errors %}
+          <li><span class="font-mono">Row {{ error.row }}</span>: {{ error.message }}</li>
+          {% endfor %}
+        </ul>
+        {% if more_errors %}
+        <p class="text-sm text-base-content/70 mt-2">&hellip;and {{ more_errors }} more.</p>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      {% if plan.conflicts %}
+      <div class="card bg-base-300 p-4">
+        <h3 class="font-semibold">Changed since your export &mdash; not applied</h3>
+        <p class="text-sm text-base-content/70 mt-1 mb-3">
+          You edited these, but the status has also changed since the file was exported, so it is
+          not clear which should win. To apply yours anyway, clear that row&rsquo;s
+          <code>exported_statuses</code> cell and upload again.
+        </p>
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th>Member</th>
+                <th>Kit</th>
+                <th>When exported</th>
+                <th>Now</th>
+                <th>Your file</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for conflict in plan.conflicts %}
+              <tr>
+                <td>
+                  <a href="{% url 'accounts:public_profile' conflict.member.pk %}" class="link link-hover">{{ conflict.member_name }}</a>
+                </td>
+                <td>{{ conflict.kit.name }}</td>
+                <td class="whitespace-nowrap">{{ conflict.labels.exported }}</td>
+                <td class="whitespace-nowrap font-semibold">{{ conflict.labels.now }}</td>
+                <td class="whitespace-nowrap">{{ conflict.labels.wanted }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if plan.changes %}
+      {% if plan.held_back_count %}
+      <p class="text-sm">
+        {{ plan.held_back_count }} row{{ plan.held_back_count|pluralize }} would change a rider who already has
+        the kit. {{ plan.held_back_count|pluralize:"It is,They are" }} not ticked &mdash; tick any you do mean to change.
+      </p>
+      {% endif %}
+
+      {% comment %}
+        Every change is ticked to be applied except one that would move a rider who already has the
+        kit (ImportChange.selected_by_default).
+
+        The selection posts as ONE field, "apply" -- the ticked rows' positions in this list (the
+        list held in the session), comma-separated -- which the script below keeps in step with the
+        boxes. The boxes themselves have no name: one field per row would hit Django's 1000-field
+        limit on a large import and fail with a bare 400. Without JavaScript the boxes stay
+        disabled, showing exactly the default selection the hidden field already holds.
+
+        autocomplete="off" stops the browser restoring ticks on Back after the script has run,
+        which would leave the count and the posted selection disagreeing with the boxes.
+      {% endcomment %}
+      <form method="post" action="{% url 'team_kit_import_confirm' %}" id="kit-import-confirm" class="space-y-3">
+        {% csrf_token %}
+        <input type="hidden" name="token" value="{{ token }}">
+        <input type="hidden" name="apply" id="kit-import-apply-list" value="{{ plan.default_selection }}" autocomplete="off">
+        <div class="overflow-x-auto">
+          <table class="table table-sm">
+            <thead>
+              <tr>
+                <th class="w-8">
+                  <input type="checkbox" id="kit-import-select-all" class="checkbox checkbox-sm" aria-label="Tick or untick every row" autocomplete="off" hidden>
+                </th>
+                <th>Member</th>
+                <th>Zwift ID</th>
+                <th>Kit</th>
+                <th>Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for change in plan.changes %}
+              <tr>
+                <td>
+                  <input type="checkbox" data-position="{{ forloop.counter0 }}" class="checkbox checkbox-sm checkbox-primary"
+                         aria-label="Apply {{ change.member_name }}, {{ change.kit.name }}: {{ change.old_label }} to {{ change.new_label }}"
+                         autocomplete="off" disabled {% if change.selected_by_default %}checked{% endif %}>
+                </td>
+                <td>
+                  <a href="{% url 'accounts:public_profile' change.member.pk %}" class="link link-hover">{{ change.member_name }}</a>
+                </td>
+                <td class="font-mono">{{ change.member.zwid|default:"—" }}</td>
+                <td>{{ change.kit.name }}</td>
+                <td class="whitespace-nowrap">
+                  <span class="badge {{ change.old_badge }} badge-sm">{{ change.old_label }}</span>
+                  <span aria-hidden="true" class="mx-1">&rarr;</span><span class="sr-only">to</span>
+                  <span class="badge {{ change.new_badge }} badge-sm">{{ change.new_label }}</span>
+                  {% if not change.selected_by_default %}
+                  <span class="block text-xs text-base-content/60 mt-1">Already has the kit &mdash; tick to change it anyway</span>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-2">
+          <button type="submit" id="kit-import-apply" class="btn btn-primary btn-sm">
+            Apply selected (<span id="kit-import-selected-count">{{ plan.default_selected_count }}</span>)
+          </button>
+          <a href="{% url 'config_section_page' 'team_kit' %}" class="btn btn-ghost btn-sm">Cancel</a>
+        </div>
+      </form>
+      <p class="text-xs text-base-content/60">
+        Only ticked rows change. If a status moves between now and applying &mdash; a rider
+        updating their own, say &mdash; it is skipped rather than overwritten.
+      </p>
+      {% else %}
+      <div class="alert">
+        <span>
+          Nothing to apply{% if plan.unchanged and not plan.errors and not plan.conflicts and not plan.kept_newer %} &mdash; every status in the file already matches{% endif %}.
+        </span>
+      </div>
+      <div>
+        <a href="{% url 'config_section_page' 'team_kit' %}" class="btn btn-sm">Back to Team Kit</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{% if plan.changes %}
+<script>
+// Makes the row boxes live: writes the ticked positions into the one "apply" field the form
+// posts, keeps the Apply button's count and state honest, and offers tick/untick-all. Without
+// JavaScript the boxes stay disabled and the field keeps the default selection it was rendered
+// with, so what is shown is always what is posted.
+(function () {
+  var form = document.getElementById('kit-import-confirm');
+  if (!form) return;
+  var boxes = Array.prototype.slice.call(form.querySelectorAll('input[data-position]'));
+  var field = document.getElementById('kit-import-apply-list');
+  var all = document.getElementById('kit-import-select-all');
+  var count = document.getElementById('kit-import-selected-count');
+  var apply = document.getElementById('kit-import-apply');
+  function update() {
+    var ticked = boxes.filter(function (box) { return box.checked; });
+    field.value = ticked.map(function (box) { return box.getAttribute('data-position'); }).join(',');
+    count.textContent = ticked.length;
+    apply.disabled = ticked.length === 0;
+    all.checked = ticked.length === boxes.length;
+    all.indeterminate = ticked.length > 0 && ticked.length < boxes.length;
+  }
+  boxes.forEach(function (box) {
+    box.disabled = false;
+    box.addEventListener('change', update);
+  });
+  all.hidden = false;
+  all.addEventListener('change', function () {
+    boxes.forEach(function (box) { box.checked = all.checked; });
+    update();
+  });
+  update();
+  // A page shown again from the back/forward cache keeps whatever the boxes held; re-read them.
+  window.addEventListener('pageshow', function () { setTimeout(update, 0); });
+})();
+</script>
+{% endif %}
+{% endblock %}

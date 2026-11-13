@@ -1,0 +1,107 @@
+<script>
+// Turn any <select class="filter-select"> into a searchable dropdown:
+// collapsed by default (input shows the current selection); on focus it opens the
+// full list and filters as you type. Progressive enhancement over the native
+// <select>, which still holds and submits the value. Shared by the squad and event forms.
+(function () {
+  function enhance(select) {
+    if (select.disabled || select.dataset.filterReady) return;
+    select.dataset.filterReady = '1';
+
+    var wrap = document.createElement('div');
+    wrap.className = 'relative';
+    select.parentNode.insertBefore(wrap, select);
+    wrap.appendChild(select);
+    select.style.display = 'none';
+
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Type to filter…';
+    // Carry the select's size modifier across, or the replacement input sits taller than
+    // the controls beside it on forms built with select-sm / select-xs.
+    var size = ['xs', 'sm', 'md', 'lg'].find(function (s) {
+      return select.classList.contains('select-' + s);
+    });
+    input.className = 'input input-bordered w-full' + (size ? ' input-' + size : '');
+    wrap.appendChild(input);
+
+    var list = document.createElement('div');
+    list.className = 'absolute z-20 left-0 right-0 mt-1 bg-base-100 border border-base-300 '
+      + 'rounded-box max-h-60 overflow-y-auto shadow hidden';
+    wrap.appendChild(list);
+
+    var empty = document.createElement('div');
+    empty.className = 'px-3 py-2 text-sm text-base-content/50';
+    empty.textContent = 'No matches';
+    empty.style.display = 'none';
+    list.appendChild(empty);
+
+    // Each option's value and text stay here, in the script, not in data-* attributes on
+    // the rows: Datastar runs on every page and evaluates any data-text attribute as an
+    // expression, so an option called "— No route —" became a syntax error in the console.
+    var rows = Array.from(select.options).map(function (opt) {
+      var row = document.createElement('div');
+      row.className = 'px-3 py-1.5 cursor-pointer hover:bg-base-200 text-sm';
+      row.textContent = opt.textContent;
+      row.addEventListener('mousedown', function (e) {
+        e.preventDefault();  // keep focus so blur doesn't fire before the click
+        select.value = opt.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        input.value = currentLabel();
+        mark();
+        close();
+      });
+      list.appendChild(row);
+      return { el: row, value: opt.value, text: opt.textContent, search: opt.textContent.toLowerCase() };
+    });
+
+    function currentLabel() {
+      var o = select.options[select.selectedIndex];
+      return (o && o.value && o.value !== '0') ? o.textContent : '';
+    }
+
+    function mark() {
+      rows.forEach(function (row) {
+        var sel = row.value === select.value;
+        row.el.classList.toggle('bg-base-300', sel);
+        row.el.classList.toggle('font-semibold', sel);
+        row.el.textContent = (sel ? '✓ ' : '') + row.text;
+      });
+    }
+
+    function render(query) {
+      var q = (query || '').trim().toLowerCase();
+      var shown = 0;
+      rows.forEach(function (row) {
+        var match = !q || row.search.indexOf(q) !== -1;
+        row.el.style.display = match ? '' : 'none';
+        if (match) { shown++; }
+      });
+      empty.style.display = shown ? 'none' : '';
+    }
+
+    function open() {
+      render('');
+      list.classList.remove('hidden');
+      var sel = rows.find(function (r) { return r.value === select.value; });
+      if (sel) { sel.el.scrollIntoView({ block: 'nearest' }); }
+    }
+    function close() { list.classList.add('hidden'); }
+
+    input.value = currentLabel();
+    mark();
+
+    input.addEventListener('focus', function () { open(); input.select(); });
+    input.addEventListener('input', function () { list.classList.remove('hidden'); render(input.value); });
+    input.addEventListener('blur', function () {
+      // Delay so a row's mousedown registers first.
+      setTimeout(function () { close(); input.value = currentLabel(); }, 150);
+    });
+  }
+
+  function init() {
+    document.querySelectorAll('select.filter-select').forEach(enhance);
+  }
+  if (document.readyState !== 'loading') { init(); } else { document.addEventListener('DOMContentLoaded', init); }
+})();
+</script>

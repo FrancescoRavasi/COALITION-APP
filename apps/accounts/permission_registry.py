@@ -1,0 +1,181 @@
+"""Central registry of permissions and the views they control.
+
+When adding a new view with permission checks, update this registry.
+This is used to display help tooltips on the permission config page.
+"""
+
+from apps.accounts.models import Permissions
+
+PERMISSION_REGISTRY: dict[str, dict] = {
+    Permissions.APP_ADMIN: {
+        "name": "App Admin",
+        "description": "Full application administration access",
+        "views": [
+            "/site/config/ - Site configuration settings",
+            "/site/config/compliance/ - Compliance tools: delete an account on request, block logins by Discord ID",
+            "/site/config/team_kit/ - Team kits: add kits, choose the current one, see who needs it",
+            "/site/config/team-kit/export/ - Team kits: download the member list and kit statuses as CSV",
+            "/site/config/team-kit/import/ - Team kits: set kit statuses from a CSV, after a preview",
+        ],
+    },
+    Permissions.TEAM_CAPTAIN: {
+        "name": "Team Captain",
+        "description": "Team captain leadership role",
+        "views": [
+            "(Currently no view restrictions - used for role identification)",
+        ],
+    },
+    Permissions.VICE_CAPTAIN: {
+        "name": "Vice Captain",
+        "description": "Vice captain leadership role",
+        "views": [
+            "(Currently no view restrictions - used for role identification)",
+        ],
+    },
+    Permissions.LINK_ADMIN: {
+        "name": "Link Admin",
+        "description": "Manage team links",
+        "views": [
+            "(Currently no view restrictions - used for role identification)",
+        ],
+    },
+    Permissions.MEMBERSHIP_ADMIN: {
+        "name": "Membership Admin",
+        "description": "Review and manage membership applications",
+        "views": [
+            "/team/applications/ - Membership application list",
+            "/team/applications/{uuid}/ - Individual application review",
+            "/team/discord-review/ - Discord guild member review",
+            "/team/zwift-connections/ - Zwift account connections (Zwift Link) list",
+            "/site/config/team_kit/ - Team kits: add kits, choose the current one, see who needs it",
+            "/site/config/team-kit/export/ - Team kits: download the member list and kit statuses as CSV",
+            "/site/config/team-kit/import/ - Team kits: set kit statuses from a CSV, after a preview",
+        ],
+    },
+    Permissions.RACING_ADMIN: {
+        "name": "Racing Admin",
+        "description": "Manage racing-related settings",
+        "views": [
+            "/routes/check-updates/ - Re-sync the Zwift Speed Lab route/segment dataset",
+        ],
+    },
+    Permissions.TEAM_MEMBER: {
+        "name": "Team Member",
+        "description": "Required for most pages - basic team access",
+        "views": [
+            "/team/roster/ - Team roster (cards)",
+            "/team/roster/table/ - Team roster, table view with the distribution charts",
+            "/team/links/ - Team links",
+            "/team/links/submit/ - Submit new team link",
+            "/team/links/{id}/edit/ - Edit team link",
+            "/team/verification/ - Verification records",
+            "/team/verification/squad-expiring/ - Squad-mates with expiring verification (captain banner)",
+            "/team/verification/{id}/ - Verification detail",
+            "/team/team-feed/ - Team feed",
+            "/user/profile/{id}/ - View teammate profiles",
+            "/user/profile/z/{zwid}/ - Find a teammate by Zwift id",
+            "/user/profile/{id}/refresh-data/ - Ask for a teammate's racing data to be re-checked",
+            "/zp/results/ - Team-wide ZwiftPower race results",
+            "/zp/results/{zid}/ - Per-event ZP results leaderboard",
+            "/events/squad-invite/{token}/ - Accept squad invite link",
+            "/ttt/ - TTT planner (list, create, edit plans)",
+            "/ttt/help/ - How the TTT planner works (model, numbers, buttons)",
+            "/ttt/{id}/ - View/edit a TTT plan (anyone not its creator or squad confirms before editing)",
+        ],
+    },
+    Permissions.RACE_READY: {
+        "name": "Race Ready",
+        "description": "Eligible to participate in official races",
+        "views": [
+            "(Status indicator - no view restrictions)",
+        ],
+    },
+    Permissions.APPROVE_VERIFICATION: {
+        "name": "Approve Verification",
+        "description": "Can approve or reject verification records",
+        "views": [
+            "/team/verification/{id}/ - Approve/reject verification submissions",
+        ],
+    },
+    Permissions.DATA_CONNECTION: {
+        "name": "Data Connection",
+        "description": "Access Google Sheets data exports",
+        "views": [
+            "/data-connections/ - Data connections list",
+            "/data-connections/create/ - Create new connection",
+            "/data-connections/{id}/edit/ - Edit connection",
+            "/data-connections/{id}/delete/ - Delete connection",
+            "/data-connections/{id}/sync/ - Sync data to sheet",
+        ],
+    },
+    Permissions.PAGES_ADMIN: {
+        "name": "Pages Admin",
+        "description": "Create, edit, and delete CMS pages",
+        "views": [
+            "/page/manage/ - Page list and management",
+            "/page/create/ - Create new page",
+            "/page/{id}/edit/ - Edit page",
+            "/page/{id}/delete/ - Delete page",
+        ],
+    },
+    Permissions.PERFORMANCE_VERIFICATION_TEAM: {
+        "name": "Performance Verification Team",
+        "description": "Team members responsible for performance verification reviews",
+        "views": [
+            "/team/performance-review/ - Performance review dashboard",
+            "/team/verification/{id}/ - Change status of any verification record",
+            "/team/verification/{id}/ - Delete any verification record",
+        ],
+    },
+    Permissions.EVENT_ADMIN: {
+        "name": "Event Admin",
+        "description": "Create, edit, and manage events, squads, and signups",
+        "views": [
+            "/events/create/ - Create new event",
+            "/events/{id}/edit/ - Edit event",
+            "/events/{id}/stages/ - A race series' stages",
+            "/events/{id}/stages/{stage_id}/courses/ - A stage's course options",
+            "/events/{id}/delete/ - Delete event",
+            "/events/{id}/squads/add/ - Create squad",
+            "/events/{id}/squads/{squad_id}/edit/ - Edit squad",
+            "/events/{id}/squads/{squad_id}/delete/ - Delete squad",
+            "/events/{id}/squads/assign/ - Assign users to squads",
+            "/events/{id}/assign-riders/ - Dedicated squad assignment page",
+            "/events/{id}/signup-statuses/ - Manage an event's own list of signup statuses",
+            "/events/{id}/signups/{signup_id}/status/ - Set a signup's status (also head captain / coordinators)",
+            "/events/{id}/squads/{squad_id}/regenerate-token/ - Generate/regenerate squad invite link",
+            "/events/{id}/availability/ - Manage availability",
+            "/events/{id}/squads/{squad_id}/availability/{grid_id}/repost/ - Re-post an availability sheet to Discord",
+        ],
+    },
+    Permissions.ASSIGN_ROLES: {
+        "name": "Assign Roles",
+        "description": "Manage Discord role assignments for event and squad members",
+        "views": [
+            "/events/{id}/discord-roles/ - Discord Roles page for event signups (also head captain / coordinators)",
+            "/events/{id}/signups/export/ - Download event signups as CSV (head captain / coordinators only)",
+            "/tickets/ - Every ticket in the queue; without it a member sees only their own",
+            "/events/{id}/toggle-event-role/{user_id}/ - Toggle event Discord role",
+            "/events/{id}/toggle-coordinator-role/{user_id}/{role_id}/ - Toggle a coordinator Discord role",
+            "/events/{id}/squads/{squad_id}/toggle-role/{user_id}/ - Toggle squad Discord role",
+        ],
+    },
+}
+
+
+def get_permission_help(constance_key: str) -> dict | None:
+    """Get permission help data from a Constance key like PERM_APP_ADMIN_ROLES.
+
+    Args:
+        constance_key: The Constance setting key (e.g., "PERM_APP_ADMIN_ROLES")
+
+    Returns:
+        Dict with name, description, views or None if not found.
+
+    """
+    # Convert PERM_APP_ADMIN_ROLES -> app_admin
+    if not constance_key.startswith("PERM_") or not constance_key.endswith("_ROLES"):
+        return None
+
+    permission_name = constance_key[5:-6].lower()  # Strip PERM_ and _ROLES
+    return PERMISSION_REGISTRY.get(permission_name)

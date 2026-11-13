@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}{{ current_section.name }} - Configuration - {{ config.TEAM_NAME }}{% endblock %}
+
+{% block extra_css %}
+<!-- Tom Select CSS -->
+<link href="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/css/tom-select.css" rel="stylesheet">
+<!-- Marked.js for client-side markdown preview -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+    /* Tom Select customization for DaisyUI */
+    .ts-wrapper {
+        max-width: 100%;
+    }
+    .ts-wrapper .ts-control {
+        background-color: #1d232a !important;
+        border-color: rgba(255, 255, 255, 0.2) !important;
+        border-radius: var(--rounded-btn, 0.5rem);
+        padding: 0.5rem 1rem;
+        min-height: 3rem;
+        color: #a6adba !important;
+    }
+    .ts-wrapper .ts-control > input,
+    .ts-wrapper .ts-control > input[type="text"] {
+        color: #a6adba !important;
+        background: transparent !important;
+    }
+    .ts-wrapper .ts-control > input::placeholder {
+        color: #6b7280 !important;
+    }
+    .ts-wrapper .ts-control .item span {
+        color: #a6adba !important;
+    }
+    /* Tom Select dropdown - use inherit to get background from page context */
+    .ts-dropdown {
+        background-color: #1d232a !important; /* DaisyUI dark theme base-100 fallback */
+        border: 1px solid rgba(255, 255, 255, 0.1) !important;
+        border-radius: 0.5rem !important;
+        z-index: 9999 !important;
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5) !important;
+        position: absolute !important;
+    }
+    .ts-dropdown-content {
+        background-color: #1d232a !important;
+    }
+    /* Ensure dropdown wrapper has proper z-index and positioning */
+    .ts-wrapper.dropdown-active {
+        z-index: 9999 !important;
+        position: relative !important;
+    }
+    .ts-dropdown .option,
+    .ts-dropdown-content .option {
+        display: flex !important;
+        align-items: center !important;
+        gap: 8px !important;
+        padding: 0.5rem 1rem !important;
+        background-color: #1d232a !important;
+        color: #a6adba !important;
+    }
+    .ts-dropdown .option:hover,
+    .ts-dropdown-content .option:hover {
+        background-color: #2a323c !important;
+    }
+    .ts-dropdown .option.active,
+    .ts-dropdown-content .option.active {
+        background-color: #3d4451 !important;
+    }
+    .role-color-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+    .role-id {
+        font-size: 11px;
+        color: oklch(var(--bc) / 0.5);
+        font-family: monospace;
+    }
+    .ts-wrapper .item {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        border-radius: 0.25rem;
+        padding: 2px 8px;
+        margin: 2px;
+    }
+    .ts-wrapper .item .role-color-dot {
+        width: 8px;
+        height: 8px;
+    }
+    /* Password toggle button */
+    .password-toggle {
+        position: absolute;
+        right: 0.75rem;
+        top: 50%;
+        transform: translateY(-50%);
+        cursor: pointer;
+        color: oklch(var(--bc) / 0.5);
+    }
+    .password-toggle:hover {
+        color: oklch(var(--bc) / 0.8);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+    <div class="card bg-base-200 shadow-xl">
+        <div class="card-body">
+            <h2 class="card-title text-2xl mb-4">{{ current_section.name }}</h2>
+
+            {% if is_site_images %}
+            <!-- Site Images Form -->
+            <div id="site-images-form">
+                {% include "accounts/partials/config_site_images.html" %}
+            </div>
+            {% elif is_compliance %}
+            <!-- Compliance -->
+              {% include "accounts/partials/config_compliance.html" %}
+
+            {% elif is_team_kit %}
+                {% include "accounts/partials/config_team_kit.html" %}
+            {% elif is_background_tasks %}
+            <!-- Background Tasks -->
+            <div id="tasks-container">
+                {% include "accounts/partials/config_tasks.html" %}
+            </div>
+            {% else %}
+            <!-- Section Form -->
+            <div id="section-{{ current_section.key }}">
+                <div class="section-content">
+                    {% include "accounts/partials/config_section.html" with section=current_section %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Tom Select JS -->
+<script src="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/js/tom-select.complete.min.js"></script>
+<!-- SortableJS for drag-and-drop -->
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    initTomSelects();
+    initSortableLists();
+});
+
+// Re-initialize after HTMX settles (DOM is fully ready)
+document.body.addEventListener('htmx:afterSettle', function(event) {
+    // Use setTimeout to ensure DOM is fully ready
+    setTimeout(function() {
+        initTomSelects();
+        initSortableLists();
+    }, 10);
+});
+
+// Initialize sortable lists
+function initSortableLists() {
+    document.querySelectorAll('.string-list-items').forEach(function(list) {
+        if (!list.dataset.sortableInit) {
+            new Sortable(list, {
+                animation: 150,
+                handle: '.cursor-move',
+                ghostClass: 'opacity-50'
+            });
+            list.dataset.sortableInit = 'true';
+        }
+    });
+}
+
+// Add new item to string list
+function addStringListItem(button, key) {
+    const container = button.closest('.string-list-container');
+    const itemsContainer = container.querySelector('.string-list-items');
+
+    const newItem = document.createElement('div');
+    newItem.className = 'string-list-item flex items-center gap-2';
+    newItem.innerHTML = `
+        <span class="cursor-move text-base-content/40 hover:text-base-content/70">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8h16M4 16h16" />
+            </svg>
+        </span>
+        <input type="text"
+               name="${key}"
+               value=""
+               class="input input-bordered input-sm flex-1"
+               placeholder="Enter new item...">
+        <button aria-label="Remove this item" type="button" class="btn btn-ghost btn-sm btn-square text-error" onclick="this.closest('.string-list-item').remove()">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+        </button>
+    `;
+
+    itemsContainer.appendChild(newItem);
+
+    // Focus the new input
+    newItem.querySelector('input').focus();
+}
+
+function initTomSelects() {
+    // Tom Select adds 'ts-hidden-accessible' class when initialized
+    const selects = document.querySelectorAll('.role-select:not(.ts-hidden-accessible)');
+    selects.forEach(function(select) {
+        try {
+            new TomSelect(select, {
+                plugins: ['remove_button'],
+                maxOptions: null,
+                closeAfterSelect: false,
+                hideSelected: false,
+                render: {
+                    option: function(data, escape) {
+                        const color = data.color || '#99AAB5';
+                        const parts = data.text.match(/^(.+) \((\d+)\)$/);
+                        const name = parts ? parts[1] : data.text;
+                        const id = parts ? parts[2] : '';
+                        return `<div class="option">
+                            <span class="role-color-dot" style="background-color: ${escape(color)};"></span>
+                            <span class="role-name">${escape(name)}</span>
+                            <span class="role-id">${escape(id)}</span>
+                        </div>`;
+                    },
+                    item: function(data, escape) {
+                        const color = data.color || '#99AAB5';
+                        const parts = data.text.match(/^(.+) \((\d+)\)$/);
+                        const name = parts ? parts[1] : data.text;
+                        return `<div class="item" style="background-color: ${escape(color)}20; border: 1px solid ${escape(color)};">
+                            <span class="role-color-dot" style="background-color: ${escape(color)};"></span>
+                            <span>${escape(name)}</span>
+                        </div>`;
+                    }
+                },
+                onInitialize: function() {
+                    const self = this;
+                    Object.keys(this.options).forEach(function(key) {
+                        const opt = select.querySelector(`option[value="${key}"]`);
+                        if (opt) {
+                            self.options[key].color = opt.dataset.color;
+                        }
+                    });
+                }
+            });
+        } catch (e) {
+            console.error('Error initializing Tom Select:', e, select);
+        }
+    });
+}
+
+// Password visibility toggle
+function togglePassword(inputId) {
+    const input = document.getElementById(inputId);
+    const icon = document.getElementById(inputId + '-icon');
+    if (input.type === 'password') {
+        input.type = 'text';
+        icon.innerHTML = `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />`;
+    } else {
+        input.type = 'password';
+        icon.innerHTML = `<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />`;
+    }
+}
+
+// Textarea markdown preview functions
+function showTextareaPreview(key) {
+    const editDiv = document.getElementById('edit_' + key);
+    const previewDiv = document.getElementById('preview_' + key);
+    const editBtn = document.getElementById('btn_edit_' + key);
+    const previewBtn = document.getElementById('btn_preview_' + key);
+    const textarea = document.getElementById('id_' + key);
+
+    // Hide edit, show preview
+    editDiv.classList.add('hidden');
+    previewDiv.classList.remove('hidden');
+
+    // Update button states
+    editBtn.disabled = false;
+    editBtn.classList.remove('btn-ghost');
+    editBtn.classList.add('btn-outline');
+    previewBtn.disabled = true;
+    previewBtn.classList.remove('btn-outline');
+    previewBtn.classList.add('btn-ghost');
+
+    // Render markdown client-side using marked.js
+    const text = textarea.value;
+
+    if (!text || text.trim() === '') {
+        previewDiv.innerHTML = '<p class="text-base-content/50 italic">No content to preview</p>';
+        return;
+    }
+
+    try {
+        // Configure marked for similar output to server-side
+        marked.setOptions({
+            breaks: true,  // Convert \n to <br> (like nl2br)
+            gfm: true,     // GitHub Flavored Markdown
+        });
+        const html = marked.parse(text);
+        previewDiv.innerHTML = html;
+    } catch (error) {
+        console.error('Markdown preview error:', error);
+        previewDiv.innerHTML = '<p class="text-error">Error rendering preview: ' + error.message + '</p>';
+    }
+}
+
+function showTextareaEdit(key) {
+    const editDiv = document.getElementById('edit_' + key);
+    const previewDiv = document.getElementById('preview_' + key);
+    const editBtn = document.getElementById('btn_edit_' + key);
+    const previewBtn = document.getElementById('btn_preview_' + key);
+
+    // Show edit, hide preview
+    editDiv.classList.remove('hidden');
+    previewDiv.classList.add('hidden');
+
+    // Update button states
+    editBtn.disabled = true;
+    editBtn.classList.remove('btn-outline');
+    editBtn.classList.add('btn-ghost');
+    previewBtn.disabled = false;
+    previewBtn.classList.remove('btn-ghost');
+    previewBtn.classList.add('btn-outline');
+}
+</script>
+{% endblock %}

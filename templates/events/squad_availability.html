@@ -1,0 +1,405 @@
+{% extends "base.html" %}
+
+{% block title %}Manage Availability - {{ squad.name }}{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+  <a href="{% url 'events:squad_manage' event.pk %}" class="btn btn-ghost btn-sm mb-4">&larr; Back to Squads</a>
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <h2 class="card-title text-2xl mb-1">Manage Availability</h2>
+      <p class="text-sm text-base-content/70 mb-4">{{ squad.name }} &mdash; {{ event.title }}</p>
+
+      {% if availability_grids %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Dates</th>
+              <th>Responses</th>
+              <th>Status</th>
+              <th class="text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for grid in availability_grids %}
+            <tr>
+              <td class="font-medium">{{ grid.title }}</td>
+              <td class="text-sm">{{ grid.start_date|date:"M j" }} &mdash; {{ grid.end_date|date:"M j" }}</td>
+              <td class="text-sm">
+                <div class="flex items-center gap-1">
+                  <span>{{ grid.response_count }}</span>
+                  {% if grid.is_published or grid.is_closed %}
+                  <a aria-label="View results for {{ grid.title }}" href="{% url 'events:availability_results' event.pk squad.pk grid.pk %}"
+                     class="link link-secondary"
+                     title="View results">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M3 3v18h18M7 14l3-3 4 4 5-5"/>
+                    </svg>
+                  </a>
+                  {% endif %}
+                </div>
+              </td>
+              <td>
+                {% if grid.is_draft %}
+                <span class="badge badge-ghost badge-sm">Draft</span>
+                {% elif grid.is_published %}
+                <span class="badge badge-success badge-sm">Published</span>
+                {% elif grid.is_closed %}
+                <span class="badge badge-neutral badge-sm">Closed</span>
+                {% endif %}
+              </td>
+              <td class="text-right">
+                {# Actions menu — gear icon opens a dropdown of grid actions. #}
+                <button type="button" class="btn btn-ghost btn-xs btn-circle"
+                        popovertarget="grid-actions-{{ grid.pk }}" style="anchor-name:--gear-grid-{{ grid.pk }}"
+                        aria-label="Actions" title="Actions">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                  </svg>
+                </button>
+                <ul class="dropdown dropdown-end menu menu-sm bg-base-100 rounded-box z-[60] w-44 p-1 shadow border border-base-300 text-left"
+                    popover id="grid-actions-{{ grid.pk }}" style="position-anchor:--gear-grid-{{ grid.pk }}">
+                  {% comment %}
+                  Published sheets are editable too; the builder freezes the shape once
+                  anyone has answered. Only a closed sheet is locked outright.
+                  {% endcomment %}
+                  {% if not grid.is_closed %}
+                  <li><a href="{% if grid.is_series %}{% url 'events:series_sheet' event.pk squad.pk %}{% else %}{% url 'events:availability_edit' event.pk squad.pk grid.pk %}{% endif %}">{% if grid.is_series %}Edit stage times{% else %}Edit{% endif %}</a></li>
+                  {% endif %}
+                  {% if grid.is_draft %}
+                  <li><button type="button" onclick="document.getElementById('publish-modal-{{ grid.pk }}').showModal()">Publish</button></li>
+                  {% elif grid.is_published %}
+                  {% comment %}
+                    Re-post re-sends the publish announcement as a reminder -- same channel,
+                    same role ping, same link. Hidden without a Discord channel because there
+                    is nowhere for it to go, and the failure would only surface as a warning
+                    after the click.
+                  {% endcomment %}
+                  {% if squad.discord_channel_id %}
+                  {% if grid.in_notify_cooldown %}
+                  <li class="menu-disabled"><span title="The squad was notified less than 30 minutes ago">Re-Post to Discord</span></li>
+                  {% else %}
+                  <li><button type="button" onclick="document.getElementById('repost-modal-{{ grid.pk }}').showModal()">Re-Post to Discord</button></li>
+                  {% endif %}
+                  {% endif %}
+                  <li><button type="submit" form="close-grid-{{ grid.pk }}">Close</button></li>
+                  {% endif %}
+                  {% if not grid.is_series %}
+                  <li><button type="button" onclick="document.getElementById('copy-modal-{{ grid.pk }}').showModal()">Copy</button></li>
+                  {% endif %}
+                  <li><button type="submit" form="delete-grid-{{ grid.pk }}" class="text-error">Delete</button></li>
+                </ul>
+
+                {# Hidden forms submitted by the menu items above. #}
+                {% if grid.is_published %}
+                <form id="close-grid-{{ grid.pk }}" method="post" action="{% url 'events:availability_status' event.pk squad.pk grid.pk %}">
+                  {% csrf_token %}
+                  <input type="hidden" name="status" value="closed">
+                </form>
+                {% if squad.discord_channel_id and not grid.in_notify_cooldown %}
+                <dialog id="repost-modal-{{ grid.pk }}" class="modal">
+                  <div class="modal-box">
+                    <h3 class="font-bold text-lg">Re-post "{{ grid.title|default:'Availability Grid' }}"?</h3>
+                    <p class="py-2 text-sm">
+                      Posts a reminder to the squad's Discord channel with a link to this sheet
+                      {% if squad.team_discord_role %}and <strong>@-mentions the squad role</strong>{% endif %},
+                      asking everyone to check their availability is still correct.
+                      Nothing about the sheet or the responses changes.
+                    </p>
+                    {% if grid.last_notified_at %}
+                    <p class="text-xs text-base-content/60">
+                      Squad last notified {{ grid.last_notified_at|timesince }} ago.
+                    </p>
+                    {% endif %}
+                    <div class="modal-action flex flex-wrap gap-2">
+                      <form method="dialog" class="inline">
+                        <button class="btn btn-sm">Cancel</button>
+                      </form>
+                      <form method="post" action="{% url 'events:availability_repost' event.pk squad.pk grid.pk %}" class="inline">
+                        {% csrf_token %}
+                        <button type="submit" class="btn btn-sm btn-primary">Post reminder</button>
+                      </form>
+                    </div>
+                  </div>
+                  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+                </dialog>
+                {% endif %}
+                {% endif %}
+                <form id="delete-grid-{{ grid.pk }}" method="post" action="{% url 'events:availability_delete' event.pk squad.pk grid.pk %}"
+                      onsubmit="return confirm('Delete availability grid &quot;{{ grid.title|escapejs }}&quot;? This will remove the grid and all {{ grid.response_count }} response(s). This cannot be undone.');">
+                  {% csrf_token %}
+                </form>
+
+                {% if grid.is_draft %}
+                <dialog id="publish-modal-{{ grid.pk }}" class="modal">
+                  <div class="modal-box">
+                    <h3 class="font-bold text-lg">Publish "{{ grid.title|default:'Availability Grid' }}"?</h3>
+                    <p class="py-2 text-sm">
+                      Riders will be able to respond once published. You can optionally notify the squad in
+                      Discord with a link to the response page.
+                    </p>
+                    {% if not squad.discord_channel_id %}
+                    <p class="text-xs text-warning">Squad has no Discord channel set — notify option disabled.</p>
+                    {% endif %}
+                    <div class="modal-action flex flex-wrap gap-2">
+                      <form method="dialog" class="inline">
+                        <button class="btn btn-sm">Cancel</button>
+                      </form>
+                      <form method="post" action="{% url 'events:availability_status' event.pk squad.pk grid.pk %}" class="inline">
+                        {% csrf_token %}
+                        <input type="hidden" name="status" value="published">
+                        <button type="submit" class="btn btn-sm">Publish only</button>
+                      </form>
+                      {% if squad.discord_channel_id %}
+                      <form method="post" action="{% url 'events:availability_status' event.pk squad.pk grid.pk %}" class="inline">
+                        {% csrf_token %}
+                        <input type="hidden" name="status" value="published">
+                        <input type="hidden" name="notify" value="1">
+                        <button type="submit" class="btn btn-sm btn-primary">Publish &amp; Notify Squad</button>
+                      </form>
+                      {% endif %}
+                    </div>
+                  </div>
+                  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+                </dialog>
+                {% endif %}
+
+                <dialog id="copy-modal-{{ grid.pk }}" class="modal">
+                  <div class="modal-box">
+                    <h3 class="font-bold text-lg">Copy "{{ grid.title|default:'Availability Grid' }}"</h3>
+                    <p class="py-2 text-sm">
+                      Creates a new <strong>draft</strong> grid with the same times, duration, timezone, and
+                      questions. Blocked cells shift forward by the same number of days as the date change;
+                      cells that fall outside the new range are dropped.
+                    </p>
+                    <p class="text-xs text-base-content/60 mb-3">
+                      Source dates: {{ grid.start_date|date:"M j, Y" }} &mdash; {{ grid.end_date|date:"M j, Y" }}
+                    </p>
+                    <form method="post" action="{% url 'events:availability_copy' event.pk squad.pk grid.pk %}" class="space-y-3">
+                      {% csrf_token %}
+                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="form-control">
+                          <label class="label py-1"><span class="label-text text-xs">New start date</span></label>
+                          <input type="date" name="start_date" required
+                                 value="{{ grid.next_period_start_date|date:'Y-m-d' }}"
+                                 class="input input-bordered input-sm w-full">
+                        </div>
+                        <div class="form-control">
+                          <label class="label py-1"><span class="label-text text-xs">New end date</span></label>
+                          <input type="date" name="end_date" required
+                                 value="{{ grid.next_period_end_date|date:'Y-m-d' }}"
+                                 class="input input-bordered input-sm w-full">
+                        </div>
+                      </div>
+                      <div class="modal-action">
+                        <button type="button" class="btn btn-sm"
+                                onclick="this.closest('dialog').close()">Cancel</button>
+                        <button type="submit" class="btn btn-sm btn-primary">Create Copy</button>
+                      </div>
+                    </form>
+                  </div>
+                  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+                </dialog>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/70">{% if event.is_race_series %}No stage times yet. Set them to ask riders about each stage.{% else %}No availability grids yet.{% endif %}</p>
+      {% endif %}
+
+      {% if not event.is_race_series %}
+      <div class="divider">Templates</div>
+      <p class="text-xs text-base-content/60 mb-2">
+        Reusable starting points for this squad. Build a grid and click <strong>Save as Template</strong> to add one,
+        then <strong>Use</strong> it to spin up a draft for a chosen start date.
+      </p>
+      {% if availability_templates %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Configuration</th>
+              <th class="text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for t in availability_templates %}
+            <tr>
+              <td class="font-medium">
+                {{ t.name }}
+                {% if t.shared %}<span class="badge badge-success badge-sm ml-1">Shared</span>{% endif %}
+              </td>
+              <td class="text-sm text-base-content/70">
+                {{ t.start_time }}&ndash;{{ t.end_time }} {{ t.grid_timezone }} &middot;
+                {{ t.slot_duration }}m slots &middot; {{ t.default_length_days }} day{{ t.default_length_days|pluralize }}
+                {% if t.max_races_question %} &middot; max-races{% endif %}{% if t.rest_days_question %} &middot; rest-days{% endif %}
+              </td>
+              <td class="text-right">
+                {# Actions menu — gear icon opens a dropdown of template actions. #}
+                <button type="button" class="btn btn-ghost btn-xs btn-circle"
+                        popovertarget="template-actions-{{ t.pk }}" style="anchor-name:--gear-tmpl-{{ t.pk }}"
+                        aria-label="Actions" title="Actions">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                  </svg>
+                </button>
+                <ul class="dropdown dropdown-end menu menu-sm bg-base-100 rounded-box z-[60] w-44 p-1 shadow border border-base-300 text-left"
+                    popover id="template-actions-{{ t.pk }}" style="position-anchor:--gear-tmpl-{{ t.pk }}">
+                  <li><button type="button" onclick="document.getElementById('use-template-{{ t.pk }}').showModal()">Use</button></li>
+                  <li><button type="submit" form="share-template-{{ t.pk }}">{% if t.shared %}Stop sharing{% else %}Share within this event{% endif %}</button></li>
+                  <li><button type="submit" form="delete-template-{{ t.pk }}" class="text-error">Delete</button></li>
+                </ul>
+
+                <form id="share-template-{{ t.pk }}" method="post" action="{% url 'events:availability_template_share' event.pk squad.pk t.pk %}">
+                  {% csrf_token %}
+                </form>
+
+                <form id="delete-template-{{ t.pk }}" method="post" action="{% url 'events:availability_template_delete' event.pk squad.pk t.pk %}"
+                      onsubmit="return confirm('Delete template &quot;{{ t.name|escapejs }}&quot;? This cannot be undone.');">
+                  {% csrf_token %}
+                </form>
+
+                <dialog id="use-template-{{ t.pk }}" class="modal">
+                  <div class="modal-box">
+                    <h3 class="font-bold text-lg">Use template "{{ t.name }}"</h3>
+                    <p class="py-2 text-sm">
+                      Creates a new <strong>draft</strong> grid spanning
+                      {{ t.default_length_days }} day{{ t.default_length_days|pluralize }} from the start date below,
+                      using {{ t.start_time }}&ndash;{{ t.end_time }} {{ t.grid_timezone }}, {{ t.slot_duration }}-minute slots.
+                    </p>
+                    <form method="post" action="{% url 'events:availability_template_apply' event.pk squad.pk t.pk %}" class="space-y-3">
+                      {% csrf_token %}
+                      <div class="form-control">
+                        <label class="label py-1"><span class="label-text text-xs">Start date</span></label>
+                        <input type="date" name="start_date" required value="{{ today }}"
+                               class="input input-bordered input-sm w-full">
+                      </div>
+                      <div class="modal-action">
+                        <button type="button" class="btn btn-sm" onclick="this.closest('dialog').close()">Cancel</button>
+                        <button type="submit" class="btn btn-sm btn-primary">Create Draft</button>
+                      </div>
+                    </form>
+                  </div>
+                  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+                </dialog>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/50">No templates yet.</p>
+      {% endif %}
+
+      {% if shared_templates %}
+      <h3 class="font-semibold text-sm mt-4 mb-1">Shared templates</h3>
+      <p class="text-xs text-base-content/60 mb-2">
+        Templates other squads in this event have shared. They carry the times and timezone they were
+        built with &mdash; check both against your own squad before publishing.
+      </p>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <tbody>
+            {% for t in shared_templates %}
+            <tr>
+              <td class="font-medium">
+                {{ t.name }}
+                <span class="badge badge-ghost badge-sm ml-1">{{ t.squad.name }}</span>
+              </td>
+              <td class="text-sm text-base-content/70">
+                {{ t.start_time }}&ndash;{{ t.end_time }} {{ t.grid_timezone }} &middot;
+                {{ t.slot_duration }}m slots &middot; {{ t.default_length_days }} day{{ t.default_length_days|pluralize }}
+                {% if t.max_races_question %} &middot; max-races{% endif %}{% if t.rest_days_question %} &middot; rest-days{% endif %}
+              </td>
+              <td class="text-right">
+                <button type="button" class="btn btn-ghost btn-xs"
+                        onclick="document.getElementById('use-shared-{{ t.pk }}').showModal()">Use</button>
+
+                <dialog id="use-shared-{{ t.pk }}" class="modal">
+                  <div class="modal-box">
+                    <h3 class="font-bold text-lg">Use "{{ t.name }}"</h3>
+                    <p class="text-sm text-base-content/60 mb-2">Shared by {{ t.squad.name }}</p>
+                    {# A borrowed template keeps the other squad's clock. #}
+                    <div role="alert" class="alert alert-warning text-sm mb-3">
+                      <span>
+                        Built by {{ t.squad.name }} for <strong>{{ t.start_time }}&ndash;{{ t.end_time }}
+                        {{ t.grid_timezone }}</strong>. Set the date, time and timezone for
+                        {{ squad.name }} below before creating the draft.
+                      </span>
+                    </div>
+                    <p class="py-1 text-sm">
+                      Creates a new <strong>draft</strong> grid named
+                      &ldquo;{{ t.name }}&rdquo;, spanning
+                      {{ t.default_length_days }} day{{ t.default_length_days|pluralize }} from the start date below,
+                      with {{ t.slot_duration }}-minute slots.
+                    </p>
+                    <form method="post" action="{% url 'events:availability_template_apply' event.pk squad.pk t.pk %}" class="space-y-3">
+                      {% csrf_token %}
+                      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div class="form-control">
+                          <label class="label py-1"><span class="label-text text-xs">Start date</span></label>
+                          <input type="date" name="start_date" required value="{{ today }}"
+                                 class="input input-bordered input-sm w-full">
+                        </div>
+                        <div class="form-control">
+                          <label class="label py-1"><span class="label-text text-xs">Start time</span></label>
+                          <input type="time" name="start_time" required value="{{ t.start_time }}"
+                                 class="input input-bordered input-sm w-full">
+                        </div>
+                      </div>
+                      <div class="form-control">
+                        <label class="label py-1"><span class="label-text text-xs">Timezone</span></label>
+                        <select name="grid_timezone" class="select select-bordered select-sm w-full">
+                          {% for value, label in timezone_choices %}
+                          <option value="{{ value }}" {% if value == t.grid_timezone %}selected{% endif %}>{{ label }}</option>
+                          {% endfor %}
+                        </select>
+                      </div>
+                      <p class="text-xs text-base-content/60">
+                        Prefilled from the template. The grid keeps its
+                        {{ t.slot_duration }}-minute slots and overall length whatever you choose here.
+                      </p>
+                      <div class="modal-action">
+                        <button type="button" class="btn btn-sm" onclick="this.closest('dialog').close()">Cancel</button>
+                        <button type="submit" class="btn btn-sm btn-primary">Create Draft</button>
+                      </div>
+                    </form>
+                  </div>
+                  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+                </dialog>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      {% endif %}
+
+      <div class="divider"></div>
+      <div class="flex justify-between items-center">
+        <a href="{% url 'events:squad_manage' event.pk %}" class="link link-primary">Back to Squads</a>
+        {% if event.is_race_series %}
+        {% if not series_sheet or not series_sheet.is_closed %}
+        <a href="{% url 'events:series_sheet' event.pk squad.pk %}"
+           class="btn btn-secondary btn-sm btn-outline">{% if series_sheet %}Edit stage times{% else %}Set stage times{% endif %}</a>
+        {% endif %}
+        {% else %}
+        <a href="{% url 'events:availability_create' event.pk squad.pk %}"
+           class="btn btn-secondary btn-sm btn-outline">New Availability</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

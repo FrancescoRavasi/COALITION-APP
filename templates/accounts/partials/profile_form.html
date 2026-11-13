@@ -1,0 +1,588 @@
+<form hx-post="{% url 'accounts:profile_edit' %}"
+      hx-target="#profile-form-container"
+      hx-swap="innerHTML"
+      class="space-y-4">
+    {% csrf_token %}
+
+    <!-- Discord Account Section -->
+    <div class="bg-base-300 rounded-lg p-4 mb-4">
+        <div class="flex items-center gap-4">
+            {% if user.discord_avatar %}
+            <div class="avatar">
+                <div class="w-16 rounded-full">
+                    <img src="https://cdn.discordapp.com/avatars/{{ user.discord_id }}/{{ user.discord_avatar }}.png" alt="Discord Avatar" />
+                </div>
+            </div>
+            {% else %}
+            <div class="avatar placeholder">
+                <div class="bg-neutral text-neutral-content rounded-full w-16">
+                    <span class="text-xl">{{ user.discord_username|slice:":2"|upper }}</span>
+                </div>
+            </div>
+            {% endif %}
+            <div>
+                <h3 class="font-semibold text-lg">Discord Account</h3>
+                <p class="text-base-content/70">{{ user.discord_username }}</p>
+                {% if user.discord_nickname and user.discord_nickname != user.discord_username %}
+                <p class="text-sm text-base-content/50">Nickname: {{ user.discord_nickname }}</p>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if user.has_accepted_zwid_verification and user.zwid %}
+        <!-- Zwift Info -->
+        <div class="border-t border-base-content/10 mt-4 pt-4">
+            <div class="grid grid-cols-3 gap-4 text-sm">
+                <div>
+                    <span class="text-base-content/50">Zwift ID</span>
+                    <p class="font-mono font-semibold">{{ user.zwid }}</p>
+                </div>
+                <div>
+                    <span class="text-base-content/50">ZwiftPower</span>
+                    <p class="font-semibold">{% if zp_data and zp_data.category %}{{ zp_data.category }}{% else %}—{% endif %}</p>
+                </div>
+                <div>
+                    <span class="text-base-content/50">Zwift Racing</span>
+                    <p class="font-semibold">{% if zr_data and zr_data.category %}{{ zr_data.category }}{% else %}—{% endif %}</p>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- Verification Status Summary -->
+        {% if required_summary %}
+        <div class="border-t border-base-content/10 mt-4 pt-4">
+            <div class="flex flex-wrap items-center gap-2">
+                <span class="text-sm font-semibold text-base-content/70">Race Verified:</span>
+                {% for item in required_summary %}
+                    {% if item.status == "valid" %}
+                        <span class="badge badge-success gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                            {{ item.label }}
+                        </span>
+                    {% elif item.status == "expired" %}
+                        <span class="badge badge-error gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                            {{ item.label }} — Expired
+                        </span>
+                    {% elif item.status == "pending" %}
+                        <span class="badge badge-warning gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                            {{ item.label }} — Pending
+                        </span>
+                    {% else %}
+                        <span class="badge badge-outline gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                            {{ item.label }} — Missing
+                        </span>
+                    {% endif %}
+                {% endfor %}
+                <a href="{% url 'accounts:verification' %}" class="btn btn-xs btn-outline">View Records</a>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+
+    <h3 class="text-lg font-semibold mb-3">Profile Information</h3>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_first_name">
+                <span class="label-text">{{ form.first_name.label }}</span>
+            </label>
+            {{ form.first_name }}
+            {% if form.first_name.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.first_name.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_last_name">
+                <span class="label-text">{{ form.last_name.label }}</span>
+            </label>
+            {{ form.last_name }}
+            {% if form.last_name.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.last_name.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_birth_year">
+                <span class="label-text">{{ form.birth_year.label }}</span>
+            </label>
+            {{ form.birth_year }}
+            {% if form.birth_year.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.birth_year.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_email">
+                <span class="label-text">{{ form.email.label }}</span>
+            </label>
+            {{ form.email }}
+            {% if form.email.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.email.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_gender">
+                <span class="label-text">{{ form.gender.label }}</span>
+            </label>
+            {{ form.gender }}
+            {% if form.gender.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.gender.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_timezone">
+                <span class="label-text">{{ form.timezone.label }}</span>
+            </label>
+            {{ form.timezone }}
+            {% if form.timezone.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.timezone.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_city">
+                <span class="label-text">{{ form.city.label }}</span>
+            </label>
+            {{ form.city }}
+            {% if form.city.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.city.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_country">
+                <span class="label-text">{{ form.country.label }}</span>
+            </label>
+            {{ form.country }}
+            {% if form.country.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.country.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="form-control">
+        <label class="label" for="id_unit_preference">
+            <span class="label-text">{{ form.unit_preference.label }}</span>
+        </label>
+        {{ form.unit_preference }}
+        {% if form.unit_preference.errors %}
+        <label class="label">
+            <span class="label-text-alt text-error">{{ form.unit_preference.errors.0 }}</span>
+        </label>
+        {% endif %}
+        <label class="label">
+            <span class="label-text-alt">Used for weight/height verification records</span>
+        </label>
+    </div>
+
+    <!-- Training Equipment Section -->
+    <div class="divider">Training Equipment</div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_trainer">
+                <span class="label-text">{{ form.trainer.label }}</span>
+            </label>
+            {{ form.trainer }}
+            <label class="label">
+                <span class="label-text-alt">A smart trainer is required to race</span>
+            </label>
+            {% if form.trainer.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.trainer.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_powermeter">
+                <span class="label-text">{{ form.powermeter.label }}</span>
+            </label>
+            {{ form.powermeter }}
+            <label class="label">
+                <span class="label-text-alt">Powermeter on your trainer bike, if any</span>
+            </label>
+            {% if form.powermeter.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.powermeter.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_dual_recording">
+                <span class="label-text">{{ form.dual_recording.label }}</span>
+            </label>
+            {{ form.dual_recording }}
+            <label class="label">
+                <span class="label-text-alt flex items-center gap-1">
+                    Are you able to dual record?
+                    <div class="tooltip tooltip-right" data-tip="Some events require dual recording for Cat A or A+">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-info cursor-help" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                    </div>
+                </span>
+            </label>
+            {% if form.dual_recording.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.dual_recording.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_heartrate_monitor">
+                <span class="label-text">{{ form.heartrate_monitor.label }}</span>
+            </label>
+            {{ form.heartrate_monitor }}
+            <label class="label">
+                <span class="label-text-alt flex items-center gap-1">
+                    Required to race
+                    <div class="tooltip tooltip-left" data-tip="You must turn on heartrate data sharing at zwiftpower.com">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-info cursor-help" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                    </div>
+                </span>
+            </label>
+            {% if form.heartrate_monitor.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.heartrate_monitor.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    {% include "accounts/partials/_team_kit_fields.html" %}
+
+    <div class="form-control mt-4">
+        <button type="submit" class="btn btn-primary">
+            <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+            Save Changes
+        </button>
+    </div>
+
+    {% if not user.has_accepted_zwid_verification %}
+    <!-- Zwift Verification Prompt -->
+    <div class="alert alert-warning mt-4">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <div>
+            <h3 class="font-bold">Zwift Account Not Verified</h3>
+            <p class="text-sm">Verify your Zwift account to complete your profile and join team races.</p>
+        </div>
+        <a href="{% url 'zwift:zauth' %}" class="btn btn-sm btn-primary">
+            <span class="px-1.5 py-0.5 text-xs font-bold text-primary-content bg-primary/60 rounded shrink-0">Z</span>
+            Connect Zwift Account
+        </a>
+
+    </div>
+    {% endif %}
+
+    <!-- Emergency Contact Section -->
+    <div class="divider">Emergency Contact (Optional)</div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_emergency_contact_name">
+                <span class="label-text">{{ form.emergency_contact_name.label }}</span>
+            </label>
+            {{ form.emergency_contact_name }}
+            {% if form.emergency_contact_name.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.emergency_contact_name.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_emergency_contact_relation">
+                <span class="label-text">{{ form.emergency_contact_relation.label }}</span>
+            </label>
+            {{ form.emergency_contact_relation }}
+            {% if form.emergency_contact_relation.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.emergency_contact_relation.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_emergency_contact_email">
+                <span class="label-text">{{ form.emergency_contact_email.label }}</span>
+            </label>
+            {{ form.emergency_contact_email }}
+            {% if form.emergency_contact_email.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.emergency_contact_email.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_emergency_contact_phone">
+                <span class="label-text">{{ form.emergency_contact_phone.label }}</span>
+            </label>
+            {{ form.emergency_contact_phone }}
+            {% if form.emergency_contact_phone.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.emergency_contact_phone.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Social Accounts Section -->
+    <div class="divider">Social Accounts (Optional)</div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_strava_url">
+                <span class="label-text">{{ form.strava_url.label }}</span>
+            </label>
+            {{ form.strava_url }}
+            {% if form.strava_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.strava_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_garmin_url">
+                <span class="label-text">{{ form.garmin_url.label }}</span>
+            </label>
+            {{ form.garmin_url }}
+            {% if form.garmin_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.garmin_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="form-control">
+        <label class="label" for="id_tpv_profile_url">
+            <span class="label-text">{{ form.tpv_profile_url.label }}</span>
+        </label>
+        {{ form.tpv_profile_url }}
+        {% if form.tpv_profile_url.errors %}
+        <label class="label">
+            <span class="label-text-alt text-error">{{ form.tpv_profile_url.errors.0 }}</span>
+        </label>
+        {% endif %}
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_youtube_channel">
+                <span class="label-text">{{ form.youtube_channel.label }}</span>
+            </label>
+            {{ form.youtube_channel }}
+            {% if form.youtube_channel.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.youtube_channel.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_twitch_channel">
+                <span class="label-text">{{ form.twitch_channel.label }}</span>
+            </label>
+            {{ form.twitch_channel }}
+            {% if form.twitch_channel.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.twitch_channel.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_instagram_url">
+                <span class="label-text">{{ form.instagram_url.label }}</span>
+            </label>
+            {{ form.instagram_url }}
+            {% if form.instagram_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.instagram_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_facebook_url">
+                <span class="label-text">{{ form.facebook_url.label }}</span>
+            </label>
+            {{ form.facebook_url }}
+            {% if form.facebook_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.facebook_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_bluesky_url">
+                <span class="label-text">{{ form.bluesky_url.label }}</span>
+            </label>
+            {{ form.bluesky_url }}
+            {% if form.bluesky_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.bluesky_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_tiktok_url">
+                <span class="label-text">{{ form.tiktok_url.label }}</span>
+            </label>
+            {{ form.tiktok_url }}
+            {% if form.tiktok_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.tiktok_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="form-control">
+            <label class="label" for="id_twitter_url">
+                <span class="label-text">{{ form.twitter_url.label }}</span>
+            </label>
+            {{ form.twitter_url }}
+            {% if form.twitter_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.twitter_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+
+        <div class="form-control">
+            <label class="label" for="id_mastodon_url">
+                <span class="label-text">{{ form.mastodon_url.label }}</span>
+            </label>
+            {{ form.mastodon_url }}
+            {% if form.mastodon_url.errors %}
+            <label class="label">
+                <span class="label-text-alt text-error">{{ form.mastodon_url.errors.0 }}</span>
+            </label>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="divider">Notifications</div>
+
+    <div class="form-control">
+        <label class="cursor-pointer flex items-start gap-3">
+            {{ form.discord_dm_opt_out }}
+            <span>
+                <span class="font-medium">Opt out of Discord DMs</span>
+                <span class="block text-sm text-base-content/70 mt-1">
+                    The bot will send you no direct messages at all.
+                </span>
+            </span>
+        </label>
+    </div>
+
+    <div class="alert alert-warning mt-3">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <div>
+            <h3 class="font-bold">DMs are how the team reaches you</h3>
+            <div class="text-sm">
+                Turning them off means you will not be told when your race verification is about
+                to expire, when it is approved or rejected, or when you are signed up for an
+                event. Those messages are not repeated anywhere else, and missing them can leave
+                you unable to race. Leave DMs on unless you have a good reason not to.
+            </div>
+        </div>
+    </div>
+
+    <div class="form-control mt-6">
+        <button type="submit" class="btn btn-primary">
+            <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+            Save Changes
+        </button>
+    </div>
+</form>
+
+{% if success %}
+<div class="toast toast-end toast-bottom z-50" id="profile-toast">
+    <div class="alert {% if missing_fields %}alert-warning{% else %}alert-success{% endif %} shadow-lg">
+        {% if missing_fields %}
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <div>
+            <span class="font-semibold">Profile updated!</span>
+            <p class="text-sm">Still missing: {{ missing_fields|join:", " }}</p>
+        </div>
+        {% else %}
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <span>Profile updated! Your profile is complete.</span>
+        {% endif %}
+        <button aria-label="Close this message" type="button" class="btn btn-ghost btn-sm btn-square" onclick="this.closest('.toast').remove()">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+        </button>
+    </div>
+</div>
+<script>
+    // Auto-dismiss toast after 5 seconds
+    setTimeout(function() {
+        const toast = document.getElementById('profile-toast');
+        if (toast) {
+            toast.style.transition = 'opacity 0.3s ease-out';
+            toast.style.opacity = '0';
+            setTimeout(() => toast.remove(), 300);
+        }
+    }, 5000);
+</script>
+{% endif %}

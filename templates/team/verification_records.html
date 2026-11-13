@@ -1,0 +1,255 @@
+{% extends "base.html" %}
+
+{% block title %}Verification Records - The Coalition{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-wrap justify-between items-center gap-2 mb-6">
+        <h2 class="card-title text-2xl">Verification Records</h2>
+        {% if admin_queue_count %}
+          {% comment %}
+            Only admins see this: pending Other records are a queue nobody else can clear, so
+            the count is theirs, and it links straight to it.
+          {% endcomment %}
+          <a href="?reviewer=admin&status=pending" class="badge badge-neutral gap-1 py-3">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            </svg>
+            {{ admin_queue_count }} waiting on an admin
+          </a>
+        {% endif %}
+      </div>
+
+      <!-- Filters -->
+      <form method="get" class="mb-6">
+        <div class="flex flex-wrap gap-4 items-end">
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Search</span>
+            </label>
+            <input type="text"
+                   name="q"
+                   placeholder="Search by name..."
+                   class="input input-bordered input-sm w-48"
+                   value="{{ search_query }}"
+            />
+          </div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Type</span>
+            </label>
+            <select name="type" class="select select-bordered select-sm">
+              <option value="">All Types</option>
+              {% for value, label in verify_type_choices %}
+                <option value="{{ value }}" {% if type_filter == value %}selected{% endif %}>
+                  {{ label }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Status</span>
+            </label>
+            <select name="status" class="select select-bordered select-sm">
+              <option value="">All</option>
+              {% for value, label in status_choices %}
+                <option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>
+                  {{ label }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Gender</span>
+            </label>
+            <select name="gender" class="select select-bordered select-sm">
+              <option value="">All</option>
+              {% for value, label in gender_choices %}
+                <option value="{{ value }}" {% if gender_filter == value %}selected{% endif %}>
+                  {{ label }}
+                </option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-control">
+            <label class="label" for="reviewer-filter">
+              <span class="label-text">Reviewer</span>
+            </label>
+            <select name="reviewer" id="reviewer-filter" class="select select-bordered select-sm">
+              <option value="">Any</option>
+              {% for value, label in reviewer_choices %}
+                <option value="{{ value }}" {% if reviewer_filter == value %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+          <a href="{% url 'team:verification_records' %}" class="btn btn-ghost btn-sm">Reset</a>
+        </div>
+      </form>
+
+      <!-- Media Cleanup Actions -->
+      {% if can_verify %}
+      <div class="flex flex-wrap gap-4 mb-6">
+        <form method="post" action="{% url 'team:delete_expired_media' %}" class="inline">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-outline btn-sm" onclick="return confirm('Delete media from all expired records?')">
+            Delete Expired Media
+          </button>
+          <span class="text-sm text-base-content/60 ml-2">Removes videos/photos/links from expired records</span>
+        </form>
+        <form method="post" action="{% url 'team:delete_rejected_media' %}" class="inline">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-outline btn-sm" onclick="return confirm('Delete media from rejected records older than 30 days?')">
+            Delete Rejected Media
+          </button>
+          <span class="text-sm text-base-content/60 ml-2">Removes videos/photos/links from rejected records older than 30 days</span>
+        </form>
+      </div>
+      {% endif %}
+
+      <!-- Records Table -->
+      <div class="overflow-x-auto">
+        <table class="table table-zebra table-cards">
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Type</th>
+              <th>Media</th>
+              <th>Date</th>
+              <th>Gender</th>
+              <th>Status</th>
+              <th>Expiry</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in records_with_review_status %}
+            {% with record=row.record %}
+            <tr>
+              <td class="font-medium">
+                {% include "accounts/_user_tooltip.html" with display_name=record.user.get_full_name|default:record.user.discord_username user_id=record.user.pk discord_id=record.user.discord_id discord_avatar_url=record.user.discord_avatar_url zwid=record.user.zwid zp_category=record.tt_zp_category zp_category_w=record.tt_zp_category_w zr_category=record.tt_zr_category zr_v2=record.tt_zr_v2_category zr_rating=record.tt_zr_rating zr_phenotype=record.tt_zr_phenotype is_race_ready=record.user.is_race_ready is_extra_verified=record.user.is_extra_verified in_zwiftpower=record.tt_in_zwiftpower in_zwiftracing=record.tt_in_zwiftracing %}
+              </td>
+              <td data-label="Type">
+                <span class="badge badge-sm text-xs whitespace-nowrap {% if record.verify_type == 'weight_full' %}badge-primary{% elif record.verify_type == 'weight_light' %}badge-secondary{% elif record.verify_type == 'height' %}badge-accent{% elif record.verify_type == 'power' %}badge-warning{% else %}badge-outline{% endif %}">{{ record.get_verify_type_display }}</span>
+              </td>
+              <td data-label="Media">{{ record.get_media_type_display }}</td>
+              <td data-label="Date">{{ record.date_created|date:"M d, Y" }}</td>
+              <td data-label="Gender">
+                {% if record.user.gender %}
+                  {{ record.user.get_gender_display }}
+                {% else %}
+                  <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td data-label="Status">
+                {% if record.is_verified %}
+                <span class="badge badge-success badge-sm">Verified</span>
+                {% elif record.is_rejected %}
+                <span class="badge badge-error badge-sm">Rejected</span>
+                {% else %}
+                <span class="badge badge-warning badge-sm">Pending</span>
+                {% endif %}
+                {% comment %}
+                  Who may review it, in words -- see services.review_requirements. Solid
+                  neutral rather than a coloured outline: it passes contrast in both themes,
+                  and it is a fact about the record, not a warning.
+                {% endcomment %}
+                {% for requirement in row.requirements %}
+                <span class="badge badge-neutral badge-sm ml-1 whitespace-nowrap">{{ requirement.label }}</span>
+                {% endfor %}
+              </td>
+              <td data-label="Expiry">
+                {% if record.is_verified %}
+                  {% if record.days_remaining is not None %}
+                    {% if record.days_remaining >= 0 %}
+                      <span class="font-mono text-success">{{ record.days_remaining }}</span>
+                    {% else %}
+                      <span class="font-mono text-error">{{ record.days_remaining }}</span>
+                    {% endif %}
+                  {% else %}
+                    <span class="text-base-content/50" title="Never expires">&infin;</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td class="cell-actions">
+                {% if row.can_open %}
+                <a href="{% url 'team:verification_record_detail' record.pk %}" class="btn btn-ghost btn-xs">
+                  View
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                  </svg>
+                </a>
+                {% endif %}
+                {% if not row.can_open or not row.can_decide and record.is_pending %}
+                  {% comment %}
+                    Visible text, not a tooltip. A record they cannot open (same gender, or
+                    Other for a reviewer who is not an admin) gets the reason in place of View,
+                    whatever its status; one they can open but not decide (Power, for a reviewer
+                    outside the performance team) gets View with the reason beside it -- while
+                    it is pending, which is when the decision is still to be made.
+                  {% endcomment %}
+                  <span class="text-xs whitespace-nowrap">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="inline h-3 w-3 mb-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+                    </svg>
+                    {{ row.unmet.0.only_label }}
+                  </span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endwith %}
+            {% empty %}
+            <tr>
+              <td colspan="8" class="text-center py-8 text-base-content/50">
+                No verification records found.
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Stats & Pagination -->
+      <div class="mt-6 flex flex-col sm:flex-row justify-between items-center gap-4">
+        <div class="text-sm text-base-content/50">
+          Showing {{ page_obj.start_index }}-{{ page_obj.end_index }} of {{ page_obj.paginator.count }} record{{ page_obj.paginator.count|pluralize }}
+        </div>
+        {% if page_obj.paginator.num_pages > 1 %}
+        <div class="join">
+          {% if page_obj.has_previous %}
+            <a aria-label="Go to previous page of verification records" href="?q={{ search_query }}&type={{ type_filter }}&status={{ status_filter }}&gender={{ gender_filter }}&reviewer={{ reviewer_filter }}&page={{ page_obj.previous_page_number }}" class="join-item btn btn-sm">«</a>
+          {% else %}
+            <span class="join-item btn btn-sm btn-disabled">«</span>
+          {% endif %}
+          {% for num in page_obj.paginator.page_range %}
+            {% if num == page_obj.number %}
+              <span class="join-item btn btn-sm btn-active">{{ num }}</span>
+            {% elif num == 1 or num == page_obj.paginator.num_pages or num >= page_obj.number|add:"-2" and num <= page_obj.number|add:"2" %}
+              <a href="?q={{ search_query }}&type={{ type_filter }}&status={{ status_filter }}&gender={{ gender_filter }}&reviewer={{ reviewer_filter }}&page={{ num }}" class="join-item btn btn-sm">{{ num }}</a>
+            {% elif num == page_obj.number|add:"-3" or num == page_obj.number|add:"3" %}
+              <span class="join-item btn btn-sm btn-disabled">…</span>
+            {% endif %}
+          {% endfor %}
+          {% if page_obj.has_next %}
+            <a aria-label="Go to next page of verification records" href="?q={{ search_query }}&type={{ type_filter }}&status={{ status_filter }}&gender={{ gender_filter }}&reviewer={{ reviewer_filter }}&page={{ page_obj.next_page_number }}" class="join-item btn btn-sm">»</a>
+          {% else %}
+            <span class="join-item btn btn-sm btn-disabled">»</span>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

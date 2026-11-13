@@ -1,0 +1,381 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}My Events{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-6">
+        <h2 class="card-title text-2xl">My Events</h2>
+        <div class="flex items-center gap-2">
+          <form method="get" class="flex items-center gap-2">
+            <label class="label cursor-pointer gap-2">
+              <input type="checkbox" name="show_past" class="checkbox checkbox-sm" {% if show_past %}checked{% endif %} onchange="this.form.submit()" />
+              <span class="label-text">Show past</span>
+            </label>
+          </form>
+          <a href="{% url 'events:event_list' %}" class="btn btn-ghost btn-sm">All Events</a>
+        </div>
+      </div>
+
+      {% if events_data %}
+        <div class="flex flex-col gap-6">
+          {% for item in events_data %}
+          <div class="card bg-base-300">
+            <div class="card-body p-4">
+              <div class="flex flex-col sm:flex-row sm:items-start gap-3 sm:gap-4">
+                <div class="min-w-0 w-full sm:flex-1">
+                  {% if item.event.logo %}
+                  <a href="{% url 'events:event_detail' item.event.pk %}" class="inline-block mb-2">
+                    <img src="{{ item.event.logo.url }}" alt="{{ item.event.title }}" class="h-10 w-auto max-w-28 object-contain rounded" style="filter:drop-shadow(0 0 1px rgba(0,0,0,.4)) drop-shadow(0 0 1px rgba(255,255,255,.4))">
+                  </a>
+                  {% endif %}
+                  <h3 class="font-semibold text-lg break-words">
+                    <a href="{% url 'events:event_detail' item.event.pk %}" class="link link-primary hover:link-hover">
+                      {{ item.event.title }}
+                    </a>
+                  </h3>
+                  <p class="text-sm text-base-content/70">
+                    {{ item.event.start_date|date:"M j, Y" }} &ndash; {{ item.event.end_date|date:"M j, Y" }}
+                  </p>
+                </div>
+                {% if item.has_availability_grids or item.can_create_availability or item.can_view_squad_manage %}
+                <div class="flex items-center justify-end gap-2 w-full sm:w-auto shrink-0">
+                  {# Also opens with no grids yet, so a captain can reach "New availability". #}
+                  {% if item.has_availability_grids or item.can_create_availability %}
+                  <div class="dropdown dropdown-end shrink-0">
+                  <label tabindex="0" class="btn btn-outline btn-xs gap-1">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                    Availability
+                    {% if item.pending_availability_count %}
+                    <span class="badge badge-warning badge-xs">{{ item.pending_availability_count }}</span>
+                    {% endif %}
+                  </label>
+                  <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow-lg z-50 p-2 w-72 max-w-[calc(100vw-2rem)]">
+                    {% for sq in item.squads %}
+                    {% if sq.grids or sq.can_manage_availability %}
+                    {% include "events/_availability_menu_items.html" with event_pk=item.event.pk sq=sq ended_key=item.ended_key show_squad_heading=True only %}
+                    {% endif %}
+                    {% endfor %}
+                    {% if item.ended_grid_count %}
+                    <li class="mt-1 border-t border-base-300 pt-1">
+                      <button type="button" class="btn btn-ghost btn-xs w-full justify-center"
+                              data-count="{{ item.ended_grid_count }}"
+                              onclick="toggleEndedAvailability(event, '{{ item.ended_key }}', this)">
+                        Show ended ({{ item.ended_grid_count }})
+                      </button>
+                    </li>
+                    {% endif %}
+                  </ul>
+                  </div>
+                  {% endif %}
+                  {% if item.can_view_squad_manage %}
+                  <span class="tooltip tooltip-left shrink-0" data-tip="Manage squads">
+                    <a href="{% url 'events:squad_manage' item.event.pk %}"
+                       class="btn btn-outline btn-xs btn-square" aria-label="Manage squads">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      </svg>
+                    </a>
+                  </span>
+                  {% endif %}
+                </div>
+                {% endif %}
+              </div>
+
+              {% if item.squads %}
+              <div class="mt-3">
+                <p class="text-xs font-semibold text-base-content/60 uppercase tracking-wide mb-2">My Squads</p>
+                <div class="flex flex-col gap-3">
+                  {% for sq in item.squads %}
+                  <div class="bg-base-200 rounded-lg p-3">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <button aria-label="Show members of {{ sq.squad.name }}" type="button" class="btn btn-ghost btn-xs !px-0 !min-h-0" onclick="toggleMySquadMembers('{{ item.event.pk }}-{{ sq.squad.pk }}')" title="Show members">
+                        <svg id="my-squad-arrow-{{ item.event.pk }}-{{ sq.squad.pk }}" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                      <span class="font-medium">{{ sq.squad.name }}</span>
+                      <span class="badge badge-neutral badge-sm gap-1" title="{{ sq.members|length }} member{{ sq.members|pluralize }}">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                          <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
+                        </svg>
+                        {{ sq.members|length }}
+                      </span>
+
+                      {% if sq.squad.discord_channel_id %}
+                      <span class="tooltip" data-tip="Discord channel">
+                        <a href="https://discord.com/channels/{{ guild_id }}/{{ sq.squad.discord_channel_id }}"
+                           target="_blank" rel="noopener"
+                           class="btn btn-xs btn-outline btn-square" aria-label="Discord channel">
+                          <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                          </svg>
+                        </a>
+                      </span>
+                      {% endif %}
+
+                      {% if sq.squad.audio_channel_id %}
+                      <span class="tooltip" data-tip="Audio channel">
+                        <a href="https://discord.com/channels/{{ guild_id }}/{{ sq.squad.audio_channel_id }}"
+                           target="_blank" rel="noopener"
+                           class="btn btn-xs btn-outline btn-square" aria-label="Audio channel">
+                          <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                          </svg>
+                        </a>
+                      </span>
+                      {% endif %}
+
+                      {# Same menu as the event's Availability dropdown, scoped to this squad. #}
+                      {% if sq.grids or sq.can_manage_availability %}
+                      <div class="dropdown shrink-0">
+                        <div class="indicator">
+                          {% if sq.pending_availability_count %}
+                          <span class="indicator-item badge badge-warning badge-xs">{{ sq.pending_availability_count }}</span>
+                          {% endif %}
+                          <label tabindex="0" class="btn btn-xs btn-outline btn-square" title="Availability" aria-label="Availability">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                          </label>
+                        </div>
+                        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow-lg z-50 p-2 w-72 max-w-[calc(100vw-2rem)]">
+                          {% include "events/_availability_menu_items.html" with event_pk=item.event.pk sq=sq ended_key=sq.ended_key show_squad_heading=False only %}
+                          {% if sq.ended_grid_count %}
+                          <li class="mt-1 border-t border-base-300 pt-1">
+                            <button type="button" class="btn btn-ghost btn-xs w-full justify-center"
+                                    data-count="{{ sq.ended_grid_count }}"
+                                    onclick="toggleEndedAvailability(event, '{{ sq.ended_key }}', this)">
+                              Show ended ({{ sq.ended_grid_count }})
+                            </button>
+                          </li>
+                          {% endif %}
+                        </ul>
+                      </div>
+                      {% endif %}
+
+                      {% if sq.squad.url %}
+                      <span class="tooltip" data-tip="Squad link">
+                        <a href="{{ sq.squad.url }}" target="_blank" rel="noopener"
+                           class="btn btn-xs btn-outline btn-square" aria-label="Squad link">
+                          <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                          </svg>
+                        </a>
+                      </span>
+                      {% endif %}
+
+                    </div>
+                    <div id="my-squad-members-{{ item.event.pk }}-{{ sq.squad.pk }}" style="display:none" class="mt-2">
+                      {% if sq.members %}
+                      <div class="flex flex-wrap gap-x-3 gap-y-2 text-sm">
+                        {% for m in sq.members %}
+                        <div>
+                          {% if m.user.pk in sq.squad.captain_pks %}<span class="tooltip" data-tip="Captain">🎖️</span>{% elif m.user.pk in sq.squad.vice_captain_pks %}<span class="tooltip" data-tip="Vice Captain">🎖️</span>{% endif %}
+                          {% include "accounts/_user_tooltip.html" with display_name=m.user.get_full_name|default:m.user.discord_username user_id=m.user.pk discord_id=m.user.discord_id discord_avatar_url=m.user.discord_avatar_url zwid=m.zwid zp_category=m.zp_category zp_category_w=m.zp_category_w zr_category=m.zr_category zr_v2=m.zr_v2_category zr_rating=m.zr_rating zr_phenotype=m.zr_phenotype zr_age=m.zr_age is_race_ready=m.is_race_ready is_extra_verified=m.is_extra_verified in_zwiftpower=m.in_zwiftpower in_zwiftracing=m.in_zwiftracing %}
+                        </div>
+                        {% endfor %}
+                      </div>
+                      {% else %}
+                      <p class="text-sm text-base-content/50">No members in this squad yet.</p>
+                      {% endif %}
+                    </div>
+
+                    {% if sq.series %}
+                    {# A race series: every stage with what it means for this rider. #}
+                    <div class="mt-3 pt-3 border-t border-base-300">
+                      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                        <h3 class="text-xs font-semibold text-base-content/80 uppercase tracking-wide">My stages</h3>
+                        {% if sq.series.grid.is_published %}
+                        <a href="{% url 'events:availability_respond' item.event.pk sq.squad.pk sq.series.grid.pk %}"
+                           class="btn btn-xs {% if sq.series.needs_answer %}btn-warning{% else %}btn-outline{% endif %}">{% if sq.series.needs_answer %}Answer stages{% else %}Change answers{% endif %}</a>
+                        {% endif %}
+                      </div>
+                      <ol class="flex flex-col gap-2">
+                        {% for st in sq.series.stages %}
+                        <li class="flex gap-3 rounded-md bg-base-100 p-2">
+                          <div class="w-12 shrink-0 flex flex-col items-center justify-center rounded bg-base-200 py-1 text-center" aria-hidden="true">
+                            {% if st.day %}
+                            <span class="text-[11px] font-semibold uppercase tracking-wide">{{ st.dow }}</span>
+                            <span class="text-lg font-bold leading-tight tabular-nums">{{ st.day }}</span>
+                            <span class="text-[11px] font-semibold uppercase tracking-wide">{{ st.month }}</span>
+                            {% else %}
+                            <span>&mdash;</span>
+                            {% endif %}
+                          </div>
+                          <div class="min-w-0 flex-1 flex flex-col gap-1">
+                            <div class="flex flex-wrap items-center gap-1">
+                              <span class="badge badge-neutral badge-sm">Stage {{ st.number }}</span>
+                              <span class="{{ st.badge }}">{{ st.label }}</span>
+                            </div>
+                            <p class="font-medium break-words">{{ st.stage.name }}</p>
+                            <p class="text-xs text-base-content/80">{% if st.time %}{{ st.dow }} {{ st.day }} {{ st.month }} &middot; {{ st.time }} &middot; {% endif %}{{ st.stage.get_stage_type_display }}{% if st.reason %} &middot; {{ st.reason }}{% endif %}</p>
+                            {% if st.race %}
+                            <p class="text-xs flex flex-wrap gap-x-3 gap-y-1">
+                              {% if st.race.thread_link %}<a href="{{ st.race.thread_link }}" target="_blank" rel="noopener" class="link">Discord thread</a>{% endif %}
+                              {% if st.race.event_invite_url %}<a href="{{ st.race.event_invite_url }}" target="_blank" rel="noopener" class="link">Event invite</a>{% endif %}
+                              {% if st.ics_url %}<a href="{{ st.ics_url }}" class="link">Add to calendar</a>{% endif %}
+                            </p>
+                            {% endif %}
+                          </div>
+                        </li>
+                        {% endfor %}
+                      </ol>
+                    </div>
+                    {% endif %}
+
+                    {% if sq.user_slot_selections %}
+                    <div class="mt-3 pt-3 border-t border-base-300">
+                      <p class="text-xs font-semibold text-base-content/60 uppercase tracking-wide mb-2">Scheduled Races</p>
+                      <div class="flex flex-col gap-2">
+                        {% for slot in sq.user_slot_selections %}
+                        <div class="bg-base-100 rounded-md p-3">
+                          <button type="button" class="w-full text-left flex items-start gap-2 cursor-pointer" onclick="toggleSlotRiders('{{ item.event.pk }}-{{ sq.squad.pk }}-{{ slot.selection.pk }}')" title="Show riders">
+                            <svg id="slot-arrow-{{ item.event.pk }}-{{ sq.squad.pk }}-{{ slot.selection.pk }}" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mt-1 shrink-0 transition-transform text-base-content/60" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                            </svg>
+                            <span class="flex-1 min-w-0">
+                              {# Phones give the title the full width and drop the status badge below it. #}
+                              <span class="flex flex-col items-start gap-2 sm:flex-row sm:justify-between">
+                                <span class="font-medium break-words">{{ slot.selection.name }}</span>
+                                {% if slot.is_status_visible %}
+                                <span class="badge {{ slot.status_class }} badge-sm shrink-0">{{ slot.status_label }}</span>
+                                {% endif %}
+                              </span>
+                              <span class="flex items-center gap-1 mt-2 font-medium">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 shrink-0 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                </svg>
+                                <span>{{ slot.local_day }} {{ slot.local_date }} &middot; {{ slot.local_time }}</span>
+                              </span>
+                              <span class="block text-xs text-base-content/50 mt-1">{{ slot.display_timezone }}{% if slot.grid_title %} &middot; {{ slot.grid_title }}{% endif %}</span>
+                              <span class="flex flex-wrap items-center gap-1 mt-2">
+                                <span class="badge {{ slot.days_class }} badge-sm">{{ slot.days_label }}</span>
+                                <span class="badge badge-neutral badge-sm gap-1" title="{{ slot.riders|length }} rider{{ slot.riders|pluralize }}">
+                                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
+                                  </svg>
+                                  {{ slot.riders|length }}
+                                </span>
+                              </span>
+                            </span>
+                          </button>
+                          <div id="slot-riders-{{ item.event.pk }}-{{ sq.squad.pk }}-{{ slot.selection.pk }}" style="display:none" class="mt-2">
+                            <p class="text-xs mb-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+                              {% if slot.selection.event_invite_url %}
+                              <a href="{{ slot.selection.event_invite_url }}" target="_blank" rel="noopener" class="link link-primary">Event invite</a>
+                              {% endif %}
+                              {% if slot.selection.course_url %}
+                              <a href="{{ slot.selection.course_url }}" target="_blank" rel="noopener" class="link link-primary">Course</a>
+                              {% endif %}
+                              {% if slot.selection.thread_link %}
+                              <a href="{{ slot.selection.thread_link }}" target="_blank" rel="noopener"
+                                 class="link link-primary inline-flex items-center gap-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 shrink-0 fill-current" viewBox="0 0 24 24"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"></path></svg>
+                                Thread
+                              </a>
+                              {% endif %}
+                              {# Icon-only so the whole link row still fits one line on a phone. #}
+                              <span class="tooltip" data-tip="Add to Google Calendar">
+                                <a href="{{ slot.gcal_url }}" target="_blank" rel="noopener"
+                                   class="btn btn-xs btn-ghost btn-square" aria-label="Add to Google Calendar">
+                                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h4m4 0h2M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 14v4m-2-2h4" />
+                                  </svg>
+                                </a>
+                              </span>
+                              <span class="tooltip" data-tip="Download .ics">
+                                <a href="{{ slot.ics_url }}" class="btn btn-xs btn-ghost btn-square" aria-label="Download .ics">
+                                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                  </svg>
+                                </a>
+                              </span>
+                            </p>
+                            {% if slot.riders %}
+                            <div class="flex flex-wrap gap-x-3 gap-y-2 text-sm">
+                              {% for r in slot.riders %}
+                              <div>
+                                {% if r.user.pk in sq.squad.captain_pks %}<span class="tooltip" data-tip="Captain">🎖️</span>{% elif r.user.pk in sq.squad.vice_captain_pks %}<span class="tooltip" data-tip="Vice Captain">🎖️</span>{% endif %}
+                                {% include "accounts/_user_tooltip.html" with display_name=r.user.get_full_name|default:r.user.discord_username user_id=r.user.pk discord_id=r.user.discord_id discord_avatar_url=r.user.discord_avatar_url zwid=r.zwid zp_category=r.zp_category zp_category_w=r.zp_category_w zr_category=r.zr_category zr_v2=r.zr_v2_category zr_rating=r.zr_rating zr_phenotype=r.zr_phenotype zr_age=r.zr_age is_race_ready=r.is_race_ready is_extra_verified=r.is_extra_verified in_zwiftpower=r.in_zwiftpower in_zwiftracing=r.in_zwiftracing %}
+                              </div>
+                              {% endfor %}
+                            </div>
+                            {% else %}
+                            <p class="text-sm text-base-content/50">No riders selected.</p>
+                            {% endif %}
+                          </div>
+                        </div>
+                        {% endfor %}
+                      </div>
+                    </div>
+                    {% endif %}
+                  </div>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="text-center py-12">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-16 w-16 mx-auto text-base-content/30 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+          </svg>
+          <p class="text-base-content/60 mb-4">You haven't signed up for any events yet.</p>
+          <a href="{% url 'events:event_list' %}" class="btn btn-primary btn-sm">Browse Events</a>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function toggleMySquadMembers(key) {
+  var row = document.getElementById('my-squad-members-' + key);
+  var arrow = document.getElementById('my-squad-arrow-' + key);
+  if (row.style.display === 'none') {
+    row.style.display = '';
+    arrow.style.transform = 'rotate(90deg)';
+  } else {
+    row.style.display = 'none';
+    arrow.style.transform = '';
+  }
+}
+function toggleSlotRiders(key) {
+  var row = document.getElementById('slot-riders-' + key);
+  var arrow = document.getElementById('slot-arrow-' + key);
+  if (row.style.display === 'none') {
+    row.style.display = '';
+    arrow.style.transform = 'rotate(90deg)';
+  } else {
+    row.style.display = 'none';
+    arrow.style.transform = '';
+  }
+}
+// `key` scopes the toggle to one dropdown: "e<event_pk>" for the event-wide menu,
+// "s<squad_pk>" for a squad's own menu. Sharing a key would make the two menus fight.
+function toggleEndedAvailability(ev, key, btn) {
+  // Keep the DaisyUI dropdown open when the toggle is clicked.
+  ev.preventDefault();
+  ev.stopPropagation();
+  var items = document.querySelectorAll('.av-ended-' + key);
+  var nowHidden = true;
+  items.forEach(function (el, i) {
+    el.classList.toggle('hidden');
+    if (i === 0) { nowHidden = el.classList.contains('hidden'); }
+  });
+  var count = btn.getAttribute('data-count');
+  btn.textContent = (nowHidden ? 'Show ended (' : 'Hide ended (') + count + ')';
+}
+</script>
+{% endblock %}

@@ -1,0 +1,498 @@
+{% extends "base.html" %}
+
+{% block title %}{% if not user.is_profile_complete %}Complete Your Profile{% else %}Edit Profile{% endif %} - The Coalition{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto">
+    {% if pending_application %}
+    <!-- Import Registration Data Banner -->
+    <div class="alert alert-info mb-6 shadow-lg">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <div>
+            <h3 class="font-bold">Import Registration Data</h3>
+            {% if offers_only_zwift_carry_over %}
+            {# Nothing is left to fill, so "auto-fill your profile" would promise nothing. #}
+            <p class="text-sm">Your approved registration is connected to Zwift. Import it to move that connection to your account.</p>
+            {% else %}
+            <p class="text-sm">We found your approved membership registration. Import this data to auto-fill your profile.</p>
+            {% if offers_zwift_carry_over %}
+            <p class="text-sm">It also moves your registration's Zwift connection to your account.</p>
+            {% endif %}
+            {% endif %}
+        </div>
+        <a href="{% url 'accounts:import_application' pending_application.pk %}" class="btn btn-sm btn-primary">
+            Review & Import
+        </a>
+    </div>
+    {% endif %}
+
+    <div class="card bg-base-200 shadow-xl">
+        <div class="card-body">
+            {% if not user.is_profile_complete %}
+            <!-- Profile Incomplete Warning -->
+            <div class="alert alert-warning mb-6">
+                <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                </svg>
+                <div>
+                    <h3 class="font-bold">Profile Incomplete</h3>
+                    <p class="text-sm">You must complete your profile and verify your Zwift account to access the team platform.</p>
+                </div>
+            </div>
+            <h2 class="card-title text-2xl mb-6">Complete Your Profile</h2>
+
+            <!-- Profile Completion Status -->
+            <div class="mb-6">
+                <h3 class="text-lg font-semibold mb-3">Required Information</h3>
+                <div class="flex flex-wrap gap-2">
+                    {% with status=user.profile_completion_status %}
+                    <div class="badge {% if status.first_name %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.first_name %}&#10003;{% else %}&#10007;{% endif %} First Name
+                    </div>
+                    <div class="badge {% if status.last_name %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.last_name %}&#10003;{% else %}&#10007;{% endif %} Last Name
+                    </div>
+                    <div class="badge {% if status.birth_year %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.birth_year %}&#10003;{% else %}&#10007;{% endif %} Birth Year
+                    </div>
+                    <div class="badge {% if status.gender %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.gender %}&#10003;{% else %}&#10007;{% endif %} Gender
+                    </div>
+                    <div class="badge {% if status.timezone %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.timezone %}&#10003;{% else %}&#10007;{% endif %} Timezone
+                    </div>
+                    <div class="badge {% if status.country %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.country %}&#10003;{% else %}&#10007;{% endif %} Country
+                    </div>
+                    <div class="badge {% if status.zwid_verified %}badge-success{% else %}badge-error{% endif %} gap-1">
+                        {% if status.zwid_verified %}&#10003;{% else %}&#10007;{% endif %} Zwift Verified
+                    </div>
+                    {% endwith %}
+                </div>
+            </div>
+            <div class="divider"></div>
+            {% else %}
+            <h2 class="card-title text-2xl mb-6">Edit Profile</h2>
+            {% endif %}
+
+            <form method="post" class="space-y-4">
+                {% csrf_token %}
+
+                <!-- Discord Account Section -->
+                <div class="bg-base-300 rounded-lg p-4 mb-4">
+                    <div class="flex items-center gap-4">
+                        {% if user.discord_avatar %}
+                        <div class="avatar">
+                            <div class="w-16 rounded-full">
+                                <img src="https://cdn.discordapp.com/avatars/{{ user.discord_id }}/{{ user.discord_avatar }}.png" alt="Discord Avatar" />
+                            </div>
+                        </div>
+                        {% else %}
+                        <div class="avatar placeholder">
+                            <div class="bg-neutral text-neutral-content rounded-full w-16">
+                                <span class="text-xl">{{ user.discord_username|slice:":2"|upper }}</span>
+                            </div>
+                        </div>
+                        {% endif %}
+                        <div>
+                            <h3 class="font-semibold text-lg">Discord Account</h3>
+                            <p class="text-base-content/70">{{ user.discord_username }}</p>
+                            {% if user.discord_nickname and user.discord_nickname != user.discord_username %}
+                            <p class="text-sm text-base-content/50">Nickname: {{ user.discord_nickname }}</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_first_name">
+                            <span class="label-text">{{ form.first_name.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.first_name }}
+                        {% if form.first_name.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.first_name.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_last_name">
+                            <span class="label-text">{{ form.last_name.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.last_name }}
+                        {% if form.last_name.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.last_name.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_birth_year">
+                            <span class="label-text">{{ form.birth_year.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.birth_year }}
+                        {% if form.birth_year.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.birth_year.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_gender">
+                            <span class="label-text">{{ form.gender.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.gender }}
+                        {% if form.gender.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.gender.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_timezone">
+                            <span class="label-text">{{ form.timezone.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.timezone }}
+                        {% if form.timezone.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.timezone.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_country">
+                            <span class="label-text">{{ form.country.label }} <span class="text-error">*</span></span>
+                        </label>
+                        {{ form.country }}
+                        {% if form.country.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.country.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_email">
+                            <span class="label-text">{{ form.email.label }}</span>
+                        </label>
+                        {{ form.email }}
+                        {% if form.email.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.email.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_city">
+                            <span class="label-text">{{ form.city.label }}</span>
+                        </label>
+                        {{ form.city }}
+                        {% if form.city.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.city.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Emergency Contact Section -->
+                <div class="divider">Emergency Contact (Optional)</div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_emergency_contact_name">
+                            <span class="label-text">{{ form.emergency_contact_name.label }}</span>
+                        </label>
+                        {{ form.emergency_contact_name }}
+                        {% if form.emergency_contact_name.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.emergency_contact_name.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_emergency_contact_relation">
+                            <span class="label-text">{{ form.emergency_contact_relation.label }}</span>
+                        </label>
+                        {{ form.emergency_contact_relation }}
+                        {% if form.emergency_contact_relation.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.emergency_contact_relation.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_emergency_contact_email">
+                            <span class="label-text">{{ form.emergency_contact_email.label }}</span>
+                        </label>
+                        {{ form.emergency_contact_email }}
+                        {% if form.emergency_contact_email.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.emergency_contact_email.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_emergency_contact_phone">
+                            <span class="label-text">{{ form.emergency_contact_phone.label }}</span>
+                        </label>
+                        {{ form.emergency_contact_phone }}
+                        {% if form.emergency_contact_phone.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.emergency_contact_phone.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Social Accounts Section -->
+                <div class="divider">Social Accounts (Optional)</div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_youtube_channel">
+                            <span class="label-text">{{ form.youtube_channel.label }}</span>
+                        </label>
+                        {{ form.youtube_channel }}
+                        {% if form.youtube_channel.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.youtube_channel.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_twitch_channel">
+                            <span class="label-text">{{ form.twitch_channel.label }}</span>
+                        </label>
+                        {{ form.twitch_channel }}
+                        {% if form.twitch_channel.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.twitch_channel.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_instagram_url">
+                            <span class="label-text">{{ form.instagram_url.label }}</span>
+                        </label>
+                        {{ form.instagram_url }}
+                        {% if form.instagram_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.instagram_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_facebook_url">
+                            <span class="label-text">{{ form.facebook_url.label }}</span>
+                        </label>
+                        {{ form.facebook_url }}
+                        {% if form.facebook_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.facebook_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_twitter_url">
+                            <span class="label-text">{{ form.twitter_url.label }}</span>
+                        </label>
+                        {{ form.twitter_url }}
+                        {% if form.twitter_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.twitter_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_tiktok_url">
+                            <span class="label-text">{{ form.tiktok_url.label }}</span>
+                        </label>
+                        {{ form.tiktok_url }}
+                        {% if form.tiktok_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.tiktok_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_bluesky_url">
+                            <span class="label-text">{{ form.bluesky_url.label }}</span>
+                        </label>
+                        {{ form.bluesky_url }}
+                        {% if form.bluesky_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.bluesky_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_mastodon_url">
+                            <span class="label-text">{{ form.mastodon_url.label }}</span>
+                        </label>
+                        {{ form.mastodon_url }}
+                        {% if form.mastodon_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.mastodon_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="form-control">
+                        <label class="label" for="id_strava_url">
+                            <span class="label-text">{{ form.strava_url.label }}</span>
+                        </label>
+                        {{ form.strava_url }}
+                        {% if form.strava_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.strava_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+
+                    <div class="form-control">
+                        <label class="label" for="id_garmin_url">
+                            <span class="label-text">{{ form.garmin_url.label }}</span>
+                        </label>
+                        {{ form.garmin_url }}
+                        {% if form.garmin_url.errors %}
+                        <label class="label">
+                            <span class="label-text-alt text-error">{{ form.garmin_url.errors.0 }}</span>
+                        </label>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="id_tpv_profile_url">
+                        <span class="label-text">{{ form.tpv_profile_url.label }}</span>
+                    </label>
+                    {{ form.tpv_profile_url }}
+                    {% if form.tpv_profile_url.errors %}
+                    <label class="label">
+                        <span class="label-text-alt text-error">{{ form.tpv_profile_url.errors.0 }}</span>
+                    </label>
+                    {% endif %}
+                </div>
+
+                {% comment %}
+                  Kept in step with the same block in partials/profile_form.html -- this page
+                  and the HTMX partial each carry their own copy of the form.
+                {% endcomment %}
+                <div class="divider">Notifications</div>
+
+                <div class="form-control">
+                    <label class="cursor-pointer flex items-start gap-3">
+                        {{ form.discord_dm_opt_out }}
+                        <span>
+                            <span class="font-medium">Opt out of Discord DMs</span>
+                            <span class="block text-sm text-base-content/70 mt-1">
+                                The bot will send you no direct messages at all.
+                            </span>
+                        </span>
+                    </label>
+                </div>
+
+                <div class="alert alert-warning mt-3">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                    </svg>
+                    <div>
+                        <h3 class="font-bold">DMs are how the team reaches you</h3>
+                        <div class="text-sm">
+                            Turning them off means you will not be told when your race verification
+                            is about to expire, when it is approved or rejected, or when you are
+                            signed up for an event. Those messages are not repeated anywhere else,
+                            and missing them can leave you unable to race. Leave DMs on unless you
+                            have a good reason not to.
+                        </div>
+                    </div>
+                </div>
+
+                {% include "accounts/partials/_team_kit_fields.html" %}
+
+                <div class="flex gap-4 mt-6">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    {% if user.is_profile_complete %}
+                    <a href="{% url 'accounts:profile' %}" class="btn btn-ghost">Cancel</a>
+                    {% endif %}
+                </div>
+            </form>
+
+            <!-- Zwift Verification Section -->
+            <div class="divider"></div>
+            <div class="mb-6">
+                <h3 class="text-lg font-semibold mb-3">
+                    Zwift Account Verification
+                    {% if not user.is_profile_complete %}<span class="text-error">*</span>{% endif %}
+                </h3>
+                <div id="zwift-status-container">
+                    {% include "accounts/partials/zwift_status.html" %}
+                </div>
+            </div>
+
+            {% comment %}
+              The same rider data cards the public profile shows, so a rider can see exactly
+              what their teammates see about them. Read-only: they are a cache of what zauth
+              returned, and the next sync would overwrite anything edited here. The partial's
+              wrapper is display: contents, so the grid here lays its cards out two by two.
+
+              profile_user is passed explicitly because the partial is written for the public
+              profile, where the subject is not the logged-in user.
+            {% endcomment %}
+            <div class="divider"></div>
+            <div class="mb-6">
+                <h3 class="text-lg font-semibold mb-3">Your Racing Data</h3>
+                <p class="text-sm text-base-content/70 mb-3">
+                    This is what teammates see on your profile. The rider data is synced from Zwift,
+                    ZwiftPower and ZwiftRacing and is not editable here; the links are the ones you
+                    entered above.
+                </p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {% include "accounts/partials/rider_data_cards.html" with profile_user=user %}
+                </div>
+                {% include "accounts/partials/_rider_data_update_script.html" %}
+            </div>
+
+
+            <p class="text-sm text-base-content/50 mt-4"><span class="text-error">*</span> Required fields</p>
+        </div>
+    </div>
+</div>
+{% endblock %}

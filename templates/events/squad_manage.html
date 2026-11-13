@@ -1,0 +1,703 @@
+{% extends "base.html" %}
+
+{% block title %}Manage Squads - {{ event.title }}{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto">
+  {# "Back to Event" now lives in the Actions menu as "View event". #}
+  <div class="flex justify-between items-center gap-2 mb-4">
+    <h2 class="text-xl font-bold min-w-0 truncate">Squads &mdash; {{ event.title }}</h2>
+    <div class="flex gap-2 items-center shrink-0">
+      {# Primary action stays visible; everything else lives in the Actions menu. #}
+      {% if can_manage_all %}
+      <a href="{% url 'events:squad_create' event.pk %}" class="btn btn-primary btn-sm gap-1"
+         title="Add squad" aria-label="Add squad">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+        </svg>
+        <span class="hidden sm:block">Add squad</span>
+      </a>
+      {% endif %}
+      <div class="dropdown dropdown-end">
+        <label tabindex="0" class="btn btn-outline btn-sm gap-1" title="Actions" aria-label="Actions">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M12 5v.01M12 12v.01M12 19v.01M12 6a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2zm0 7a1 1 0 110-2 1 1 0 010 2z" />
+          </svg>
+          <span class="hidden sm:block">Actions</span>
+        </label>
+        <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow-lg z-50 p-2 w-60 max-w-[calc(100vw-2rem)]">
+          <li class="menu-title">View</li>
+          <li>
+            <a href="{% url 'events:event_detail' event.pk %}">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+              </svg>
+              View event
+            </a>
+          </li>
+
+          <li class="menu-title">Reports</li>
+          <li>
+            <a href="{% url 'events:squad_v_report' event.pk %}">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Eligibility
+            </a>
+          </li>
+          <li>
+            <a href="{% url 'events:event_all_races' event.pk %}?tab=participation">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+              Participation
+            </a>
+          </li>
+          {% if event.is_race_series %}
+          {% if can_view_series_board %}
+          <li>
+            <a href="{% url 'events:series_board' event.pk %}">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5h16v14H4zM4 10h16M9 5v14" />
+              </svg>
+              Series board
+            </a>
+          </li>
+          {% else %}
+          <li class="menu-disabled">
+            <span title="Requires event admin, head captain, coordinator, or a squad's captain or vice-captain">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+              Series board
+            </span>
+          </li>
+          {% endif %}
+          {% endif %}
+
+          <li class="menu-title">Manage</li>
+          {% if can_assign_riders %}
+          <li>
+            <a href="{% url 'events:squad_assign_page' event.pk %}">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-1a3 3 0 00-5.356-1.857M17 20H7m10 0v-1a5.99 5.99 0 00-.75-2.906M7 20H2v-1a3 3 0 015.356-1.857M7 20v-1c0-1.06.275-2.057.75-2.906m0 0a6 6 0 1110.5 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+              Assign riders
+            </a>
+          </li>
+          {% else %}
+          <li class="menu-disabled">
+            <span title="Requires the Event Admin permission">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+              Assign riders
+            </span>
+          </li>
+          {% endif %}
+          {% if can_manage_roles %}
+          <li>
+            <a href="{% url 'events:discord_roles' event.pk %}">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z" />
+              </svg>
+              Discord Roles
+            </a>
+          </li>
+          {% else %}
+          <li class="menu-disabled">
+            <span title="Requires the Assign Roles permission or the event Head Captain role">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+              </svg>
+              Discord Roles
+            </span>
+          </li>
+          {% endif %}
+
+          <li class="menu-title">Help</li>
+          <li>
+            <button type="button" onclick="document.getElementById('squad-help-modal').showModal()">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              How this page works
+            </button>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  {% if squads %}
+  <div class="mb-4">
+    <div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+      <input type="text" id="squad-search" placeholder="Search squads by name or captain…"
+             class="input input-bordered input-sm w-full sm:w-80"
+             oninput="filterSquads()" />
+      {% if squad_timezones %}
+      <select id="filter-squad-timezone" class="select select-bordered select-sm w-full sm:w-auto"
+              onchange="filterSquads()">
+        <option value="">All timezones</option>
+        {% for tz in squad_timezones %}<option value="{{ tz }}">{{ tz }}</option>{% endfor %}
+      </select>
+      {% endif %}
+      {% if squad_genders %}
+      <select id="filter-squad-gender" class="select select-bordered select-sm w-full sm:w-auto"
+              onchange="filterSquads()">
+        <option value="">All genders</option>
+        {% for g in squad_genders %}<option value="{{ g }}">{{ g }}</option>{% endfor %}
+      </select>
+      {% endif %}
+      {% if event.squad_tags %}
+      {# Every tag the event offers, not just the ones in use: picking an unused one says #}
+      {# plainly that no squad carries it, which is what an admin came to find out. #}
+      <select id="filter-squad-tag" class="select select-bordered select-sm w-full sm:w-auto"
+              aria-label="Filter squads by tag" onchange="filterSquads()">
+        <option value="">All tags</option>
+        {% for tag in event.squad_tags %}<option value="{{ tag }}">{{ tag }}</option>{% endfor %}
+      </select>
+      {% endif %}
+    </div>
+    <p id="squad-no-results" class="text-sm text-base-content/60 mt-2 hidden">No squads match your search.</p>
+  </div>
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="squad-grid">
+    {% for squad in squads %}
+    <div class="card bg-base-200 shadow-md squad-card{% if squad.role_violations or squad.channel_warnings %} border-2 border-error{% endif %}"
+         data-timezone="{{ squad.squad_timezone|default:'' }}"
+         data-gender="{{ squad.gender|default:'' }}"
+         {# Bar-wrapped and lowercased, so a filter matches a whole tag and never half of one. #}
+         data-tags="{% for tag in squad.tag_list %}|{{ tag|lower }}{% endfor %}{% if squad.tag_list %}|{% endif %}"
+         data-search="{{ squad.name|lower }} {% for c in squad.captains.all %}{{ c.get_full_name|lower }} {% endfor %}{% for c in squad.vice_captains.all %}{{ c.get_full_name|lower }} {% endfor %}">
+      <div class="card-body p-4">
+        {# Header: name + action buttons #}
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-1">
+          <div class="flex flex-wrap items-center gap-2 min-w-0">
+            <h3 class="card-title text-base">{{ squad.name }}</h3>
+            {% include "events/_squad_tag_badges.html" with tags=squad.tag_list labelled=True %}
+          </div>
+          <div class="flex gap-1">
+            {% if squad.can_manage %}
+            <a href="{% url 'events:squad_edit' event.pk squad.pk %}" class="btn btn-primary btn-sm">Edit</a>
+            {% endif %}
+            {% if can_manage_all %}
+            <form method="post" action="{% url 'events:squad_delete' event.pk squad.pk %}" onsubmit="return confirm('Delete squad &quot;{{ squad.name }}&quot;?')">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-error btn-outline btn-sm">Delete</button>
+            </form>
+            {% endif %}
+          </div>
+        </div>
+
+        {# Subtitle badges #}
+        <div class="flex flex-wrap gap-3 text-sm text-base-content/70 mb-3">
+          <span>{{ squad.member_count }} member{{ squad.member_count|pluralize }}</span>
+        </div>
+
+        {% comment %}
+          Profile section: timezone, gender, and who leads the squad.
+
+          Leadership used to be its own card below Enforced Requirements. It reads as part of
+          who a squad IS rather than as a separate topic, and burying the captains under the
+          requirements block put the most-asked question ("who runs this one?") third. Folded
+          in here rather than duplicated -- the same names twice on one card is worse than
+          either placement.
+
+          The captain rows render even when empty, matching Timezone and Squad Gender above:
+          on a management page a squad with no captain is exactly what you are looking for,
+          and a hidden row cannot be scanned.
+        {% endcomment %}
+        <div class="card bg-base-300 p-3 mb-2">
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-2">Profile</p>
+          <div class="space-y-1">
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Timezone</span>
+              <span class="text-sm">{{ squad.squad_timezone|default:"—" }}</span>
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Squad Gender</span>
+              <span class="text-sm">
+                {% if squad.gender %}<span class="badge badge-outline badge-sm">{{ squad.gender }}</span>{% else %}—{% endif %}
+              </span>
+            </div>
+            {% for captain in squad.captains.all %}
+            <div class="flex items-start justify-between gap-3">
+              <span class="text-base-content/70 text-sm shrink-0">{% if forloop.first %}Captain{{ squad.captains.all|length|pluralize }}{% endif %}</span>
+              <span class="text-sm text-right">{{ captain.get_full_name|default:captain.discord_username }}</span>
+            </div>
+            {% empty %}
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-base-content/70 text-sm">Captain</span>
+              <span class="text-sm">—</span>
+            </div>
+            {% endfor %}
+            {% for vc in squad.vice_captains.all %}
+            <div class="flex items-start justify-between gap-3">
+              <span class="text-base-content/70 text-sm shrink-0">{% if forloop.first %}Vice Captain{{ squad.vice_captains.all|length|pluralize }}{% endif %}</span>
+              <span class="text-sm text-right">{{ vc.get_full_name|default:vc.discord_username }}</span>
+            </div>
+            {% empty %}
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-base-content/70 text-sm">Vice Captain</span>
+              <span class="text-sm">—</span>
+            </div>
+            {% endfor %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Captain Notifications</span>
+              {% if squad.captain_notifications %}
+              <span class="badge badge-success badge-sm">On</span>
+              {% else %}
+              <span class="badge badge-neutral badge-sm">Off</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+
+        {# Enforcement / join requirements #}
+        <div class="card bg-base-300 p-3 mb-2">
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-2">Enforced Requirements</p>
+          {% if squad.enforcement_summary %}
+          <div class="flex flex-wrap gap-1">
+            {% for item in squad.enforcement_summary %}
+            <span class="badge badge-warning badge-sm">{{ item }}</span>
+            {% endfor %}
+          </div>
+          {% else %}
+          <span class="text-sm text-base-content/50">None enforced</span>
+          {% endif %}
+        </div>
+
+        {# Category Range section #}
+        {% if squad.min_zwift_racing_category or squad.max_zwift_racing_category or squad.min_zwift_category or squad.max_zwift_category or squad.min_womens_zwift_category or squad.max_womens_zwift_category %}
+        <div class="card bg-base-300 p-3 mb-2">
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-2">Category Range</p>
+          <div class="space-y-1">
+            {% if squad.min_zwift_racing_category or squad.max_zwift_racing_category %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">ZR Category</span>
+              <span class="text-sm">{{ squad.min_zwift_racing_category|default:"" }}{% if squad.min_zwift_racing_category and squad.max_zwift_racing_category %} &ndash; {% endif %}{{ squad.max_zwift_racing_category|default:"" }}</span>
+            </div>
+            {% endif %}
+            {% if squad.min_zwift_category or squad.max_zwift_category %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Zwift Category</span>
+              <span class="text-sm">{{ squad.min_zwift_category|default:"" }}{% if squad.min_zwift_category and squad.max_zwift_category %} &ndash; {% endif %}{{ squad.max_zwift_category|default:"" }}</span>
+            </div>
+            {% endif %}
+            {% if squad.min_womens_zwift_category or squad.max_womens_zwift_category %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Women's Zwift Category</span>
+              <span class="text-sm">{{ squad.min_womens_zwift_category|default:"" }}{% if squad.min_womens_zwift_category and squad.max_womens_zwift_category %} &ndash; {% endif %}{{ squad.max_womens_zwift_category|default:"" }}</span>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endif %}
+
+        {% if squad.channel_warnings %}
+        {% comment %}
+          Checked live on every render, not stored: channel permissions change in Discord,
+          so a check made when the squad was set up would go stale without anyone noticing.
+        {% endcomment %}
+        <div class="alert alert-error py-2 mb-2">
+          <div>
+            <p class="font-semibold text-sm">Discord channel is visible to the whole server</p>
+            <ul class="list-disc list-inside text-xs">
+              {% for problem in squad.channel_warnings %}<li>{{ problem }}</li>{% endfor %}
+            </ul>
+            <p class="text-xs mt-1">
+              Fix it in Discord by restricting the channel to the squad's role, or pick a
+              private channel when editing this squad.
+              Or use <span class="font-medium">Channel access</span> in the panel below to see
+              exactly who can view it.
+            </p>
+          </div>
+        </div>
+        {% endif %}
+
+        {% if squad.role_violations %}
+        {% comment %}
+          A squad keeps whatever role was stored before Role Setup's lists were narrowed,
+          and the squad form drops such a value from initial on the next edit rather than
+          offering it back -- so without this the role would just disappear one day.
+        {% endcomment %}
+        <div class="alert alert-error py-2 mb-2">
+          <div>
+            <p class="font-semibold text-sm">Roles not allowed by Role Setup</p>
+            <ul class="list-disc list-inside text-xs">
+              {% for problem in squad.role_violations %}<li>{{ problem }}</li>{% endfor %}
+            </ul>
+            <p class="text-xs mt-1">
+              Fix on <a href="{% url 'events:event_role_setup' event.pk %}" class="link">Role Setup</a>
+              or by editing this squad. Editing the squad will clear the disallowed role.
+            </p>
+          </div>
+        </div>
+        {% endif %}
+
+        {% comment %}
+          Discord section. Collapsed by default: a fully configured squad lists a channel,
+          an audio channel and four roles, which is reference detail rather than what this
+          page is for. The channel-access audit lives in here too, and it makes a live
+          Discord call -- keeping it behind a click means opening the page does not.
+        {% endcomment %}
+        {% if squad.discord_channel_id or squad.audio_channel_id or squad.team_discord_role or squad.discord_captain_role or squad.regional_coordinator_role or squad.region_role %}
+        <details class="collapse collapse-arrow bg-base-300 mb-2">
+          <summary class="collapse-title text-xs font-semibold uppercase tracking-wide text-base-content/50 py-2 min-h-0 cursor-pointer">Discord</summary>
+          <div class="collapse-content space-y-1">
+            {% if squad.discord_channel_id %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Channel</span>
+              <span class="text-sm">{% if squad.channel_name %}#{{ squad.channel_name }}{% else %}<span class="font-mono text-xs">{{ squad.discord_channel_id }}</span>{% endif %}</span>
+            </div>
+            <div class="flex justify-end">
+              <button type="button" class="btn btn-outline btn-xs"
+                      hx-get="{% url 'events:squad_channel_access' event.pk squad.pk %}"
+                      hx-target="#channel-access-{{ squad.pk }}"
+                      hx-swap="innerHTML"
+                      hx-indicator="#channel-access-spinner-{{ squad.pk }}"
+                      title="Read this channel's permissions from Discord and compare them with the squad roster">
+                Who can see this channel?
+              </button>
+              <span id="channel-access-spinner-{{ squad.pk }}" class="htmx-indicator loading loading-spinner loading-xs ml-2"></span>
+            </div>
+            <div id="channel-access-{{ squad.pk }}"></div>
+            {% endif %}
+            {% if squad.audio_channel_id %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Audio</span>
+              <span class="text-sm">{% if squad.audio_name %}{{ squad.audio_name }}{% else %}<span class="font-mono text-xs">{{ squad.audio_channel_id }}</span>{% endif %}</span>
+            </div>
+            {% endif %}
+            {% if squad.team_discord_role %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Role</span>
+              <span class="text-sm">{% if squad.role_name %}@{{ squad.role_name }}{% else %}<span class="font-mono text-xs">{{ squad.team_discord_role }}</span>{% endif %}</span>
+            </div>
+            {% endif %}
+            {% if squad.discord_captain_role %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Captain</span>
+              <span class="text-sm">{% if squad.captain_role_name %}@{{ squad.captain_role_name }}{% else %}<span class="font-mono text-xs">{{ squad.discord_captain_role }}</span>{% endif %}</span>
+            </div>
+            {% endif %}
+            {% if squad.regional_coordinator_role %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Coordinator</span>
+              <span class="text-sm">{% if squad.coordinator_role_name %}@{{ squad.coordinator_role_name }}{% else %}<span class="font-mono text-xs">{{ squad.regional_coordinator_role }}</span>{% endif %}</span>
+            </div>
+            {% endif %}
+            {% if squad.region_role %}
+            <div class="flex items-center justify-between">
+              <span class="text-base-content/70 text-sm">Region</span>
+              <span class="text-sm">{% if squad.region_role_name %}@{{ squad.region_role_name }}{% else %}<span class="font-mono text-xs">{{ squad.region_role }}</span>{% endif %}</span>
+            </div>
+            {% endif %}
+          </div>
+        </details>
+        {% endif %}
+
+        {# Links section #}
+        {% if squad.url or squad.invite_url %}
+        <div class="card bg-base-300 p-3 mb-2">
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-2">Links</p>
+          <div class="space-y-1">
+            {% if squad.url %}
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-base-content/70 text-sm">URL</span>
+              <a href="{{ squad.url }}" target="_blank" rel="noopener" class="link link-hover text-sm truncate max-w-[200px]">{{ squad.url }}</a>
+            </div>
+            {% endif %}
+            {% if squad.invite_url %}
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-base-content/70 text-sm">Invite URL</span>
+              <a href="{{ squad.invite_url }}" target="_blank" rel="noopener" class="link link-hover text-sm truncate max-w-[200px]">{{ squad.invite_url }}</a>
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endif %}
+
+        {# Invite Link section #}
+        {% if squad.can_manage %}
+        <div class="card bg-base-300 p-3 mb-2">
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-2">Squad Invite Link</p>
+          {% if squad.invite_token %}
+          <div class="flex items-center gap-2">
+            <input type="text" readonly value="{{ request.scheme }}://{{ request.get_host }}{% url 'events:squad_invite' squad.invite_token %}" class="input input-bordered input-sm flex-1 font-mono text-xs" id="invite-url-{{ squad.pk }}">
+            <button type="button" class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('invite-url-{{ squad.pk }}').value).then(()=>{this.textContent='Copied!';setTimeout(()=>{this.textContent='Copy'},1500)})">Copy</button>
+          </div>
+          <div class="mt-2">
+            <form method="post" action="{% url 'events:squad_regenerate_token' event.pk squad.pk %}" onsubmit="return confirm('Regenerate invite link? The current link will stop working.')">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-warning btn-outline btn-xs">Regenerate Link</button>
+            </form>
+          </div>
+          {% else %}
+          <form method="post" action="{% url 'events:squad_regenerate_token' event.pk squad.pk %}">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-primary btn-sm">Generate Invite Link</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endif %}
+
+        {# Availability section #}
+        <div class="card bg-base-300 p-3 mb-2">
+          {# flex-wrap: at 320px with the largest text size the caption and the button cannot share a line, and .btn does not shrink -- without it the card pushes the page sideways. #}
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50">Availability</p>
+            {% if squad.can_manage %}
+            <a href="{% url 'events:squad_availability' event.pk squad.pk %}" class="btn btn-primary btn-xs">Manage Availability</a>
+            {% endif %}
+          </div>
+          {% if squad.active_grids %}
+          <div class="space-y-1">
+            {% for grid in squad.active_grids %}
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="text-sm">{{ grid.title }}</span>
+                {% if grid.is_published %}
+                <span class="badge badge-success badge-xs">Open</span>
+                {% elif grid.is_closed %}
+                <span class="badge badge-neutral badge-xs">Closed</span>
+                {% endif %}
+              </div>
+              {% if squad.can_manage %}
+              <div class="flex items-center gap-1">
+                {% if grid.is_published %}
+                <a href="{% url 'events:availability_respond' event.pk squad.pk grid.pk %}" class="btn btn-ghost btn-xs">Form</a>
+                {% endif %}
+                <a href="{% url 'events:availability_results' event.pk squad.pk grid.pk %}" class="btn btn-ghost btn-xs">Resp. {{ grid.response_count }}</a>
+              </div>
+              {% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <p class="text-sm text-base-content/50">No availability grids yet.</p>
+          {% endif %}
+        </div>
+
+        {# Riders section (expandable) #}
+        <details class="collapse collapse-arrow bg-base-300 mb-2">
+          <summary class="collapse-title text-xs font-semibold uppercase tracking-wide text-base-content/50 min-h-0 py-3 flex items-center justify-between pr-10">
+            <span>Riders</span>
+            <span id="squad-count-{{ squad.pk }}" class="badge badge-neutral badge-sm normal-case">{{ squad.enriched_members|length }} member{{ squad.enriched_members|length|pluralize }}</span>
+          </summary>
+          <div class="collapse-content">
+            {% include "events/_squad_manage_panel.html" with squad=squad members=squad.enriched_members available_signups=squad.available_signups event_role_name=event_role_name event_pk=event.pk can_manage=squad.can_manage available_groups=squad.available_groups oob=False %}
+          </div>
+        </details>
+
+        {# Footer: timestamps #}
+        <div class="text-xs text-base-content/50 mt-1 flex gap-4">
+          <span>Created {{ squad.created_at|date:"M j, Y" }}</span>
+          {% if squad.updated_at != squad.created_at %}
+          <span>Updated {{ squad.updated_at|date:"M j, Y" }}</span>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <p class="text-sm text-base-content/70">No squads yet. Use "Add squad" to create one.</p>
+    </div>
+  </div>
+  {% endif %}
+
+  {# Help: permissions, what each squad field does, and what assigning a rider actually changes. #}
+  <dialog id="squad-help-modal" class="modal">
+    <div class="modal-box max-w-3xl">
+      <form method="dialog">
+        <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2" aria-label="Close">&#10005;</button>
+      </form>
+      <h3 class="text-lg font-bold mb-1">How this page works</h3>
+      <p class="text-sm text-base-content/70 mb-4">Squads for <span class="font-medium">{{ event.title }}</span>.</p>
+
+      <div class="max-h-96 overflow-y-auto px-1 space-y-6">
+
+        <section>
+          <h4 class="font-semibold mb-2">Who can do what</h4>
+          {# table-cards: two columns on desktop, stacked action-then-who blocks on phones. #}
+          <div class="overflow-x-auto">
+            <table class="table table-xs table-cards">
+              <thead>
+                <tr><th>Action</th><th>Who can do it</th></tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="font-medium">Open this page</td>
+                  <td class="cell-block">Event admins, the event's Head Captain role, regional coordinators &mdash; plus any squad captain or vice-captain in this event.</td>
+                </tr>
+                <tr>
+                  <td class="font-medium">Create or delete a squad</td>
+                  <td class="cell-block">Event admins, Head Captain role, regional coordinators.</td>
+                </tr>
+                <tr>
+                  <td class="font-medium">Edit a squad, manage its availability, add or remove its riders</td>
+                  <td class="cell-block">The above, plus <span class="font-medium">that squad's</span> captain, vice-captain, or holder of the squad's Discord captain role.</td>
+                </tr>
+                <tr>
+                  <td class="font-medium">Remove a rider from every squad at once</td>
+                  <td class="cell-block">Event admins, Head Captain role, regional coordinators (it spans squads, so it isn't a captain action).</td>
+                </tr>
+                <tr>
+                  <td class="font-medium">Assign Riders page</td>
+                  <td class="cell-block">Event admins only.</td>
+                </tr>
+                <tr>
+                  <td class="font-medium">Discord Roles page</td>
+                  <td class="cell-block">The Assign Roles permission, or the event's Head Captain role.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="text-sm mt-2">
+            Captains see <em>every</em> squad listed here, but the controls only act on squads they lead.
+            Superusers can do everything.
+          </p>
+        </section>
+
+        <section>
+          <h4 class="font-semibold mb-2">Adding a rider grants Discord access</h4>
+          <ul class="list-disc list-inside text-sm space-y-1">
+            <li>Adding a rider gives them the squad's <span class="font-medium">Discord role</span> &mdash; that role is what lets them into the squad's text and voice channels.</li>
+            <li>If the squad has a <span class="font-medium">Region role</span>, they get that too.</li>
+            <li>Removing a rider takes both away again &mdash; except the region role is kept if they still belong to another squad that uses the same one.</li>
+            <li>If the rider was a captain or vice-captain, removing them also clears those and the captain Discord role.</li>
+            <li>Adding is <span class="font-medium">additive</span>: a rider can be in more than one squad, and adding them here does not remove them from another squad. The "Add rider" list groups riders by the squad they're already in, with unassigned riders first.</li>
+            <li>Riders can also join themselves through the squad's invite link, which grants the same roles.</li>
+          </ul>
+        </section>
+
+        <section>
+          <h4 class="font-semibold mb-2">Squad fields</h4>
+          <dl class="text-sm space-y-1.5">
+            <div><dt class="font-medium inline">Name</dt> &mdash; <dd class="inline">What the squad is called; also what the search box on this page matches.</dd></div>
+            <div><dt class="font-medium inline">Timezone</dt> &mdash; <dd class="inline">The squad's working timezone. Shown on the card and used by the timezone filter above.</dd></div>
+            <div><dt class="font-medium inline">Squad gender</dt> &mdash; <dd class="inline">Male, Female or COED. With <span class="font-medium">Enforce gender</span> on, a rider whose gender doesn't match is blocked (COED allows anyone).</dd></div>
+            <div><dt class="font-medium inline">Discord channel / Audio channel</dt> &mdash; <dd class="inline">Where the squad coordinates. Riders reach these via the squad's Discord role.</dd></div>
+            <div><dt class="font-medium inline">Squad Discord role</dt> &mdash; <dd class="inline">Added when a rider joins the squad and removed when they leave. This is the channel-access role.</dd></div>
+            <div><dt class="font-medium inline">Captain Discord role</dt> &mdash; <dd class="inline">Marks the squad's captains. Anyone holding it can manage this squad, the same as a named captain.</dd></div>
+            <div><dt class="font-medium inline">Region role</dt> &mdash; <dd class="inline">An extra role added on join and removed on leave, unless the rider is still in another squad with the same region role.</dd></div>
+            <div><dt class="font-medium inline">Regional coordinator role</dt> &mdash; <dd class="inline">This squad's coordinator, picked from the event's coordinator roles.</dd></div>
+            <div><dt class="font-medium inline">Zwift category min / max</dt> &mdash; <dd class="inline">The category range for the squad (A is highest, E lowest; "min" is the lowest allowed). Each bound only blocks anyone when its <span class="font-medium">Enforce</span> box is ticked.</dd></div>
+            <div><dt class="font-medium inline">Women's Zwift category min / max</dt> &mdash; <dd class="inline">The same range applied to women's categories, with its own enforce boxes.</dd></div>
+            <div><dt class="font-medium inline">Zwift Racing category min / max</dt> &mdash; <dd class="inline">The same idea using ZwiftRacing categories, with its own enforce boxes.</dd></div>
+            <div><dt class="font-medium inline">Squad link</dt> &mdash; <dd class="inline">An optional external page for the squad.</dd></div>
+            <div><dt class="font-medium inline">Invite link</dt> &mdash; <dd class="inline">A shareable link that lets riders add themselves to this squad. Generate or regenerate it on the squad card.</dd></div>
+            <div><dt class="font-medium inline">Captain notifications</dt> &mdash; <dd class="inline">DM the captain and vice-captain when a squad member's verification record changes.</dd></div>
+          </dl>
+        </section>
+
+        <section>
+          <h4 class="font-semibold mb-2">Good to know</h4>
+          <ul class="list-disc list-inside text-sm space-y-1">
+            <li>Category and gender limits are checked <span class="font-medium">when you add a rider</span>. Tightening a limit later doesn't remove riders who are already in the squad.</li>
+            <li>A squad's Discord role has to start with one of the event's role prefixes; the choices are filtered to match.</li>
+            <li>The search box and the timezone filter combine, so you can narrow to one region and then search within it.</li>
+            <li>Greyed-out items in the Actions menu are ones your roles don't cover &mdash; hover them to see what's required.</li>
+          </ul>
+        </section>
+
+      </div>
+
+      <div class="modal-action">
+        <form method="dialog"><button class="btn btn-sm">Close</button></form>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button>close</button></form>
+  </dialog>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  function filterSquads() {
+    var searchEl = document.getElementById("squad-search");
+    var q = (searchEl ? searchEl.value : "").trim().toLowerCase();
+    var tzEl = document.getElementById("filter-squad-timezone");
+    var tz = tzEl ? tzEl.value : "";
+    var genderEl = document.getElementById("filter-squad-gender");
+    var gender = genderEl ? genderEl.value : "";
+    var tagEl = document.getElementById("filter-squad-tag");
+    // Bars around the tag, so "Red" cannot match "Red Group".
+    var tag = tagEl && tagEl.value ? "|" + tagEl.value.toLowerCase() + "|" : "";
+    var shown = 0;
+    document.querySelectorAll("#squad-grid .squad-card").forEach(function (card) {
+      var match = !q || card.dataset.search.indexOf(q) !== -1;
+      if (match && tz && card.dataset.timezone !== tz) match = false;
+      if (match && gender && card.dataset.gender !== gender) match = false;
+      if (match && tag && (card.dataset.tags || "").indexOf(tag) === -1) match = false;
+      card.style.display = match ? "" : "none";
+      if (match) shown++;
+    });
+    var none = document.getElementById("squad-no-results");
+    if (none) none.classList.toggle("hidden", shown !== 0);
+  }
+</script>
+<script>
+// "Eligible only" on each squad's add-rider picker. Eligibility is decided server-side
+// (see _mark_eligibility) and shipped as data-eligible on each option; this only shows
+// or hides them.
+//
+// Options are removed and restored rather than hidden: `display:none` on <option> is
+// ignored by Safari, and a hidden-but-present option is still selectable by keyboard.
+(function () {
+  var KEY = "squadEligibleOnly";
+  var pristine = new WeakMap();
+
+  function apply(select, onlyEligible) {
+    if (!pristine.has(select)) { pristine.set(select, select.innerHTML); }
+    select.innerHTML = pristine.get(select);
+    if (!onlyEligible) { return; }
+    select.querySelectorAll('option[data-eligible="0"]').forEach(function (o) { o.remove(); });
+    select.querySelectorAll("optgroup").forEach(function (g) {
+      if (!g.querySelector("option")) { g.remove(); }
+    });
+    if (!select.querySelector("option[data-eligible]")) {
+      var empty = document.createElement("option");
+      empty.value = "";
+      empty.disabled = true;
+      empty.textContent = "No eligible riders";
+      select.appendChild(empty);
+    }
+    select.value = "";
+  }
+
+  function stored() {
+    try { return localStorage.getItem(KEY) === "1"; } catch (e) { return false; }
+  }
+
+  window.filterEligibleRiders = function (checkbox) {
+    try { localStorage.setItem(KEY, checkbox.checked ? "1" : "0"); } catch (e) { /* private mode */ }
+    var select = checkbox.closest("form").querySelector("[data-rider-picker]");
+    if (select) { apply(select, checkbox.checked); }
+  };
+
+  // The panel is re-rendered by HTMX on every add, which discards the checkbox state,
+  // so it is re-applied from storage after each swap as well as on load.
+  function restore(root) {
+    var on = stored();
+    (root || document).querySelectorAll("[data-eligible-only]").forEach(function (cb) {
+      cb.checked = on;
+      var select = cb.closest("form").querySelector("[data-rider-picker]");
+      if (select) { apply(select, on); }
+    });
+  }
+
+  function init() {
+    restore();
+    document.body.addEventListener("htmx:afterSwap", function (e) {
+      restore(e.target.querySelectorAll ? e.target : null);
+    });
+  }
+  if (document.readyState !== "loading") { init(); } else { document.addEventListener("DOMContentLoaded", init); }
+})();
+</script>
+{% endblock %}

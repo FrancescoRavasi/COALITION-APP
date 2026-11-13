@@ -1,0 +1,340 @@
+{% extends "base.html" %}
+{% load humanize %}
+
+{% block title %}Team Roster - The Coalition{% endblock %}
+
+{% block content %}
+  {% comment %}
+    hx-history="false": htmx would otherwise keep a copy of this page -- riders' names and faces
+    -- in localStorage for Back. With it, Back asks the server again (rosterv2_view answers a
+    history restore with the whole page).
+  {% endcomment %}
+  <div class="max-w-6xl mx-auto" hx-history="false">
+    <div class="card bg-base-200 shadow-xl">
+      <div class="card-body">
+        <h1 class="card-title text-2xl">Team Roster</h1>
+
+        {% comment %}
+          Both numbers whenever they differ. A card needs cached stats as well as a place on
+          the team, so a roster can be missing most of the team while looking perfectly
+          healthy -- "5 riders" reads as a team of five, not as a sync that has not run. This
+          is the first thing to look at after a deploy.
+        {% endcomment %}
+        <p class="text-sm text-base-content/70">
+          {% if unstatted_count %}
+            {{ rider_count|intcomma }} of {{ team_size|intcomma }} riders ·
+          {% else %}
+            {{ rider_count }} rider{{ rider_count|pluralize }} ·
+          {% endif %}
+          {% if stats_synced_at %}
+            stats synced {{ stats_synced_at|timesince }} ago
+          {% else %}
+            no rider stats yet
+          {% endif %}
+        </p>
+        {% comment %}
+          The table this page replaced is still one click away, and the link is not
+          nostalgia: the table carries the category, FTP and W/kg distribution charts, which
+          the cards do not, and the Discord bot's channel-filtered link renders through it.
+        {% endcomment %}
+        <p class="text-sm text-base-content/70">
+          <a class="link" href="{% url 'team:roster_table' %}">Table view</a>, with the
+          category, FTP and W/kg distribution charts.
+        </p>
+
+        {% comment %}
+          A GET form, so the query lives in the URL: a search can be bookmarked and shared,
+          and it works with no JavaScript. With htmx the results follow the typing -- 0.3 s
+          after a pause, or on Enter -- by swapping #roster-results, and rosterv2_view REPLACES
+          the URL through HX-Replace-Url (a history entry per keystroke would make Back
+          useless; the server's version leaves out an empty query). hx-sync drops an answer
+          that a newer keystroke has overtaken. The hidden inputs carry the filters in force,
+          so a search narrows within them rather than quietly clearing them.
+        {% endcomment %}
+        <form method="get" role="search" class="mt-4 flex flex-wrap items-end gap-2"
+              action="{% url 'team:roster' %}"
+              hx-get="{% url 'team:roster' %}"
+              hx-trigger="input changed delay:300ms from:#roster-search, submit"
+              hx-target="#roster-results"
+              hx-swap="outerHTML"
+              hx-sync="this:replace"
+              hx-indicator="#roster-searching">
+          <div class="flex-1 min-w-48">
+            <label class="label py-1" for="roster-search">
+              <span class="label-text">Search riders</span>
+            </label>
+            {% for name, value in kept_params %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+            <input type="search" id="roster-search" name="q" value="{{ query }}"
+                   class="input input-bordered w-full"
+                   placeholder="A name, a squad, or a Zwift ID"
+                   autocomplete="off"
+                   aria-describedby="roster-search-help">
+          </div>
+          <button type="submit" class="btn btn-primary">Search</button>
+          <span id="roster-searching" class="htmx-indicator loading loading-spinner loading-sm self-center" aria-hidden="true"></span>
+          <p id="roster-search-help" class="basis-full text-xs text-base-content/70">
+            Results update as you type. Squad names find squads in events running now; a Zwift ID matches only in full.
+          </p>
+        </form>
+        {# Read out after each search or "Show more"; lives outside #roster-results so it survives the swap. #}
+        <p id="roster-announcer" class="sr-only" role="status" aria-live="polite"></p>
+
+        {% comment %}
+          A <details> rather than a drawer component: it is one element, it works with no
+          JavaScript, it is keyboard-operable for free, and on a phone it keeps ten controls
+          out of the way until they are wanted. Open by default once a filter is on, so the
+          reason the roster looks short is never hidden.
+        {% endcomment %}
+        <details class="collapse collapse-arrow bg-base-100 mt-3" {% if filters.active %}open{% endif %}>
+          <summary class="collapse-title text-sm font-semibold">Filters and sorting</summary>
+          <div class="collapse-content">
+            {% comment %}
+              The search box is not in this form, so its text rides along in a hidden input --
+              which rosterv2.html's script refreshes on submit, because a live search changes
+              the box without reloading this form.
+            {% endcomment %}
+            <form method="get" id="roster-filters" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <input type="hidden" name="q" value="{{ query }}" id="roster-filters-q"{% if not query %} disabled{% endif %}>
+
+              <div>
+                <label class="label py-1" for="f-category"><span class="label-text">Category</span></label>
+                <select class="select select-bordered w-full" id="f-category" name="category">
+                  <option value="">Any category</option>
+                  {% for value in options.categories %}
+                    <option value="{{ value }}" {% if filters.category == value %}selected{% endif %}>Cat {{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-zr"><span class="label-text">Zwift Racing tier</span></label>
+                <select class="select select-bordered w-full" id="f-zr" name="zr">
+                  <option value="">Any tier</option>
+                  {% for value in options.zr %}
+                    <option value="{{ value }}" {% if filters.zr == value %}selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-velo2"><span class="label-text">vELO 2 tier</span></label>
+                <select class="select select-bordered w-full" id="f-velo2" name="velo2">
+                  <option value="">Any tier</option>
+                  {% for value in options.velo2 %}
+                    <option value="{{ value }}" {% if filters.velo2 == value %}selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                {# Only women have one, so picking a tier here also narrows to women. #}
+                <label class="label py-1" for="f-velo2-women"><span class="label-text">vELO 2 women's tier</span></label>
+                <select class="select select-bordered w-full" id="f-velo2-women" name="velo2_women">
+                  <option value="">Any tier</option>
+                  {% for value in options.velo2_women %}
+                    <option value="{{ value }}" {% if filters.velo2_women == value %}selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-gender"><span class="label-text">Gender</span></label>
+                <select class="select select-bordered w-full" id="f-gender" name="gender">
+                  <option value="">Any</option>
+                  <option value="women" {% if filters.gender == "women" %}selected{% endif %}>Women</option>
+                  <option value="men" {% if filters.gender == "men" %}selected{% endif %}>Men</option>
+                  <option value="unknown" {% if filters.gender == "unknown" %}selected{% endif %}>Not recorded</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-phenotype"><span class="label-text">Phenotype</span></label>
+                <select class="select select-bordered w-full" id="f-phenotype" name="phenotype">
+                  <option value="">Any phenotype</option>
+                  {% for value in options.phenotypes %}
+                    <option value="{{ value }}" {% if filters.phenotype == value %}selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-age"><span class="label-text">Age bracket</span></label>
+                <select class="select select-bordered w-full" id="f-age" name="age">
+                  <option value="">Any age</option>
+                  {% for value in options.ages %}
+                    <option value="{{ value }}" {% if filters.age == value %}selected{% endif %}>{{ value }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-verified"><span class="label-text">Race Verified</span></label>
+                <select class="select select-bordered w-full" id="f-verified" name="verified">
+                  <option value="">Any</option>
+                  <option value="verified" {% if filters.verified == "verified" %}selected{% endif %}>Race Verified</option>
+                  <option value="extra" {% if filters.verified == "extra" %}selected{% endif %}>Extra Verified</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-account"><span class="label-text">Account here</span></label>
+                <select class="select select-bordered w-full" id="f-account" name="account">
+                  <option value="">Everyone</option>
+                  <option value="yes" {% if filters.account == "yes" %}selected{% endif %}>Has an account</option>
+                  <option value="no" {% if filters.account == "no" %}selected{% endif %}>ZwiftPower only</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-wkg"><span class="label-text">Minimum 20-minute W/kg</span></label>
+                <select class="select select-bordered w-full" id="f-wkg" name="wkg">
+                  <option value="">Any</option>
+                  {% for value in wkg_steps %}
+                    <option value="{{ value }}" {% if filters.wkg == value %}selected{% endif %}>{{ value }} and up</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-ftp"><span class="label-text">Minimum FTP</span></label>
+                <select class="select select-bordered w-full" id="f-ftp" name="ftp">
+                  <option value="">Any</option>
+                  {% for value in ftp_steps %}
+                    <option value="{{ value }}" {% if filters.ftp == value %}selected{% endif %}>{{ value }} W and up</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-country"><span class="label-text">Country</span></label>
+                <select class="select select-bordered w-full" id="f-country" name="country">
+                  <option value="">Anywhere</option>
+                  {% for code, name in options.countries %}
+                    <option value="{{ code }}" {% if filters.country == code %}selected{% endif %}>{{ name }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              {% if may_see_gaps %}
+                {% comment %}
+                  Unlike its neighbours this does not narrow the cards -- it replaces them
+                  with people who have no card at all, so picking one clears the rest. The
+                  other selects fall back to "Any" on the way back, which is what they now
+                  mean.
+                {% endcomment %}
+                <div>
+                  <label class="label py-1" for="f-link"><span class="label-text">Not linked</span></label>
+                  <select class="select select-bordered w-full" id="f-link" name="link">
+                    <option value="">Any</option>
+                    {% for opt in link_options %}
+                      <option value="{{ opt.value }}" {% if filters.link == opt.value %}selected{% endif %}>{{ opt.label }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+              {% endif %}
+
+              <div>
+                <label class="label py-1" for="f-racing"><span class="label-text">Racing</span></label>
+                <select class="select select-bordered w-full" id="f-racing" name="racing">
+                  <option value="">Any</option>
+                  <option value="30" {% if filters.racing == "30" %}selected{% endif %}>Raced in the last 30 days</option>
+                  <option value="90" {% if filters.racing == "90" %}selected{% endif %}>Raced in the last 90 days</option>
+                  <option value="quiet" {% if filters.racing == "quiet" %}selected{% endif %}>No race in 60 days</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="label py-1" for="f-joined"><span class="label-text">Joined the Discord</span></label>
+                <select class="select select-bordered w-full" id="f-joined" name="joined">
+                  <option value="">Any time</option>
+                  {% for value in joined_windows %}
+                    <option value="{{ value }}" {% if filters.joined == value %}selected{% endif %}>In the last {{ value }} days</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              {% comment %}
+                Every sort keys off a stat, so on a not-linked list there is nothing to sort
+                by -- those rows are ordered by join date. Rendering the control anyway would
+                leave a select that visibly does nothing.
+              {% endcomment %}
+              {% if not filters.link %}
+                <div>
+                  <label class="label py-1" for="f-sort"><span class="label-text">Sort by</span></label>
+                  <select class="select select-bordered w-full" id="f-sort" name="sort">
+                    {% for key, label in sorts %}
+                      <option value="{{ key }}" {% if sort == key %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+              {% endif %}
+
+              <div>
+                <label class="label py-1" for="f-dir"><span class="label-text">Order</span></label>
+                <select class="select select-bordered w-full" id="f-dir" name="dir">
+                  {% if filters.link %}
+                    <option value="">Newest first</option>
+                    <option value="asc" {% if direction == "asc" %}selected{% endif %}>Oldest first</option>
+                  {% else %}
+                    <option value="">Default for this sort</option>
+                    <option value="asc" {% if direction == "asc" %}selected{% endif %}>Ascending</option>
+                    <option value="desc" {% if direction == "desc" %}selected{% endif %}>Descending</option>
+                  {% endif %}
+                </select>
+              </div>
+
+              <div class="sm:col-span-2 lg:col-span-3">
+                <button type="submit" class="btn btn-primary btn-sm">Apply</button>
+              </div>
+            </form>
+          </div>
+        </details>
+
+        {% include "team/partials/_roster_results.html" %}
+
+        <p class="mt-6 text-sm text-base-content/70">
+          Weight and exact age are never shown on this page.
+        </p>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {
+      // A live search changes the box without reloading the filter form, so its hidden copy
+      // of the query is brought up to date as the filters are applied.
+      const filters = document.getElementById('roster-filters');
+      const search = document.getElementById('roster-search');
+      const hiddenQuery = document.getElementById('roster-filters-q');
+      if (filters && search && hiddenQuery) {
+        filters.addEventListener('submit', function () {
+          hiddenQuery.value = search.value;
+          hiddenQuery.disabled = !search.value;  // no empty q= in the URL
+        });
+      }
+    })();
+
+    // "Show more" (partials/_roster_more_button.html). Pressing it removes it, so focus moves to
+    // the first new entry once it has arrived; a load that scrolling started leaves focus where
+    // it was. Decided before the request, because htmx drops the link's own listeners when the
+    // swap removes it.
+    let rosterFocusOnLoad = null;
+    function rosterMoreRequested(event, firstIndex) {
+      const config = event.detail && event.detail.requestConfig;
+      const trigger = config && config.triggeringEvent;
+      rosterFocusOnLoad = trigger && trigger.type === 'click' ? 'roster-from-' + firstIndex : null;
+    }
+    function rosterMoreFailed(event) {
+      if (event.detail && event.detail.successful) return;
+      rosterFocusOnLoad = null;
+      const announcer = document.getElementById('roster-announcer');
+      if (announcer) announcer.textContent = 'More riders could not be loaded. Press Show more riders to try again.';
+    }
+    htmx.onLoad(function () {
+      if (!rosterFocusOnLoad) return;
+      const marker = document.getElementById(rosterFocusOnLoad);
+      if (!marker) return;
+      rosterFocusOnLoad = null;
+      marker.focus();
+    });
+  </script>
+{% endblock %}

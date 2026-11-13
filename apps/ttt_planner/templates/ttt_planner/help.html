@@ -1,0 +1,500 @@
+{% extends "base.html" %}
+{% comment %}
+  How the TTT planner works. Every number quoted here is read live (planner_help passes
+  the Constance physics settings and the constants from services/compute.py); the prose
+  describing the method is not, so keep it in step with services/compute.py.
+{% endcomment %}
+
+{% block title %}How the TTT planner works{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-6">
+
+  <a href="{% url 'ttt_planner:list' %}" class="btn btn-ghost btn-sm">&larr; TTT plans</a>
+
+  <div class="space-y-2">
+    <h1 class="text-3xl font-bold">How the TTT planner works</h1>
+    <p>
+      The planner works out how hard each rider has to pull to hold a target speed, how long each pull should
+      be, and roughly how long the race will take. It is a model: good for comparing line-ups and pull plans,
+      not a promise of the result.
+    </p>
+  </div>
+
+  <nav aria-labelledby="help-toc" class="card bg-base-200">
+    <div class="card-body py-4">
+      <h2 id="help-toc" class="font-semibold">On this page</h2>
+      <ul class="grid sm:grid-cols-2 gap-x-6 gap-y-1">
+        <li><a class="link" href="#workflow">Planning a race, step by step</a></li>
+        <li><a class="link" href="#riders">Rider data</a></li>
+        <li><a class="link" href="#targets">The goal, the limits and Optimize</a></li>
+        <li><a class="link" href="#schedule">The pull schedule</a></li>
+        <li><a class="link" href="#metrics">What Pull Stats shows</a></li>
+        <li><a class="link" href="#physics">The power model</a></li>
+        <li><a class="link" href="#wprime">W′ balance</a></li>
+        <li><a class="link" href="#draft">Drafting</a></li>
+        <li><a class="link" href="#course">On the course</a></li>
+        <li><a class="link" href="#time">Finish time</a></li>
+        <li><a class="link" href="#climb">Climb compare</a></li>
+        <li><a class="link" href="#zwiftgopher">zwiftgopher comparison</a></li>
+        <li><a class="link" href="#limits">What the model leaves out</a></li>
+        <li><a class="link" href="#glossary">Glossary</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <section id="workflow" aria-labelledby="workflow-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="workflow-h" class="card-title">Planning a race, step by step</h2>
+      <ol class="list-decimal pl-5 space-y-2">
+        <li><strong>Course.</strong> Pick the route. Its distance and climbing set the finish-time estimate.
+          Course name and type are labels only; they change no numbers.</li>
+        <li><strong>Add riders.</strong> Add a whole squad, search team riders by name or Zwift ID, or add a guest
+          with their weight, height and FTP.</li>
+        <li><strong>Parameters</strong> (closed until you open it). Choose the goal: how fast (as fast as the limits
+          allow, or a speed to hold) and how the pull lengths are set (for even effort, for the most W′ in reserve, or
+          as you set them). Set the limits: the Target IF, the most any rider's IF may reach, and the W′ reserve, the
+          share of W′ every rider keeps in hand; and the shortest and longest pull Optimize may give.</li>
+        <li><strong>Optimize</strong>, the wide button just above Pull Stats, carries out the goal. The sentence under
+          it says what it will do, and links back to Parameters to change it.</li>
+        <li><strong>Adjust.</strong> Change pull lengths, mark riders who take no pulls, reorder. The table and the
+          line above it, which says whether the plan fits the limits, update as you go.</li>
+        <li><strong>Share.</strong> Copy the pull schedule for Discord, as text or as an image.</li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="riders" aria-labelledby="riders-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="riders-h" class="card-title">Rider data</h2>
+      <p>
+        When you add a team rider, the planner copies their weight, height, FTP, critical power (CP) and W′ from
+        their rider profile, the same one their profile page shows. It merges Zwift, ZwiftPower and Zwift Racing:
+        weight and height from their Zwift profile first; FTP is Zwift's zFTP, or ZwiftPower's when Zwift has none;
+        CP and W′ are Zwift Racing's. The copy stays as it was if their profile changes later. Only riders on the
+        team can be found and added.
+      </p>
+      <ul class="list-disc pl-5 space-y-1">
+        <li>No weight or height: the rider is modelled at {{ fallback_weight_kg|floatformat:0 }} kg and
+          {{ fallback_height_cm|floatformat:0 }} cm, and marked <span class="badge badge-warning badge-xs">est</span>.</li>
+        <li>No CP or W′ (guests, or riders with no Zwift Racing figures): the planner uses their FTP as CP and
+          {{ fallback_w_prime_kj }} kJ as W′, close to the team's average, and shows those values with a <span aria-hidden="true">~</span><span class="sr-only">tilde</span> in front.</li>
+        <li>No FTP: the rider still gets pull powers, but no %FTP, IF, TSS or W′ figures, and Optimize cannot judge
+          them: it leaves their pull as it is and puts them last.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="targets" aria-labelledby="targets-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-4">
+      <h2 id="targets-h" class="card-title">The goal, the limits and Optimize</h2>
+
+      <div class="space-y-2">
+        <h3 class="font-semibold">Target flat speed</h3>
+        <p>
+          The speed the team rides on level road. Every power the planner shows (on the front, sitting in, average)
+          is the power for that speed on the flat. The route's climbing enters only the finish-time estimate: on a
+          hilly course the team rides by power, so the same watts give a lower speed uphill and a higher one down.
+        </p>
+      </div>
+
+      <div class="space-y-2">
+        <h3 class="font-semibold">The two limits</h3>
+        <p>Every rider with an FTP, including riders who take no pulls, is held to two limits:</p>
+        <ul class="list-disc pl-5 space-y-1">
+          <li><strong>Target IF</strong> (a new plan starts at {{ defaults.target_if }}): the rider's IF, Normalized
+            Power ÷ FTP over the race, may not go above it.</li>
+          <li><strong>W′ reserve</strong> (starts at {{ defaults.w_prime_reserve_pct }}%): the rider's W′ balance may
+            not drop below that share of their W′ at any point in the race (see <a class="link" href="#wprime">W′
+            balance</a>).</li>
+        </ul>
+        <p>
+          Riders who take no pulls count too, because they still have to hold the wheel: the plan never goes faster by
+          leaving someone to be dropped. If one rider cannot even sit in at the speed the others could hold, that rider
+          sets the speed; the table marks anyone past a limit <span class="badge badge-error badge-xs">over target</span>.
+        </p>
+      </div>
+
+      <div class="space-y-2">
+        <h3 class="font-semibold">Does the plan fit?</h3>
+        <p>
+          The line at the top of Pull Stats answers that for the plan as it stands, whatever produced it. It says
+          whether every rider is inside both limits at the target speed, and if not, who is past which limit. It
+          also gives the fastest speed the current pull lengths allow, to 0.1 kph, and names whoever would cross a
+          limit if the team went any faster: that rider and that limit are what hold the plan back.
+        </p>
+      </div>
+
+      <div class="space-y-2">
+        <h3 class="font-semibold">The goal</h3>
+        <p>A plan's goal has two halves, chosen in the Parameters card and kept with the plan.</p>
+        <dl class="space-y-2">
+          <div><dt class="font-semibold">How fast</dt>
+            <dd><strong>As fast as the limits allow</strong> finds the fastest target speed at which every rider stays
+              inside both limits. <strong>Hold</strong> keeps the speed you type; typing a speed chooses it.</dd></div>
+          <div><dt class="font-semibold">Pull lengths</dt>
+            <dd><strong>Even effort</strong> gives stronger riders longer pulls, until everyone's IF is as even as the
+              pull steps allow. <strong>Most W′ in reserve</strong> keeps pulls short enough that every rider holds on
+              to as much W′ as possible, for surges and the finish. <strong>Keep my pull lengths</strong> leaves them,
+              and the order, as they are.</dd></div>
+        </dl>
+        <p>
+          Optimize carries the goal out, and the sentence under the button always says what it will do. As fast as
+          the limits allow with your pull lengths kept is what the planner used to call Calculate speed; with even
+          effort, it is the old Auto-balance. Holding a speed with your pull lengths kept leaves nothing to optimize,
+          so the button is off.
+        </p>
+      </div>
+
+      <div class="space-y-2">
+        <h3 class="font-semibold">How Optimize sets the pull lengths</h3>
+        <ol class="list-decimal pl-5 space-y-1">
+          <li>When the goal is as fast as the limits allow, it first finds the top speed, at a first guess that gives
+            every rider an even share of every wheel. It tries a speed: if any rider
+            could not sit in at it within the limits, the speed is too fast. Otherwise it tries rotations from the
+            shortest up, giving every rider the longest pull they can take within the limits, from the shortest pull
+            (a new plan: {{ defaults.min_pull_s }} s) to the longest ({{ defaults.max_pull_s }} s) in steps
+            ({{ defaults.pull_step_s }} s); a rider who cannot manage even the shortest pull sits in. The speed works
+            if some rotation can be filled that way, and halving its way between speeds finds the fastest that works.</li>
+          <li>At that speed, or at the speed you hold, it tries every rotation length. In each, it finds the pull lengths
+            that keep the hardest-working rider's IF lowest (Even effort), or the lowest W′ balance highest (Most W′ in
+            reserve), handing out the front time a step at a time to whoever it costs least. That first pass gives
+            everyone an even share of every wheel, which is quick.</li>
+          <li>The most promising rotations are then filled again with each rider on the wheels the order gives them
+            (see <a class="link" href="#schedule">The pull schedule</a>), until the pull lengths stop changing, and are
+            judged on those wheels.</li>
+          <li>The rotation whose worst rider fares best wins; a tie goes to the one whose next-worst rider fares best,
+            and so on, then to the other measure, then to the shorter rotation.</li>
+          <li>Even effort keeps every rider's W′ above the reserve, and Most W′ in reserve keeps every IF at or under
+            Target IF. If the speed you hold is too fast for that, Optimize says so and sets the pulls anyway, without
+            that limit.</li>
+          <li>The order runs from the longest pull to the shortest, then the riders who sit in. A rider sits on the
+            2nd wheel, where the draft saves least, for as long as the rider ahead of them pulls, so this order gives
+            the long stints there to riders who pull long themselves, and puts the last in line at the back through
+            the longest pull. Riders with no FTP keep their settings and go last.</li>
+          <li>When the goal is as fast as the limits allow, the speed is then worked out for those pulls exactly as
+            with your pull lengths kept, so optimizing again that way changes nothing.</li>
+        </ol>
+        <p>
+          Pulls are chosen as if the race were long, which is the worst case for W′; the table and the line above it
+          judge the race you planned.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section id="schedule" aria-labelledby="schedule-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="schedule-h" class="card-title">The pull schedule</h2>
+      <p>
+        What each rider rides, in pull order: the pull's length, its W/kg and watts on the front, then, for each wheel
+        from the 2nd (right behind the rider on the front) to the last, the watts to hold the speed sitting in there,
+        with that wheel's own saving from <a class="link" href="#draft">Drafting</a>, and how long the rider sits there
+        in each rotation.
+      </p>
+      <p>
+        After a pull a rider drops to the back and works up the line a wheel at a time: they sit at the last wheel
+        while the rider just behind them pulls, and at the 2nd while the rider just ahead of them pulls. So each wheel
+        lasts as long as the pull of the rider that many places ahead, and the order changes how hard sitting in is:
+        the rider right behind a long pull spends all of it on the 2nd wheel. A rider who takes no pulls comes through
+        and swings straight off, which takes no time but still moves everyone up a wheel. Pull Stats adds this up:
+        each rider's Avg W, NP, IF and W′ balance come from the wheels they actually ride.
+      </p>
+      <p>
+        <strong>Copy for Discord</strong> copies the schedule as text in a code block, which Discord shows in a fixed
+        width font so the columns line up, on a phone too. Paste it into a message as it is. <strong>Show as
+        text</strong> shows the same text, to copy by hand where the browser will not. <strong>Copy image</strong>
+        copies a picture of it instead.
+      </p>
+    </div>
+  </section>
+
+  <section id="metrics" aria-labelledby="metrics-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="metrics-h" class="card-title">What Pull Stats shows</h2>
+      <dl class="space-y-3">
+        <div><dt class="font-semibold">#, kg, FTP</dt>
+          <dd>Pull order, and the rider's data (see <a class="link" href="#riders">Rider data</a>).</dd></div>
+        <div><dt class="font-semibold">CdA</dt>
+          <dd>Estimated drag area in m², the rider's body and TT bike together (see
+            <a class="link" href="#physics">The power model</a>).</dd></div>
+        <div><dt class="font-semibold">Pull W</dt>
+          <dd>Power to hold the target flat speed on the front, with no draft. A custom pull power set for the rider
+            replaces it.</dd></div>
+        <div><dt class="font-semibold">W/kg</dt><dd>Pull W ÷ weight.</dd></div>
+        <div><dt class="font-semibold">Pull %FTP</dt>
+          <dd>Pull W ÷ FTP. Above 100% is normal: riders recover in the draft between pulls.</dd></div>
+        <div><dt class="font-semibold">Avg W</dt>
+          <dd>Average power over one rotation: Pull W for the rider's own pull, then each wheel's power for as long
+            as they sit there (see <a class="link" href="#schedule">The pull schedule</a>).</dd></div>
+        <div><dt class="font-semibold">NP</dt>
+          <dd>Normalized Power over the race: a 30-second rolling average of the rider's power, raised to the fourth power,
+            averaged, and the fourth root taken. Their power repeats every rotation, so the planner works it out exactly for
+            one rotation, which needs no route.</dd></div>
+        <div><dt class="font-semibold">IF</dt><dd>NP ÷ FTP: the usual intensity factor, and what Target IF limits.</dd></div>
+        <div><dt class="font-semibold">TSS</dt><dd>Race hours × IF² × 100. Needs a route, for the race length.</dd></div>
+        <div><dt class="font-semibold">CP, W′ kJ</dt>
+          <dd>Critical power and W′ from Zwift Racing; a <span aria-hidden="true">~</span><span class="sr-only">tilde</span>
+            marks a stand-in (see <a class="link" href="#riders">Rider data</a>).</dd></div>
+        <div><dt class="font-semibold">Low W′bal</dt>
+          <dd>The least W′ the rider has left at any point in the race, as a share of their W′. Under the W′ reserve it is
+            highlighted; below zero it reads <span class="badge badge-error badge-xs">empty</span>: the rider would run
+            out and be dropped.</dd></div>
+        <div><dt class="font-semibold">Pull (s), No pull</dt>
+          <dd>The rider's pull length, and whether they sit in the whole race.</dd></div>
+        <div><dt class="font-semibold">Team card</dt>
+          <dd>Avg team power is the mean of the riders' Avg W. Est. finish time is explained under
+            <a class="link" href="#time">Finish time</a>; the speed beside it is the distance raced, lead-in
+            included, over that time.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="physics" aria-labelledby="physics-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="physics-h" class="card-title">The power model</h2>
+      <p>The power to hold road speed <code>v</code> (m/s) is the usual cycling model:</p>
+      <p class="font-mono text-sm bg-base-100 rounded px-3 py-2 overflow-x-auto">
+        P = ( Crr·m·g·v + m·g·grade·v + ½·ρ·CdA·v³·draft ) ÷ η
+      </p>
+      <p>The three terms are rolling resistance, climbing and air resistance. Zwift has no wind, so air speed equals
+        road speed. The values in use now:</p>
+      <div class="overflow-x-auto">
+        <table class="table table-sm w-auto">
+          <caption class="sr-only">Power model constants</caption>
+          <tbody>
+            <tr><th scope="row">Crr (rolling resistance)</th><td>{{ params.crr }}</td></tr>
+            <tr><th scope="row">ρ (air density)</th><td>{{ params.air_density }} kg/m³</td></tr>
+            <tr><th scope="row">m (mass)</th><td>rider weight + {{ params.bike_mass_kg }} kg of bike</td></tr>
+            <tr><th scope="row">g</th><td>9.8067 m/s²</td></tr>
+            <tr><th scope="row">η (drivetrain efficiency)</th><td>{{ params.drivetrain_efficiency }}</td></tr>
+            <tr><th scope="row">grade</th><td>0 for every power in the pull schedule and Pull Stats; the route's own slopes in the
+              finish time and <a class="link" href="#course">On the course</a></td></tr>
+            <tr><th scope="row">draft</th><td>1 on the front; 1 − saving when sitting in (see <a class="link" href="#draft">Drafting</a>)</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>CdA, the drag area, is the rider's body, estimated from height and weight, plus their bike:</p>
+      <p class="font-mono text-sm bg-base-100 rounded px-3 py-2 overflow-x-auto">
+        CdA = {{ params.cda_coef }} × height_m^{{ params.cda_height_exp }} × weight_kg^{{ params.cda_weight_exp }}
+        {{ bike_term }}
+      </p>
+      <p>
+        This is how Zwift itself works: a rider's drag comes from their body, and each piece of equipment adds or
+        takes away a fixed amount. There is no riding position in Zwift; a TT is faster only because of the kit. The
+        body part matches Zwift's own formula, recovered from the game by the
+        <a class="link" href="https://zwiftspeedlab.coalitionracing.com">Zwift Speed Lab</a>, to within about 1% for
+        ordinary builds.
+      </p>
+      <p>
+        The planner assumes every rider is on a <strong>TT bike</strong>: a TT frame with a deep front wheel and a disc,
+        which {% if params.bike_cda_m2 < 0 %}takes {{ bike_area_m2 }} m² off{% else %}adds {{ bike_area_m2 }} m² to{% endif %}
+        the drag area, by the Speed Lab's equipment data. That makes a difference: for a
+        {{ example.kg }} kg, {{ example.cm }} cm rider, holding {{ example.kph }} kph on the flat takes about
+        {{ example.road_w }} W on a road bike and {{ example.front_w }} W on the TT bike. The saving is a fixed area,
+        so it matters more to a small rider. A plan can set its own body coefficient in Parameters (Aero CdA
+        coefficient). Climb compare models upright road riders: no TT bike, and the coefficient {{ std_cda_coef }}.
+      </p>
+      <p>
+        For example, a {{ example.kg }} kg, {{ example.cm }} cm rider has a CdA of about
+        {{ example.cda|floatformat:3 }} m² and needs about {{ example.front_w }} W to hold {{ example.kph }} kph alone
+        on the flat, or about {{ example.third_wheel_w }} W on the third wheel ({{ example.third_wheel_pct }}% of the
+        air resistance saved).
+      </p>
+      <p class="text-sm text-base-content/70">A site admin sets these values in Site Config, under TTT Planner.</p>
+    </div>
+  </section>
+
+  <section id="wprime" aria-labelledby="wprime-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="wprime-h" class="card-title">W′ balance</h2>
+      <p>
+        A pull above a rider's critical power (CP) spends a limited store of work, W′ ("W-prime"). Sitting in below CP
+        refills it, faster the further below CP the rider is and the more is missing. W′ balance is what is left. It is
+        what decides whether a hard pull can be repeated, which an average or IF cannot show.
+      </p>
+      <p>The planner uses the differential W′ balance model (Skiba 2015, after Froncioni and Clarke):</p>
+      <ul class="list-disc pl-5 space-y-1">
+        <li>Above CP, W′ drains at <code>power − CP</code> joules a second.</li>
+        <li>Below CP, it refills: <code>dW′bal/dt = (W′ − W′bal) × (CP − power) ÷ W′</code>.</li>
+      </ul>
+      <p>
+        Through a rotation the rider's power is their pull power for their own pull, then each wheel's power for as
+        long as they sit there, so each rotation drains W′ on the pull and refills some of it in the line. The race starts with W′ full and
+        the low point sinks a little each rotation until drain and refill balance out. The planner counts the rider's
+        pulls in the estimated race time (rounding up), or, without a route, assumes a long race.
+      </p>
+      <p>
+        For example, a rider with CP {{ w_example.cp }} W and W′ {{ w_example.w_prime_kj }} kJ who pulls
+        {{ w_example.pull_s }} seconds at {{ w_example.front }} W spends {{ w_example.spent_kj }} kJ a pull. If they
+        then sit in for {{ w_example.sit_min }} minutes at {{ w_example.draft }} W, they get back about
+        {{ w_example.refill_pct }}% of whatever is missing each time, and over a long race their W′ balance settles at
+        about {{ w_example.low_kj }} kJ, {{ w_example.low_pct }}% of W′, at the end of each pull.
+      </p>
+    </div>
+  </section>
+
+  <section id="draft" aria-labelledby="draft-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="draft-h" class="card-title">Drafting</h2>
+      <p>
+        Riding behind others saves part of the air resistance; the saving grows deeper in the line and levels off.
+        The site's default savings, from Zwift Insider's pack-dynamics tests:
+      </p>
+      <div class="overflow-x-auto">
+        <table class="table table-sm w-auto">
+          <caption class="sr-only">Default draft savings by wheel position</caption>
+          <thead>
+            <tr><th scope="row">Position</th>{% for row in draft_rows %}<th scope="col" class="text-right">{{ row.position }}</th>{% endfor %}</tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Air resistance saved</th>{% for row in draft_rows %}<td class="text-right">{{ row.saving_pct|floatformat:"-1" }}%</td>{% endfor %}</tr>
+          </tbody>
+        </table>
+      </div>
+      <ul class="list-disc pl-5 space-y-1">
+        <li>Position 1 is the rider on the front, who saves nothing. Positions past the end of the table use its
+          last value.</li>
+        <li>A plan can use its own savings (Parameters › Draft savings by wheel position).</li>
+        <li>While not pulling, a rider gets each wheel's own saving for as long as they sit there (see
+          <a class="link" href="#schedule">The pull schedule</a>). The last wheel is the number of riders on the
+          plan.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="course" aria-labelledby="course-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="course-h" class="card-title">On the course</h2>
+      <p>
+        Everything in the pull schedule and Pull Stats is worked out on level road. When the route has an elevation profile (from
+        the Zwift Speed Lab data the routes page uses), the plan page also shows the team riding it:
+      </p>
+      <ol class="list-decimal pl-5 space-y-1">
+        <li>The riders' weights and heights are averaged into one typical rider, and that rider's power to hold the
+          target flat speed alone on the flat is worked out.</li>
+        <li>That power is held steady over the whole route, lead-in included. On each stretch of the profile, about
+          every 50 m, it gives the team's speed there: slower up a climb, faster down a descent. That is the line on
+          the chart. Each stretch's slope is measured over about {{ course_grade_window_m }} m, since a bike's
+          momentum carries it over shorter bumps.</li>
+        <li>For each rider, the readout gives the power to hold that speed on that stretch: on the front, with no
+          draft, and sitting in, averaged over the wheels they ride by the time at each. A custom pull power scales a
+          rider's pulls in step with the model's own.</li>
+      </ol>
+      <p>
+        Two things stand out on a hilly route. On a climb, everyone's power to hold the team's speed comes out at
+        nearly the same W/kg, so a light rider holds it on fewer watts than a heavy one. And the draft saves a share
+        of the air resistance, which is most of the work on the flat but little of it on a climb, so sitting in there
+        costs nearly as much as pulling. A rider whose sitting-in power goes over their FTP is marked
+        <span class="badge badge-warning badge-xs">over FTP</span>: they get no rest there.
+      </p>
+      <p>
+        Move along the profile with the mouse, drag across it on a phone, or focus it and use the arrow keys (Page Up
+        and Page Down jump further, Home and End go to the start and the finish). The chart starts on the steepest
+        stretch.
+      </p>
+      <p>
+        The steady effort is a model, not a pacing plan: real teams often ease off on climbs so everyone stays
+        together, and push harder on the flat.
+      </p>
+    </div>
+  </section>
+
+  <section id="time" aria-labelledby="time-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="time-h" class="card-title">Finish time</h2>
+      <p>
+        With an elevation profile, the finish time is the profile ridden at the steady effort described under
+        <a class="link" href="#course">On the course</a>: each stretch's length over the team's speed on it, added up,
+        lead-in included, since the lead-in is raced. The speed beside it on the Team card is that distance over that
+        time.
+      </p>
+      <p>When the route has no profile, the planner falls back to a rougher estimate:</p>
+      <ol class="list-decimal pl-5 space-y-1">
+        <li>The typical rider's power to hold the target flat speed alone on the flat is worked out.</li>
+        <li>The planner finds the speed that power gives on the route's average gradient: total climbing ÷ distance.</li>
+        <li>Finish time = distance ÷ that speed.</li>
+      </ol>
+      <p>
+        That treats all the climbing as one steady slope with no descents, so on a hilly course it runs slow, and it
+        leaves the lead-in out.
+      </p>
+      <p>The race length also sets how many pulls each rider takes, which the W′ balance and TSS depend on.</p>
+    </div>
+  </section>
+
+  <section id="climb" aria-labelledby="climb-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="climb-h" class="card-title">Climb compare</h2>
+      <p>
+        For riders whose profile has a power curve (from Zwift Racing), the plan page shows how far behind the squad's
+        fastest climber each rider would finish a {{ climb_grade_pct }}% climb of different lengths, riding a steady best
+        effort without drafting. It shows who is likely to be dropped on a long drag before it happens.
+      </p>
+      {% include "_climb_method.html" %}
+    </div>
+  </section>
+
+  <section id="zwiftgopher" aria-labelledby="zwiftgopher-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="zwiftgopher-h" class="card-title">zwiftgopher comparison</h2>
+      <p>
+        zwiftgopher.com runs its own TTT optimiser. <strong>Run optimize</strong> sends it your riders (Zwift IDs
+        with the weight, height and FTP the plan uses, or name, weight, height and FTP for guests), your target
+        speed and the upcoming event you choose. Its plan then appears next to ours: finish time, average speed,
+        team power, and a suggested pull order you can copy.
+      </p>
+      <ul class="list-disc pl-5 space-y-1">
+        <li>Its model is its own, and its route is the upcoming event's, which may not be the one you picked.</li>
+        <li>It takes 2 to 8 riders, and accepts one request a minute, so a run can take about a minute and a half.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="limits" aria-labelledby="limits-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="limits-h" class="card-title">What the model leaves out</h2>
+      <ul class="list-disc pl-5 space-y-1">
+        <li><strong>Hills in the pull schedule and Pull Stats.</strong> Pull powers, IF and the limits are worked out on level
+          road; only the finish time and <a class="link" href="#course">On the course</a> ride the route's slopes.</li>
+        <li><strong>Pacing.</strong> The team rides the course at a steady effort. Easing off on climbs and pushing on
+          the flat is not modelled yet.</li>
+        <li><strong>Equipment.</strong> Every rider is on the same TT bike, a TT frame with a deep front wheel and a
+          disc. Ordinary wheels need about 5% more power than the planner shows, and a road bike about 15% more.</li>
+        <li><strong>Riders who take no pulls.</strong> They come through and swing straight off, so they ride every
+          wheel in turn. One who sits at the back all race instead gets more draft than the planner shows, and the
+          riders rotating ahead of them less.</li>
+        <li><strong>The order Optimize picks.</strong> It orders the riders by pull length rather than trying every
+          order. Another order can suit a team better; Pull Stats shows what any order you set does.</li>
+        <li><strong>W′ is an estimate.</strong> Zwift Racing's CP and W′ come from each rider's best recent efforts,
+          and the stand-ins for riders without them are rougher still. Real riders also tire over a race in ways the W′
+          model does not capture.</li>
+        <li><strong>Race dynamics.</strong> Surges, corners, power-ups, gaps in the rotation and riders being dropped
+          are not modelled.</li>
+        <li><strong>Data age.</strong> Weights, heights, FTPs, CP and W′ are copies of the riders' profiles, taken
+          when each rider was added, and can be out of date.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="glossary" aria-labelledby="glossary-h" class="card bg-base-200 scroll-mt-24">
+    <div class="card-body space-y-3">
+      <h2 id="glossary-h" class="card-title">Glossary</h2>
+      <dl class="space-y-2">
+        <div><dt class="font-semibold">FTP</dt><dd>Functional threshold power: roughly the power a rider can hold for an hour.</dd></div>
+        <div><dt class="font-semibold">W/kg</dt><dd>Watts per kilogram of body weight.</dd></div>
+        <div><dt class="font-semibold">CdA</dt><dd>Drag area: how much air a rider pushes, in m².</dd></div>
+        <div><dt class="font-semibold">CP</dt><dd>Critical power: the highest power a rider can hold for a long time; close to FTP.</dd></div>
+        <div><dt class="font-semibold">W′</dt><dd>The work a rider can do above CP before they must ease off, in kilojoules.</dd></div>
+        <div><dt class="font-semibold">W′ balance (W′bal)</dt><dd>How much of W′ a rider has left at a given moment.</dd></div>
+        <div><dt class="font-semibold">Pull</dt><dd>A turn on the front of the line.</dd></div>
+        <div><dt class="font-semibold">Rotation</dt><dd>One full turn through every rider who pulls.</dd></div>
+        <div><dt class="font-semibold">NP</dt><dd>Normalized Power: an average that weights hard efforts more, closer to how a varied ride feels.</dd></div>
+        <div><dt class="font-semibold">IF</dt><dd>Intensity factor: NP ÷ FTP.</dd></div>
+        <div><dt class="font-semibold">TSS</dt><dd>Training Stress Score: hours × IF² × 100. An hour at FTP is 100.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+</div>
+{% endblock %}

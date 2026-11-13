@@ -1,0 +1,27 @@
+"""URL patterns for accounts app."""
+
+from django.urls import path
+
+from apps.accounts import views
+
+app_name = "accounts"
+
+urlpatterns = [
+    path("profile/", views.profile_view, name="profile"),
+    path("profile/<int:user_id>/", views.public_profile_view, name="public_profile"),
+    # By Zwift id: the identifier that actually travels between systems. Redirects to the
+    # canonical profile URL above.
+    path("profile/z/<int:zwid>/", views.public_profile_by_zwid, name="public_profile_by_zwid"),
+    # POST triggers an upstream re-check; GET is the card polling for the result.
+    path("profile/<int:user_id>/refresh-data/", views.refresh_rider_data, name="refresh_rider_data"),
+    path("profile/edit/", views.profile_edit, name="profile_edit"),
+    path("profile/import/<uuid:application_id>/", views.import_application_view, name="import_application"),
+    path("profile/delete/", views.profile_delete_confirm, name="profile_delete_confirm"),
+    path("profile/delete/confirm/", views.profile_delete, name="profile_delete"),
+    path("profile/unverify-zwift/", views.unverify_zwift, name="unverify_zwift"),
+    path("dismiss-zauth-banner/", views.dismiss_zauth_banner, name="dismiss_zauth_banner"),
+    path("profile/refresh-zr/", views.refresh_zr, name="refresh_zr"),
+    path("profile/race-ready/", views.submit_race_ready, name="submit_race_ready"),
+    path("verification/", views.verification_view, name="verification"),
+    path("verification/delete/", views.verification_delete, name="verification_delete"),
+]

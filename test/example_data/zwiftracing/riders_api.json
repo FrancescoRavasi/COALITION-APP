@@ -1,0 +1,276 @@
+[
+  {
+    "riderId": 9000001,
+    "name": "Test Rider 1",
+    "gender": "M",
+    "country": "us",
+    "age": "Vet",
+    "height": 178,
+    "weight": 72.5,
+    "zpCategory": "B",
+    "zpFTP": 250,
+    "power": {
+      "wkg5": 12.4138,
+      "wkg15": 10.0,
+      "wkg30": 7.931,
+      "wkg60": 6.3724,
+      "wkg120": 5.3517,
+      "wkg300": 4.6621,
+      "wkg1200": 3.6138,
+      "w5": 900,
+      "w15": 725,
+      "w30": 575,
+      "w60": 462,
+      "w120": 388,
+      "w300": 338,
+      "w1200": 262,
+      "CP": 255.0,
+      "AWC": 18500.5,
+      "compoundScore": 1250.5
+    },
+    "race": {
+      "last": {
+        "rating": 1120.5539,
+        "date": 1735689600,
+        "mixed": {
+          "category": "Emerald",
+          "number": 3
+        }
+      },
+      "current": {
+        "rating": 1120.5539,
+        "date": 1735776000,
+        "mixed": {
+          "category": "Emerald",
+          "number": 3
+        }
+      },
+      "max30": {
+        "rating": 0,
+        "expires": 1738368000
+      },
+      "max90": {
+        "rating": 1140.8039,
+        "date": 1730419200,
+        "expires": 1743465600,
+        "mixed": {
+          "category": "Emerald",
+          "number": 3
+        }
+      },
+      "finishes": 42,
+      "dnfs": 1,
+      "wins": 3,
+      "podiums": 9
+    },
+    "handicaps": {
+      "profile": {
+        "flat": -1.5,
+        "rolling": -2.25,
+        "hilly": -3.0,
+        "mountainous": -4.75
+      }
+    },
+    "phenotype": {
+      "scores": {
+        "sprinter": 3.5,
+        "puncheur": 2.75,
+        "pursuiter": 4.25,
+        "climber": 3.25,
+        "tt": 2.5
+      },
+      "value": "Puncheur",
+      "bias": 12.5
+    },
+    "club": {
+      "id": 99999,
+      "name": "TEST CLUB"
+    }
+  },
+  {
+    "riderId": 9000002,
+    "name": "Test Rider 2",
+    "gender": "M",
+    "country": "gb",
+    "age": "50+",
+    "height": 183,
+    "weight": 80.0,
+    "zpCategory": "A",
+    "zpFTP": 295,
+    "power": {
+      "wkg5": 13.275,
+      "wkg15": 10.7,
+      "wkg30": 8.475,
+      "wkg60": 6.825,
+      "wkg120": 5.7125,
+      "wkg300": 4.975,
+      "wkg1200": 3.875,
+      "w5": 1062,
+      "w15": 856,
+      "w30": 678,
+      "w60": 546,
+      "w120": 457,
+      "w300": 398,
+      "w1200": 310,
+      "CP": 300.0,
+      "AWC": 18500.5,
+      "compoundScore": 1250.5
+    },
+    "race": {
+      "last": {
+        "rating": 1345.7712,
+        "date": 1735689600,
+        "mixed": {
+          "category": "Diamond",
+          "number": 1
+        }
+      },
+      "current": {
+        "rating": 1345.7712,
+        "date": 1735776000,
+        "mixed": {
+          "category": "Diamond",
+          "number": 1
+        }
+      },
+      "max30": {
+        "rating": 1358.5212,
+        "date": 1735689600,
+        "expires": 1738368000,
+        "mixed": {
+          "category": "Diamond",
+          "number": 1
+        }
+      },
+      "max90": {
+        "rating": 1366.0212,
+        "date": 1730419200,
+        "expires": 1743465600,
+        "mixed": {
+          "category": "Diamond",
+          "number": 1
+        }
+      },
+      "finishes": 87,
+      "dnfs": 2,
+      "wins": 11,
+      "podiums": 24
+    },
+    "handicaps": {
+      "profile": {
+        "flat": -1.5,
+        "rolling": -2.25,
+        "hilly": -3.0,
+        "mountainous": -4.75
+      }
+    },
+    "phenotype": {
+      "scores": {
+        "sprinter": 3.5,
+        "puncheur": 2.75,
+        "pursuiter": 4.25,
+        "climber": 2.75,
+        "tt": 2.5
+      },
+      "value": "Pursuiter",
+      "bias": -4.25
+    },
+    "club": {
+      "id": 99999,
+      "name": "TEST CLUB"
+    }
+  },
+  {
+    "riderId": 9000003,
+    "name": "Test Rider 3",
+    "gender": "F",
+    "country": "ca",
+    "age": "Snr",
+    "height": 168,
+    "weight": 61.0,
+    "zpCategory": "C",
+    "zpFTP": 205,
+    "power": {
+      "wkg5": 12.0984,
+      "wkg15": 9.7377,
+      "wkg30": 7.7213,
+      "wkg60": 6.2131,
+      "wkg120": 5.2131,
+      "wkg300": 4.541,
+      "wkg1200": 3.5246,
+      "w5": 738,
+      "w15": 594,
+      "w30": 471,
+      "w60": 379,
+      "w120": 318,
+      "w300": 277,
+      "w1200": 215,
+      "CP": 210.0,
+      "AWC": 18500.5,
+      "compoundScore": 1250.5
+    },
+    "race": {
+      "last": {
+        "rating": 980.2544,
+        "date": 1735689600,
+        "mixed": {
+          "category": "Sapphire",
+          "number": 4
+        }
+      },
+      "current": {
+        "rating": 980.2544,
+        "date": 1735776000,
+        "mixed": {
+          "category": "Sapphire",
+          "number": 4
+        }
+      },
+      "max30": {
+        "rating": 993.0044,
+        "date": 1735689600,
+        "expires": 1738368000,
+        "mixed": {
+          "category": "Sapphire",
+          "number": 4
+        }
+      },
+      "max90": {
+        "rating": 1000.5044,
+        "date": 1730419200,
+        "expires": 1743465600,
+        "mixed": {
+          "category": "Sapphire",
+          "number": 4
+        }
+      },
+      "finishes": 18,
+      "dnfs": 0,
+      "wins": 1,
+      "podiums": 4
+    },
+    "handicaps": {
+      "profile": {
+        "flat": -1.5,
+        "rolling": -2.25,
+        "hilly": -3.0,
+        "mountainous": -4.75
+      }
+    },
+    "phenotype": {
+      "scores": {
+        "sprinter": 3.5,
+        "puncheur": 2.75,
+        "pursuiter": 4.25,
+        "climber": 4.5,
+        "tt": 2.5
+      },
+      "value": "Time Trialist",
+      "bias": -18.0
+    },
+    "club": {
+      "id": 99999,
+      "name": "TEST CLUB"
+    }
+  }
+]

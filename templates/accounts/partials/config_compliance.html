@@ -1,0 +1,130 @@
+{% comment %}
+  Compliance tools. First one: carry out an erasure request on a member's behalf, running
+  the same deletion their own profile page would.
+{% endcomment %}
+<div class="space-y-6">
+  <div>
+    <h3 class="text-lg font-semibold">Delete a member's account</h3>
+    <p class="text-sm text-base-content/70 mt-1">
+      For handling an erasure request from someone who cannot do it themselves. This runs
+      exactly what their own <strong>Delete Account</strong> button runs &mdash; the next
+      screen shows what it reaches and what it does not.
+    </p>
+  </div>
+
+  <form method="get" action="{% url 'compliance_delete_confirm' %}" class="flex flex-wrap items-end gap-3">
+    <label class="form-control w-full sm:w-96">
+      <span class="label-text mb-1">Member</span>
+      <select name="user_id" class="select select-bordered select-sm filter-select" required>
+        <option value="">Select a member…</option>
+        {% for u in deletable_users %}
+        <option value="{{ u.pk }}">
+          {{ u.get_full_name|default:u.username }}{% if u.discord_username %} — {{ u.discord_username }}{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit" class="btn btn-error btn-outline btn-sm">Continue&hellip;</button>
+  </form>
+
+  <div class="alert alert-warning">
+    <span class="text-sm">
+      Account deletion is immediate and cannot be undone. There is no grace period and no
+      way to restore the account afterwards.
+    </span>
+  </div>
+
+  <div class="divider"></div>
+
+  <div>
+    <h3 class="text-lg font-semibold">Blocked logins</h3>
+    <p class="text-sm text-base-content/70 mt-1">
+      Discord accounts listed here are refused at sign-in, whether or not they have an
+      account on this site. Blocking someone who is currently signed in also ends their
+      session. It does <strong>not</strong> remove them from the Discord server.
+    </p>
+  </div>
+
+  <form method="post" action="{% url 'compliance_block_add' %}" class="flex flex-wrap items-end gap-3">
+    {% csrf_token %}
+    <label class="form-control">
+      <span class="label-text mb-1">Discord ID</span>
+      <input type="text" name="discord_id" inputmode="numeric" pattern="[0-9]+" required
+             placeholder="123456789012345678"
+             class="input input-bordered input-sm w-64 font-mono" />
+    </label>
+    <label class="form-control grow">
+      <span class="label-text mb-1">Note <span class="text-base-content/50">(optional)</span></span>
+      <input type="text" name="note" maxlength="200" placeholder="Why this account is blocked"
+             class="input input-bordered input-sm w-full" />
+    </label>
+    <button type="submit" class="btn btn-error btn-outline btn-sm">Block</button>
+  </form>
+
+  {% if blocked_logins %}
+  <div class="overflow-x-auto">
+    <table class="table table-sm">
+      <thead>
+        <tr>
+          <th>Discord ID</th>
+          <th>Note</th>
+          <th>Blocked by</th>
+          <th>Added</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for block in blocked_logins %}
+        <tr>
+          <td class="font-mono">{{ block.discord_id }}</td>
+          <td class="text-sm">{{ block.note|default:"&mdash;" }}</td>
+          <td class="text-sm">
+            {% if block.blocked_by %}{{ block.blocked_by.get_full_name|default:block.blocked_by.username }}
+            {% else %}&mdash;{% endif %}
+          </td>
+          <td class="text-sm whitespace-nowrap">{{ block.created_at|date:"M j, Y" }}</td>
+          <td class="text-right">
+            <form method="post" action="{% url 'compliance_block_remove' %}">
+              {% csrf_token %}
+              <input type="hidden" name="block_id" value="{{ block.pk }}" />
+              <button type="submit" class="btn btn-ghost btn-xs">Unblock</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="text-sm text-base-content/60">No blocked accounts.</p>
+  {% endif %}
+
+  {% comment %}
+    The Compliance fieldset, rendered here rather than on its own page so the retention
+    windows sit with the tools that act on the same data. Last rather than first on purpose:
+    the erasure tool is what this page is opened to do, and a settings form above it would
+    push that below the fold. The id/section-content wrapper is what the shared partial's
+    form posts back into, so HTMX swaps the form rather than the whole page.
+  {% endcomment %}
+  {% if current_section.settings %}
+  <div class="divider"></div>
+
+  <div>
+    <h3 class="text-lg font-semibold">Retention and policy</h3>
+    <p class="text-sm text-base-content/70 mt-1">
+      How long page-visit data is kept before it is anonymised and then deleted, how long a
+      cached rider profile is kept after we stop asking about that rider, and where the
+      published policies live. These are what a "what do you keep, and for how long" question
+      is answered against, so they are set here rather than among the settings for the systems
+      that happen to produce the data.
+    </p>
+  </div>
+
+  <div id="section-{{ current_section.key }}">
+    <div class="section-content">
+      {% include "accounts/partials/config_section.html" with section=current_section %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% include "events/_filter_select_script.html" %}

@@ -1,0 +1,128 @@
+"""URL configuration for gotta_bike_platform project.
+
+The `urlpatterns` list routes URLs to views. For more information please see:
+    https://docs.djangoproject.com/en/6.0/topics/http/urls/
+
+Examples:
+Function views
+    1. Add an import:  from my_app import views
+    2. Add a URL to urlpatterns:  path('', views.home, name='home')
+Class-based views
+    1. Add an import:  from other_app.views import Home
+    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
+Including another URLconf
+    1. Import the include() function: from django.urls import include, path
+    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+
+"""
+
+from django.conf import settings
+from django.contrib import admin
+from django.urls import include, path, re_path
+
+from apps.accounts.views import (
+    compliance_block_add,
+    compliance_block_remove,
+    compliance_delete_confirm,
+    compliance_delete_user,
+    config_section_page,
+    config_section_update,
+    config_settings,
+    config_site_images_update,
+    config_trigger_task,
+    markdown_preview,
+)
+from apps.analytics.api import api as analytics_api
+from apps.dbot_api.api import api as dbot_api
+from apps.team.kit_views import (
+    team_kit_add,
+    team_kit_edit,
+    team_kit_export,
+    team_kit_import,
+    team_kit_import_confirm,
+    team_kit_make_current,
+    team_kit_toggle_active,
+)
+from apps.user_api.api import api as user_api
+from gotta_bike_platform.views import (
+    about,
+    block_social_signup,
+    closed_account_route,
+    discord_only_login,
+    healthz,
+    home,
+    login_help,
+    robots_txt,
+)
+
+urlpatterns = [
+    path("", home, name="home"),
+    path("about/", about, name="about"),
+    path("robots.txt", robots_txt, name="robots_txt"),
+    path("healthz", healthz, name="healthz"),
+    path("admin/", admin.site.urls),
+    path("api/analytics/", analytics_api.urls),
+    path("api/dbot/", dbot_api.urls),
+    path("api/user/", user_api.urls),
+    path("accounts/3rdparty/signup/", block_social_signup, name="block_social_signup"),
+    # Discord is the only way in. These shadow allauth's email- and password-based routes
+    # (every sub-path) so none of them can sign anybody in or hand out a password; see
+    # closed_account_route. allauth's own URL names still reverse, the pages just 404.
+    path("accounts/login/", discord_only_login, name="discord_only_login"),
+    # Where a refused Discord sign-in lands, with the reason (apps/accounts/login_help.py).
+    path("accounts/login/help/", login_help, name="login_help"),
+    re_path(r"^accounts/login/code/", closed_account_route, {"route": "login_code"}),
+    re_path(r"^accounts/password/", closed_account_route, {"route": "password"}),
+    re_path(r"^accounts/email/", closed_account_route, {"route": "email"}),
+    re_path(r"^accounts/confirm-email/", closed_account_route, {"route": "confirm_email"}),
+    path("accounts/", include("allauth.urls")),
+    path("user/", include("apps.accounts.urls")),
+    path("user/api-keys/", include("apps.user_api.urls")),
+    path("user/zauth/", include("apps.zwift.urls")),
+    path("team/", include("apps.team.urls")),
+    path("data-connections/", include("apps.data_connection.urls")),
+    path("m/", include("apps.magic_links.urls")),
+    path("page/", include("apps.cms.urls")),
+    path("analytics/", include("apps.analytics.urls")),
+    path("strava/", include("apps.club_strava.urls")),
+    path("zp/", include("apps.zwiftpower.urls")),
+    path("events/", include("apps.events.urls")),
+    path("tickets/", include("apps.tickets.urls")),
+    path("ttt/", include("apps.ttt_planner.urls")),
+    path("ladder/", include("apps.ladder_planner.urls")),
+    path("routes/", include("apps.ttt_planner.routes_urls")),
+    # Site-level configuration
+    path("site/config/", config_settings, name="config_settings"),
+    # Note: specific routes must come before the generic <str:section_key> pattern
+    path("site/config/images/", config_site_images_update, name="config_site_images_update"),
+    path("site/config/tasks/trigger/", config_trigger_task, name="config_trigger_task"),
+    path("site/config/compliance/delete/", compliance_delete_user, name="compliance_delete_user"),
+    path("site/config/compliance/block/", compliance_block_add, name="compliance_block_add"),
+    path("site/config/compliance/unblock/", compliance_block_remove, name="compliance_block_remove"),
+    path(
+        "site/config/compliance/confirm/",
+        compliance_delete_confirm,
+        name="compliance_delete_confirm",
+    ),
+    # Team kit section actions (the section page itself is config_section_page "team_kit").
+    path("site/config/team-kit/add/", team_kit_add, name="team_kit_add"),
+    path("site/config/team-kit/<int:pk>/edit/", team_kit_edit, name="team_kit_edit"),
+    path("site/config/team-kit/<int:pk>/current/", team_kit_make_current, name="team_kit_make_current"),
+    path("site/config/team-kit/<int:pk>/active/", team_kit_toggle_active, name="team_kit_toggle_active"),
+    path("site/config/team-kit/export/", team_kit_export, name="team_kit_export"),
+    path("site/config/team-kit/import/", team_kit_import, name="team_kit_import"),
+    path("site/config/team-kit/import/confirm/", team_kit_import_confirm, name="team_kit_import_confirm"),
+    path("site/config/markdown-preview/", markdown_preview, name="markdown_preview"),
+    path("site/config/section/<str:section_key>/update/", config_section_update, name="config_section_update"),
+    path("site/config/<str:section_key>/", config_section_page, name="config_section_page"),
+]
+
+if settings.DEBUG:
+    from django.conf.urls.static import static
+
+    urlpatterns += [
+        path("__debug__/", include("debug_toolbar.urls")),
+        path("__reload__/", include("django_browser_reload.urls")),
+    ]
+    # Serve media files in development
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

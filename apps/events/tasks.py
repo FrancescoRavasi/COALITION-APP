@@ -1,0 +1,283 @@
+"""Background tasks for events app."""
+
+from __future__ import annotations
+
+import logfire
+from django.tasks import task  # ty:ignore[unresolved-import]
+from django.template.defaultfilters import date as date_filter
+from django.utils import timezone
+
+from apps.accounts.discord_service import send_discord_channel_message, send_discord_dm
+from apps.events import ds_service
+from apps.events.models import EventSignup, SlotDS
+from apps.team.services import ZP_DIV_TO_CATEGORY
+from apps.zwiftpower.models import ZPTeamRiders
+from apps.zwiftracing.models import ZRRider
+from gotta_bike_platform.log_utils import log_id
+
+
+def _format_signup_message(signup: EventSignup, profile_url: str | None) -> str:
+    """Build the Discord channel message for a new event signup.
+
+    Args:
+        signup: The freshly created EventSignup.
+        profile_url: Absolute URL to the rider's public profile in the app.
+
+    Returns:
+        Multi-line Markdown string ready for Discord.
+
+    """
+    user = signup.user
+    event = signup.event
+    display_name = user.get_full_name() or user.discord_nickname or user.discord_username or user.username
+
+    lines: list[str] = [f"📝 **New signup — {event.title}**"]
+
+    # Rider line; link the display name to their app profile when we have a URL.
+    if profile_url:
+        lines.append(f"Rider: [{display_name}]({profile_url})")
+    else:
+        lines.append(f"Rider: {display_name}")
+
+    # ZP category — read the user's div/divw via their zwid
+    zp_cat = ""
+    if user.zwid:
+        zp = ZPTeamRiders.objects.filter(zwid=user.zwid).first()
+        if zp:
+            zp_cat = ZP_DIV_TO_CATEGORY.get(zp.divw if user.gender == "female" else zp.div, "")
+    if zp_cat:
+        lines.append(f"ZP: **{zp_cat}**")
+
+    # ZR category + rating
+    if user.zwid:
+        zr = ZRRider.objects.filter(zwid=user.zwid).first()
+        if zr:
+            cat = (getattr(zr, "race_current_category", "") or "").strip()
+            rating = getattr(zr, "race_current_rating", None)
+            if cat or rating is not None:
+                rating_part = f" ({rating})" if rating is not None else ""
+                lines.append(f"ZR: **{cat or '?'}**{rating_part}")
+
+    # Conditional fields, only when the event captures them
+    if event.timezone_required and signup.signup_timezone:
+        lines.append("Timezone: " + ", ".join(signup.signup_timezone))
+    if event.squad_gender_required and signup.signup_squad_gender:
+        lines.append("Squad Gender: " + ", ".join(signup.signup_squad_gender))
+
+    return "\n".join(lines)
+
+
+def post_signup_notification(signup_id: int, profile_url: str | None = None) -> dict:
+    """Post the signup notification synchronously.
+
+    No-op if the event has no ``signup_notification_channel_id`` configured.
+    Failures are logged and swallowed — they must not affect the signup flow.
+
+    Args:
+        signup_id: PK of the freshly created EventSignup.
+        profile_url: Absolute URL to the rider's public profile in this app.
+
+    Returns:
+        Dict describing the outcome (status: posted / skipped / error).
+
+    """
+    with logfire.span("notify_signup_to_channel", signup_id=signup_id):
+        try:
+            signup = EventSignup.objects.select_related("user", "event").get(pk=signup_id)
+        except EventSignup.DoesNotExist:
+            logfire.error("Signup not found", signup_id=signup_id)
+            return {"status": "error", "reason": "signup_not_found"}
+
+        channel_id = signup.event.signup_notification_channel_id
+        if not channel_id:
+            logfire.debug("Event has no signup notification channel; skipping")
+            return {"status": "skipped", "reason": "channel_not_configured"}
+
+        message = _format_signup_message(signup, profile_url)
+        ok = send_discord_channel_message(channel_id, message)
+        if not ok:
+            logfire.warning(
+                "Signup notification not sent",
+                signup_id=signup_id,
+                event_id=signup.event_id,
+                channel_id=log_id(channel_id),
+            )
+            return {"status": "error", "reason": "send_failed", "channel_id": str(channel_id)}
+
+        logfire.info(
+            "Signup notification posted",
+            signup_id=signup_id,
+            event_id=signup.event_id,
+            channel_id=log_id(channel_id),
+        )
+        return {"status": "posted", "channel_id": str(channel_id)}
+
+
+@task
+def notify_signup_to_channel(signup_id: int, profile_url: str | None = None) -> dict:
+    """Background-task wrapper around ``post_signup_notification``.
+
+    Args:
+        signup_id: PK of the freshly created EventSignup.
+        profile_url: Absolute URL to the rider's public profile in this app.
+
+    Returns:
+        See :func:`post_signup_notification`.
+
+    """
+    return post_signup_notification(signup_id=signup_id, profile_url=profile_url)
+
+
+def _format_signup_dm(signup: EventSignup, my_events_url: str | None) -> str:
+    """Build the confirmation DM sent to a rider who just signed up.
+
+    Args:
+        signup: The freshly created EventSignup.
+        my_events_url: Absolute URL to the rider's "My Events" page, if known.
+
+    Returns:
+        Multi-line Markdown string for a Discord DM.
+
+    """
+    event = signup.event
+    start = date_filter(event.start_date, "M j, Y")
+    end = date_filter(event.end_date, "M j, Y")
+
+    lines: list[str] = [
+        f"✅ **You're signed up — {event.title}**",
+        "",
+        f"📅 **Dates:** {start} – {end}",  # ruff:ignore[ambiguous-unicode-character-string] — en dash for the date range is intentional
+    ]
+    if event.discord_channel_id:
+        lines.append(f"💬 **Event channel:** <#{event.discord_channel_id}>")
+    lines.append("")
+    lines.append(
+        "Head to **My Events** to set your availability, see your squad and scheduled races, "
+        "and find all the event details:"
+    )
+    if my_events_url:
+        lines.append(my_events_url)
+    lines.append("")
+    lines.append("See you on course! 🚴")
+    return "\n".join(lines)
+
+
+def send_signup_dm(signup_id: int, my_events_url: str | None = None) -> dict:
+    """Send the rider a confirmation DM for their signup, synchronously.
+
+    Non-fatal: any failure is logged and swallowed so it never affects the signup flow.
+
+    Args:
+        signup_id: PK of the freshly created EventSignup.
+        my_events_url: Absolute URL to the rider's "My Events" page, if known.
+
+    Returns:
+        Dict describing the outcome (status: sent / skipped / error).
+
+    """
+    with logfire.span("dm_signup_confirmation", signup_id=signup_id):
+        try:
+            signup = EventSignup.objects.select_related("user", "event").get(pk=signup_id)
+        except EventSignup.DoesNotExist:
+            logfire.error("Signup not found for DM", signup_id=signup_id)
+            return {"status": "error", "reason": "signup_not_found"}
+
+        user = signup.user
+        if not user.discord_id:
+            logfire.debug("Rider has no linked Discord; skipping signup DM")
+            return {"status": "skipped", "reason": "no_discord_id"}
+
+        message = _format_signup_dm(signup, my_events_url)
+        ok = send_discord_dm(user.discord_id, message)
+        if not ok:
+            logfire.warning("Signup DM not sent", signup_id=signup_id, user_id=user.id, event_id=signup.event_id)
+            return {"status": "error", "reason": "send_failed"}
+
+        logfire.info("Signup DM sent", signup_id=signup_id, user_id=user.id, event_id=signup.event_id)
+        return {"status": "sent"}
+
+
+@task
+def dm_signup_confirmation(signup_id: int, my_events_url: str | None = None) -> dict:
+    """Background-task wrapper around :func:`send_signup_dm`.
+
+    Args:
+        signup_id: PK of the freshly created EventSignup.
+        my_events_url: Absolute URL to the rider's "My Events" page, if known.
+
+    Returns:
+        See :func:`send_signup_dm`.
+
+    """
+    return send_signup_dm(signup_id=signup_id, my_events_url=my_events_url)
+
+
+# Convenience for code that wants to enqueue with the right URL builder.
+def enqueue_signup_notification(signup: EventSignup, *, request=None) -> None:
+    """Enqueue the signup channel notification and the rider confirmation DM.
+
+    The channel notification fires only when the event has a signup notification channel
+    configured; the rider DM fires only when the rider has a linked Discord account.
+
+    Args:
+        signup: The newly created EventSignup.
+        request: Optional HttpRequest; used to build absolute URLs.
+
+    """
+    profile_url: str | None = None
+    my_events_url: str | None = None
+    if request is not None:
+        from django.urls import reverse
+
+        try:
+            profile_url = request.build_absolute_uri(
+                reverse("accounts:public_profile", kwargs={"user_id": signup.user_id})
+            )
+        except Exception:
+            profile_url = None
+        try:
+            my_events_url = request.build_absolute_uri(reverse("events:my_events"))
+        except Exception:
+            my_events_url = None
+
+    if signup.event.signup_notification_channel_id:
+        notify_signup_to_channel.enqueue(signup_id=signup.pk, profile_url=profile_url)
+
+    if signup.user.discord_id:
+        dm_signup_confirmation.enqueue(signup_id=signup.pk, my_events_url=my_events_url)
+
+
+@task
+def remove_expired_ds_roles() -> dict:
+    """Remove squad roles from Directeurs Sportifs whose races have finished.
+
+    Daily sweep: for each DS we gave the squad role to (``role_was_assigned``) whose race
+    start is in the past and that hasn't been handled yet, remove the role — but only if it
+    is safe to do so (the DS isn't a squad member/captain and has no other still-active DS
+    assignment for the same squad). Each handled assignment is stamped ``role_removed_at``.
+
+    Returns:
+        Dict with ``checked``, ``removed``, and ``kept`` counts.
+
+    """
+    now = timezone.now()
+    pending = SlotDS.objects.filter(role_was_assigned=True, role_removed_at__isnull=True).select_related(
+        "user", "selection__grid__squad"
+    )
+    checked = removed = kept = 0
+    for ds in pending:
+        if ds.selection.race_datetime_utc >= now:
+            continue  # race not finished yet
+        checked += 1
+        squad = ds.selection.grid.squad
+        if ds_service.should_remove_squad_role(ds.user, squad, exclude_slot_ds_pk=ds.pk):
+            ds_service.remove_squad_role(ds.user, squad)
+            removed += 1
+        else:
+            kept += 1  # entitled (member/captain) or another active DS assignment keeps the role
+        ds.role_removed_at = now
+        ds.save(update_fields=["role_removed_at"])
+
+    result = {"checked": checked, "removed": removed, "kept": kept}
+    logfire.info("DS role sweep complete", **result)
+    return result

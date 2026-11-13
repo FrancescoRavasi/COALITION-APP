@@ -1,0 +1,580 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}Complete Your Registration - The Coalition{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <!-- Header with Status Badge -->
+      <div class="flex flex-col gap-2 sm:flex-row sm:justify-between sm:items-start mb-6">
+        <h2 class="card-title text-2xl">Complete Your Registration</h2>
+        <!-- Status Badge -->
+        {% if application.status == "pending" %}
+        <span class="badge badge-warning badge-lg">Pending Review</span>
+        {% elif application.status == "in_progress" %}
+        <span class="badge badge-info badge-lg">In Progress</span>
+        {% elif application.status == "approved" %}
+        <span class="badge badge-success badge-lg">Approved</span>
+        {% elif application.status == "rejected" %}
+        <span class="badge badge-error badge-lg">Rejected</span>
+        {% endif %}
+      </div>
+
+      <!-- Discord Account Section (like profile) -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-4">
+          {% if application.avatar_url %}
+          <div class="avatar">
+            <div class="w-16 rounded-full ring ring-primary ring-offset-base-100 ring-offset-2">
+              <img src="{{ application.avatar_url }}" alt="{{ application.display_name }}" />
+            </div>
+          </div>
+          {% else %}
+          <div class="avatar placeholder">
+            <div class="bg-neutral text-neutral-content w-16 rounded-full">
+              <span class="text-xl">{{ application.discord_username|slice:":2"|upper }}</span>
+            </div>
+          </div>
+          {% endif %}
+          <div>
+            <h3 class="font-semibold text-lg">Discord Account</h3>
+            <p class="text-base-content/70">{{ application.discord_username }}</p>
+            {% if application.server_nickname and application.server_nickname != application.discord_username %}
+            <p class="text-sm text-base-content/50">Server Nickname: {{ application.server_nickname }}</p>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <!-- Registration Form Instructions -->
+      {% if application_form_instructions %}
+      <div class="bg-info/10 border border-info rounded-lg p-4 mb-6">
+        <div class="prose prose-sm max-w-none">
+          {{ application_form_instructions|render_markdown }}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if application.status == "approved" %}
+      <!-- Approved Message -->
+      <div class="alert alert-success mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+        <div>
+          <h3 class="font-bold">Your registration has been approved!</h3>
+          <p class="text-sm">You can now log in to the team platform using your Discord account.</p>
+        </div>
+      </div>
+      <div class="text-center">
+        <a href="{% url 'account_login' %}" class="btn btn-primary btn-lg">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="currentColor" viewBox="0 0 24 24">
+            <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+          </svg>
+          Log in with Discord
+        </a>
+      </div>
+
+      {% elif application.status == "rejected" %}
+      <!-- Rejected Message -->
+      <div class="alert alert-error mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+        <div>
+          <h3 class="font-bold">Your registration has been declined.</h3>
+          <p class="text-sm">If you have questions, please reach out to the team via Discord.</p>
+        </div>
+      </div>
+
+      {% else %}
+      <!-- Editable Form -->
+      {% if application.has_incomplete_profile_fields %}
+      <div class="alert alert-warning mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <div>
+          <h3 class="font-bold">Incomplete Profile</h3>
+          <p class="text-sm">Please complete these recommended fields:</p>
+          <div class="flex flex-wrap gap-2 mt-2">
+            {% with status=application.profile_completion_status %}
+            {% if not status.email %}<span class="badge badge-outline badge-sm">Email</span>{% endif %}
+            {% if not status.country %}<span class="badge badge-outline badge-sm">Country</span>{% endif %}
+            {% if not status.timezone %}<span class="badge badge-outline badge-sm">Timezone</span>{% endif %}
+            {% if not status.birth_year %}<span class="badge badge-outline badge-sm">Birth Year</span>{% endif %}
+            {% if not status.gender %}<span class="badge badge-outline badge-sm">Gender</span>{% endif %}
+            {% if not status.unit_preference %}<span class="badge badge-outline badge-sm">Unit Preference</span>{% endif %}
+            {% if not status.trainer %}<span class="badge badge-outline badge-sm">Trainer</span>{% endif %}
+            {% if not status.heartrate_monitor %}<span class="badge badge-outline badge-sm">Heart Rate Monitor</span>{% endif %}
+            {% endwith %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <form method="post" id="registration-form" class="space-y-4">
+        {% csrf_token %}
+
+        <!-- About You Section -->
+        <div class="divider">About You</div>
+
+        <!-- How did you hear about us? -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.how_heard.label }} <span class="text-error">*</span></span>
+          </label>
+          {{ form.how_heard }}
+          {% if form.how_heard.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.how_heard.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Why do you want to join? -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.reasons.label }} <span class="text-error">*</span></span>
+          </label>
+          <div class="flex flex-wrap gap-4">
+            {% for checkbox in form.reasons %}
+            <label class="label cursor-pointer gap-2">
+              {{ checkbox.tag }}
+              <span class="label-text">{{ checkbox.choice_label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+          {% if form.reasons.help_text %}
+          <label class="label">
+            <span class="label-text-alt text-base-content/50">{{ form.reasons.help_text }}</span>
+          </label>
+          {% endif %}
+          {% if form.reasons.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.reasons.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Do you know someone? -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.know_someone.label }}</span>
+          </label>
+          {{ form.know_someone }}
+          {% if form.know_someone.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.know_someone.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Which platforms do you use? -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.platforms.label }} <span class="text-error">*</span></span>
+          </label>
+          <div class="flex flex-wrap gap-4">
+            {% for checkbox in form.platforms %}
+            <label class="label cursor-pointer gap-2">
+              {{ checkbox.tag }}
+              <span class="label-text">{{ checkbox.choice_label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+          {% if form.platforms.help_text %}
+          <label class="label">
+            <span class="label-text-alt text-base-content/50">{{ form.platforms.help_text }}</span>
+          </label>
+          {% endif %}
+          {% if form.platforms.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.platforms.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Race series interest -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.race_series.label }}</span>
+            <span class="label-text-alt text-base-content/50">Optional</span>
+          </label>
+          <div class="flex flex-wrap gap-4">
+            {% for checkbox in form.race_series %}
+            <label class="label cursor-pointer gap-2">
+              {{ checkbox.tag }}
+              <span class="label-text">{{ checkbox.choice_label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+          {% if form.race_series.help_text %}
+          <label class="label">
+            <span class="label-text-alt text-base-content/50">{{ form.race_series.help_text }}</span>
+          </label>
+          {% endif %}
+          {% if form.race_series.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.race_series.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Other race series -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.other_race_series.label }}</span>
+            <span class="label-text-alt text-base-content/50">Optional</span>
+          </label>
+          {{ form.other_race_series }}
+          {% if form.other_race_series.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.other_race_series.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Profile Section -->
+        <div class="divider">Profile</div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- First Name -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">First Name <span class="text-error">*</span></span>
+            </label>
+            {{ form.first_name }}
+            {% if form.first_name.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.first_name.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <!-- Last Name -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Last Name <span class="text-error">*</span></span>
+            </label>
+            {{ form.last_name }}
+            {% if form.last_name.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.last_name.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Email -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">Email Address <span class="text-error">*</span></span>
+          </label>
+          {{ form.email }}
+          {% if form.email.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.email.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Birth Year -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Year of Birth</span>
+            </label>
+            {{ form.birth_year }}
+            {% if form.birth_year.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.birth_year.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <!-- Gender -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Gender</span>
+            </label>
+            {{ form.gender }}
+            {% if form.gender.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.gender.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Country -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Country</span>
+            </label>
+            {{ form.country }}
+            {% if form.country.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.country.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <!-- Timezone -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Timezone</span>
+            </label>
+            {{ form.timezone }}
+            {% if form.timezone.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.timezone.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Unit Preference -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">Unit Preference</span>
+          </label>
+          {{ form.unit_preference }}
+          {% if form.unit_preference.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.unit_preference.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Training Equipment Section -->
+        <div class="divider">Training Equipment</div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Trainer -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Trainer</span>
+            </label>
+            {{ form.trainer }}
+            <label class="label">
+              <span class="label-text-alt text-base-content/50">A smart trainer is required to race</span>
+            </label>
+            {% if form.trainer.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.trainer.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <!-- Power Meter -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Power Meter</span>
+            </label>
+            {{ form.power_meter }}
+            <label class="label">
+              <span class="label-text-alt text-base-content/50">Powermeter on your trainer bike, if any</span>
+            </label>
+            {% if form.power_meter.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.power_meter.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Dual Recording -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Dual Recording</span>
+            </label>
+            {{ form.dual_recording }}
+            <label class="label">
+              <span class="label-text-alt text-base-content/50">Are you able to dual record?</span>
+            </label>
+            {% if form.dual_recording.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.dual_recording.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <!-- Heart Rate Monitor -->
+          <div class="form-control">
+            <label class="label">
+              <span class="label-text">Heart Rate Monitor</span>
+            </label>
+            {{ form.heartrate_monitor }}
+            <label class="label">
+              <span class="label-text-alt text-base-content/50">
+                Required to race
+                <span class="tooltip tooltip-left" data-tip="You must turn on heart rate data share at zwiftpower.com">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline-block ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                </span>
+              </span>
+            </label>
+            {% if form.heartrate_monitor.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.heartrate_monitor.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Zwift Account Verification Section -->
+        <div class="divider">Zwift Account Verification</div>
+        <div class="mb-2">
+          <div id="zwift-status-container">
+            {% include "team/partials/application_zwift_status.html" %}
+          </div>
+        </div>
+
+        <!-- Social Links Section (Optional) -->
+        <div class="divider">Social Links (Optional)</div>
+
+        <!-- Strava Profile -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">Strava Profile</span>
+          </label>
+          {{ form.strava_profile }}
+          {% if form.strava_profile.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.strava_profile.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- TrainingPeaks Virtual Profile -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">{{ form.tpv_profile_url.label }}</span>
+          </label>
+          {{ form.tpv_profile_url }}
+          {% if form.tpv_profile_url.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.tpv_profile_url.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Agreements Section -->
+        <div class="divider">Agreements</div>
+
+        <!-- Privacy Policy -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-4">
+            {{ form.agree_privacy }}
+            <span class="label-text">
+              I agree to the
+              {% if privacy_policy_url %}
+              <a href="{{ privacy_policy_url }}" target="_blank" rel="noopener" class="link link-primary">Privacy Policy</a>
+              {% else %}
+              Privacy Policy
+              {% endif %}
+              <span class="text-error">*</span>
+            </span>
+          </label>
+          {% if form.agree_privacy.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.agree_privacy.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Terms of Service -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-4">
+            {{ form.agree_tos }}
+            <span class="label-text">
+              I agree to the
+              {% if terms_of_service_url %}
+              <a href="{{ terms_of_service_url }}" target="_blank" rel="noopener" class="link link-primary">Terms of Service</a>
+              {% else %}
+              Terms of Service
+              {% endif %}
+              <span class="text-error">*</span>
+            </span>
+          </label>
+          {% if form.agree_tos.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.agree_tos.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Applicant Notes -->
+        <div class="form-control">
+          <label class="label">
+            <span class="label-text">Additional Notes</span>
+            <span class="label-text-alt text-base-content/50">Optional</span>
+          </label>
+          {{ form.applicant_notes }}
+          <label class="label">
+            <span class="label-text-alt text-base-content/50">Anything you'd like the team to know about your registration</span>
+          </label>
+        </div>
+
+        <!-- Form Errors -->
+        {% if form.non_field_errors %}
+        <div class="alert alert-error">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+          <span>{{ form.non_field_errors.0 }}</span>
+        </div>
+        {% endif %}
+
+        <!-- Messages from Team -->
+        {% if application.messages %}
+        <div class="bg-info/10 border border-info rounded-lg p-4 mt-6">
+          <h3 class="font-bold text-lg mb-4">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+            </svg>
+            Messages from the Team
+          </h3>
+          {% for msg in application.messages %}
+          <div class="bg-base-100 rounded p-3 mb-2 last:mb-0">
+            <div class="text-xs text-base-content/60 mb-1">
+              {{ msg.author_name }} · {{ msg.created_at }}
+            </div>
+            <div class="prose prose-sm max-w-none">{{ msg.message|render_markdown_untrusted }}</div>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <!-- Submit Button -->
+        <div class="form-control mt-6">
+          <button type="submit" class="btn btn-primary btn-lg">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+            </svg>
+            Save Registration
+          </button>
+        </div>
+      </form>
+
+      {# The Zwift section's Connect button submits this through form="...": it cannot sit inside the registration form above. #}
+      <form id="application-zauth-connect-form" method="post"
+            action="{% url 'team:application_zauth_connect' application.pk %}" hidden>
+        {% csrf_token %}
+      </form>
+
+      <p class="text-sm text-base-content/50"><span class="text-error">*</span> Required fields</p>
+      {% endif %}
+
+      <!-- Registration Status Info -->
+      <div class="divider"></div>
+      <div class="text-center text-sm text-base-content/50">
+        <p>Registration submitted on {{ application.date_created|date:"F d, Y" }}</p>
+        {% if application.date_modified != application.date_created %}
+        <p>Last updated: {{ application.date_modified|date:"F d, Y H:i" }}</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

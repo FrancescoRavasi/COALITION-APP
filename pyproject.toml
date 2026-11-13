@@ -1,0 +1,69 @@
+[project]
+name = "GOTTA-BIKE_virtual-team-app"
+version = "0.1.0"
+description = "App and discord bot for managing zwift virtual cycling teams."
+requires-python = ">=3.14"
+dependencies = [
+    "apscheduler>=3.11.3",
+    "beautifulsoup4>=4.15.0",
+    "boto3>=1.43.126",
+    "datastar-py>=1.0.3",
+    "dj-database-url>=3.1.2",
+    "django>=6.1.3",
+    "django-allauth[mfa,socialaccount]>=65.21.1",
+    "django-constance>=4.5.0",
+    "django-cors-headers>=4.9.0",
+    "django-countries>=9.1.0",
+    "django-htmx>=1.29.0",
+    "django-ninja>=1.7.3",
+    "django-ratelimit>=4.1.0",
+    "django-simple-history>=3.13.0",
+    "django-storages>=1.14.6",
+    "django-tailwind[honcho]>=4.6.0",
+    "django-tasks>=0.12.0",
+    "django-tasks-db>=0.13.0",
+    "google-api-python-client>=2.201.0",
+    "google-auth>=2.62.1",
+    "granian>=2.8.7",
+    "gspread>=6.2.1",
+    "honcho>=2.0.0",
+    "httpx>=0.28.1",
+    "justhtml>=3.16.0",
+    "logfire[asgi,django,psycopg,httpx]>=5.5.0",
+    "markdown>=3.11.3",
+    "pi-heif>=1.4.0",
+    "pillow>=13.0.0",
+    "psycopg[binary]>=3.3.8",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "whitenoise>=6.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "django-tailwind[cookiecutter,honcho,reload]",
+    "django-browser-reload>=1.21.0",
+    "django-debug-toolbar>=8.0.0",
+    "django-stubs>=6.1.2",
+    "pytest>=9.2.0",
+    "pytest-django>=4.14.0",
+    "ruff>=0.17.4",
+    "ty>=0.0.99",
+]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "gotta_bike_platform.settings"
+python_files = ["tests.py", "test_*.py", "*_tests.py"]
+testpaths = ["apps", "gotta_bike_platform"]
+addopts = [
+    "--strict-markers",
+    "--reuse-db",
+    # Tables are created from current model state instead of replaying migrations.
+    # This began as a workaround for a fresh-DB bug in accounts/0013, fixed in
+    # d5c3653; it now only saves the replay time. The cost is that the suite never
+    # runs a migration, so run `manage.py migrate` yourself after makemigrations.
+    "--no-migrations",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:allauth.*",
+]

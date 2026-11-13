@@ -1,0 +1,8956 @@
+"""Views for events app."""
+
+import csv
+import json
+import math
+import re
+from collections import Counter, defaultdict
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
+from http import HTTPStatus
+from zoneinfo import ZoneInfo, available_timezones
+
+import logfire
+from constance import config
+from datastar_py.django import DatastarResponse, ServerSentEventGenerator
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required
+from django.core.cache import cache
+from django.core.paginator import Paginator
+from django.db.models import Count, Q
+from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.template.loader import render_to_string
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.cache import patch_vary_headers
+from django.utils.http import url_has_allowed_host_and_scheme, urlencode
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
+
+from apps.accounts.decorators import discord_permission_required, team_member_required
+from apps.accounts.discord_service import (
+    DISCORD_MISSING_ACCESS,
+    DISCORD_MISSING_PERMISSIONS,
+    DISCORD_NON_TEXT_CHANNEL,
+    DISCORD_UNKNOWN_CHANNEL,
+    ChannelPostResult,
+    add_discord_role,
+    archive_discord_thread,
+    bot_has_role,
+    create_discord_thread,
+    delete_discord_thread,
+    post_discord_channel_message,
+    remove_discord_role,
+    rename_discord_thread,
+    send_discord_channel_message,
+    sync_user_discord_roles,
+)
+from apps.accounts.models import Permissions, User
+from apps.events import ds_service, grid_defaults, rider_stats, series, signup_status
+from apps.events.answer_facets import answers_payload, build_facets, panel_starts_open
+from apps.events.calendar_utils import build_race_ics, race_calendar_urls, unsign_race_token
+from apps.events.channel_access import can_view
+from apps.events.forms import EventForm, EventRoleSetupForm, SignupQuestionForm, SquadForm
+from apps.events.models import (
+    AVAILABILITY_REPOST_COOLDOWN,
+    ZR_CATEGORY_ORDER,
+    AvailabilityGrid,
+    AvailabilityGridTemplate,
+    AvailabilityResponse,
+    AvailabilitySlotSelection,
+    Event,
+    EventSignup,
+    SheetStage,
+    SignupQuestion,
+    SignupStatus,
+    SlotDS,
+    Squad,
+    SquadMember,
+)
+from apps.events.signup_questions import (
+    MAX_QUESTIONS_PER_EVENT,
+    active_questions,
+    build_question_fields,
+    parse_custom_answers,
+    resolve_signup_answers,
+)
+from apps.events.signup_requirements import blocker_details, missing_phrase, requirement_phrase, signup_blockers
+from apps.events.squad_tags import normalize_tags, prune_squad_tags
+from apps.events.squads import squad_member_users as squad_roster_users
+from apps.events.timezone_roles import mapped_roles, parse_role_map, role_columns
+from apps.events.tz_utils import (
+    TIMEZONE_CHOICES,
+    convert_blocked_cells_to_utc,
+    convert_grid_to_local,
+    convert_local_to_utc,
+    convert_utc_to_local_config,
+    drop_fully_blocked_days,
+)
+from apps.team.rosterv2 import fold
+from apps.team.services import ZP_DIV_TO_CATEGORY
+from apps.zwiftpower.models import ZPTeamRiders
+from apps.zwiftracing.models import ZRRider
+from gotta_bike_platform.csv_utils import csv_safe
+
+# Upper bound for the numeric availability answers. Both are counts bounded by a year --
+# more races than days, or more rest than a year between them, is a typo. It also keeps
+# the value inside the column: max_races and rest_days are PositiveSmallIntegerField,
+# i.e. Postgres smallint, so anything over 32767 used to arrive as "smallint out of
+# range" and 500 the rider's submit.
+MAX_AVAILABILITY_ANSWER = 365
+
+
+def _is_event_coordinator(user: User, event: Event) -> bool:
+    """Check if a user holds one of the event's regional/group coordinator roles.
+
+    Coordinators are granted the same event-wide squad management as the head captain
+    (create, edit, delete, and per-squad availability), so this is checked alongside
+    ``head_captain_role_id`` in the squad gates.
+
+    Args:
+        user: The requesting user.
+        event: The event whose coordinator roles to check.
+
+    Returns:
+        True if the user holds any of the event's coordinator roles.
+
+    """
+    return any(user.has_discord_role(role_id) for role_id in (event.coordinator_role_ids or []))
+
+
+def _can_manage_event_squads(user: User, event: Event) -> bool:
+    """Check if a user can create, edit, or delete squads for an event.
+
+    Allowed for:
+    - Superusers
+    - Users with the ``event_admin`` permission
+    - Users holding the event's head captain Discord role
+    - Users holding one of the event's regional/group coordinator roles
+
+    Args:
+        user: The requesting user.
+        event: The event to check against.
+
+    Returns:
+        True if the user can manage squads for this event.
+
+    """
+    if user.is_event_admin or user.is_superuser:
+        return True
+    if event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id):
+        return True
+    return _is_event_coordinator(user, event)
+
+
+def _can_manage_event_roles(user: User, event: Event) -> bool:
+    """Check if a user can manage Discord roles for an event.
+
+    Allowed for the ``assign_roles`` permission, the event's head captain Discord role,
+    or one of its regional/group coordinator roles. Coordinators already get the head
+    captain's event-wide squad management (see ``_is_event_coordinator``), and granting
+    the squad role is the other half of putting a rider in a squad.
+
+    Args:
+        user: The requesting user.
+        event: The event to check against.
+
+    Returns:
+        True if the user can manage roles for this event.
+
+    """
+    if user.has_permission(Permissions.ASSIGN_ROLES):
+        return True
+    if event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id):
+        return True
+    return _is_event_coordinator(user, event)
+
+
+def _can_manage_squad_availability(user: User, squad: Squad) -> bool:
+    """Check if a user can manage availability for a specific squad.
+
+    Allowed for:
+    - Superusers
+    - Users with the ``event_admin`` permission
+    - The squad's captain or vice-captain
+    - Users holding the squad's Discord captain role
+    - Users holding the parent event's head captain Discord role
+    - Users holding one of the parent event's regional/group coordinator roles
+
+    Args:
+        user: The requesting user.
+        squad: The squad whose availability is being managed.
+
+    Returns:
+        True if the user can manage availability for this squad.
+
+    """
+    if user.is_event_admin or user.is_superuser:
+        return True
+    if squad.captains.filter(pk=user.pk).exists() or squad.vice_captains.filter(pk=user.pk).exists():
+        return True
+    if squad.discord_captain_role and user.has_discord_role(squad.discord_captain_role):
+        return True
+    event = squad.event
+    if event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id):
+        return True
+    return _is_event_coordinator(user, event)
+
+
+def _can_view_squad_manage(user: User, event: Event) -> bool:
+    """Check if a user can view the squad management page for an event.
+
+    Full squad managers (event admins, superusers, the event head captain) can
+    view and act on every squad. In addition, any squad captain / vice-captain
+    (or holder of a squad's Discord captain role) in the event can open the
+    page — but they can only edit, invite to, or manage availability for the
+    squads they actually lead (gated per-squad by
+    ``_can_manage_squad_availability``).
+
+    Args:
+        user: The requesting user.
+        event: The event to check against.
+
+    Returns:
+        True if the user can view the squad management page.
+
+    """
+    if _can_manage_event_squads(user, event):
+        return True
+    if event.squads.filter(Q(captains=user) | Q(vice_captains=user)).exists():
+        return True
+    return any(
+        s.discord_captain_role and user.has_discord_role(s.discord_captain_role)
+        for s in event.squads.all()
+    )
+
+
+def _can_view_v_report(user: User, event: Event) -> bool:
+    """Check if a user can view the V Report for an event.
+
+    Allowed for event admins, superusers, squad captains/vice-captains for any squad in
+    the event, holders of the event's head captain Discord role, and its regional/group
+    coordinators.
+
+    Coordinators can already export the full signup CSV for the event
+    (``_can_export_event_signups``), which carries strictly more than either this report or
+    the signup table, so admitting them here closes an asymmetry rather than widening what
+    they can reach.
+
+    Args:
+        user: The requesting user.
+        event: The event to check against.
+
+    Returns:
+        True if the user can view the V Report.
+
+    """
+    if user.is_event_admin or user.is_superuser:
+        return True
+    if event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id):
+        return True
+    if _is_event_coordinator(user, event):
+        return True
+    return event.squads.filter(Q(captains=user) | Q(vice_captains=user)).exists()
+
+
+def _can_view_event(user: User, event: Event) -> bool:
+    """Check whether an event may be shown to a user at all.
+
+    ``Event.visible`` is the team-wide switch, and its help text says so in as many words:
+    an event with it off is not meant to be seen by team members. That has to mean
+    everywhere -- its own page, any listing, and a scheduled race of its borrowed onto
+    another event's page -- or the switch only hides the front door. A race card is the
+    leakiest of those: it names the event, the race, and every rider selected for it.
+
+    The people organising the event still need it, or a draft could not be built before it
+    is announced, so the exception is exactly the set that already sees the event's
+    internals (``_can_view_v_report``): event admins, superusers, holders of the head
+    captain or coordinator roles, and the captains/vice-captains of any of its squads.
+
+    Args:
+        user: The requesting user.
+        event: The event to check.
+
+    Returns:
+        True if the event may be shown to this user.
+
+    """
+    return event.visible or _can_view_v_report(user, event)
+
+
+def _events_hidden_from(user: User, events) -> set[int]:
+    """Return the ids of ``events`` this user must not be shown.
+
+    For the pages that list rows belonging to many events. Give it the events those rows
+    reference -- as a subquery, so nothing is fetched twice -- and it narrows to the
+    hidden ones before doing any per-event role check. An event nobody has hidden costs
+    nothing, which is the normal case.
+
+    Args:
+        user: The requesting user.
+        events: An ``Event`` queryset covering the rows about to be listed.
+
+    Returns:
+        The ids to drop from the listing.
+
+    """
+    return {event.pk for event in events.filter(visible=False) if not _can_view_v_report(user, event)}
+
+
+def _assign_discord_role(user, role_id: int, role_display_name: str, *, admin_user_id: int) -> bool | None:
+    """Add a Discord role to a user, updating their local discord_roles cache.
+
+    Args:
+        user: The User to assign the role to.
+        role_id: The Discord role ID to add.
+        role_display_name: Display name for logging.
+        admin_user_id: The admin performing the action.
+
+    Returns:
+        None if skipped (no discord_id or role_id is 0), True if success/already has, False on API failure.
+
+    """
+    if not role_id or not user.discord_id:
+        return None
+    role_id_str = str(role_id)
+    if user.has_discord_role(role_id_str):
+        return True
+    success = add_discord_role(user.discord_id, role_id_str)
+    if success:
+        roles = user.discord_roles or {}
+        roles[role_id_str] = role_display_name
+        user.discord_roles = roles
+        user.save(update_fields=["discord_roles"])
+        logfire.info(
+            "Auto-assigned Discord role",
+            user_id=user.id,
+            role_id=role_id_str,
+            role_name=role_display_name,
+            admin_user_id=admin_user_id,
+        )
+    else:
+        logfire.error(
+            "Failed to auto-assign Discord role",
+            user_id=user.id,
+            role_id=role_id_str,
+            role_name=role_display_name,
+            admin_user_id=admin_user_id,
+        )
+    return success
+
+
+def _unassign_discord_role(user, role_id: int, *, admin_user_id: int) -> bool | None:
+    """Remove a Discord role from a user, updating their local discord_roles cache.
+
+    Args:
+        user: The User to remove the role from.
+        role_id: The Discord role ID to remove.
+        admin_user_id: The admin performing the action.
+
+    Returns:
+        None if skipped (no discord_id or role_id is 0), True if success/already missing, False on API failure.
+
+    """
+    if not role_id or not user.discord_id:
+        return None
+    role_id_str = str(role_id)
+    if not user.has_discord_role(role_id_str):
+        return True
+    success = remove_discord_role(user.discord_id, role_id_str)
+    if success:
+        roles = user.discord_roles or {}
+        roles.pop(role_id_str, None)
+        user.discord_roles = roles
+        user.save(update_fields=["discord_roles"])
+        logfire.info("Auto-unassigned Discord role", user_id=user.id, role_id=role_id_str, admin_user_id=admin_user_id)
+    else:
+        logfire.error(
+            "Failed to auto-unassign Discord role", user_id=user.id, role_id=role_id_str, admin_user_id=admin_user_id
+        )
+    return success
+
+
+def _annotate_squad_role_names(squads, *, event=None) -> str:
+    """Resolve Discord role names onto squads for the squad card.
+
+    Sets ``role_name`` (the squad's member role), ``captain_role_name``, and
+    ``discord_roles_display`` -- the full labelled list the card's Roles section
+    iterates -- on each squad, in one query. Four call sites render
+    ``_squad_panel.html`` and each used to resolve names itself, which is how the
+    captain, region and coordinator roles ended up displayed nowhere: adding one to a
+    single copy would have shown it on one page and not the others.
+
+    Args:
+        squads: Squad instances to annotate, mutated in place.
+        event: Optional parent event, whose own role name is resolved and returned.
+
+    Returns:
+        The event's Discord role name, or "" when there is none.
+
+    """
+    from apps.team.models import DiscordRole
+
+    squads = list(squads)
+    fields = (
+        ("Squad", "team_discord_role"),
+        ("Captain", "discord_captain_role"),
+        ("Region", "region_role"),
+        ("Coordinator", "regional_coordinator_role"),
+    )
+
+    role_ids = {
+        str(getattr(squad, field)) for squad in squads for _label, field in fields if getattr(squad, field)
+    }
+    if event is not None and event.event_role:
+        role_ids.add(str(event.event_role))
+
+    names = (
+        dict(DiscordRole.objects.filter(role_id__in=role_ids).values_list("role_id", "name")) if role_ids else {}
+    )
+    event_role_name = names.get(str(event.event_role), "") if event is not None and event.event_role else ""
+
+    for squad in squads:
+        resolved = {
+            label: names.get(str(getattr(squad, field)), "") if getattr(squad, field) else ""
+            for label, field in fields
+        }
+        squad.role_name = resolved["Squad"]
+        squad.captain_role_name = resolved["Captain"]
+        # The event role leads the list: it is the one every member of every squad
+        # holds, so it reads as context for the squad-specific roles under it.
+        squad.discord_roles_display = [
+            {"label": label, "name": name}
+            for label, name in [("Event", event_role_name), *resolved.items()]
+            if name
+        ]
+    return event_role_name
+
+
+def _apply_squad_leadership(
+    squad,
+    *,
+    before: dict[str, set],
+    add_as_members: dict[str, bool],
+    admin_user_id: int,
+) -> list[str]:
+    """Grant and revoke Discord roles after the squad form changed its leaders.
+
+    Called with the captain/vice-captain sets as they were *before* the form saved, so
+    only genuine arrivals and departures cause Discord traffic.
+
+    Both roles map to the same ``discord_captain_role``, so a rider moving between
+    captain and vice-captain must not have it revoked in passing: the role is only
+    removed once they hold neither. New leaders optionally join the squad roster too,
+    which is a separate decision from leading it -- a captain need not race.
+
+    Squad limits are deliberately *not* enforced here. A strong rider captaining a
+    development squad is legitimate; the caller surfaces a warning instead.
+
+    Args:
+        squad: The saved squad, with its new leaders already written.
+        before: ``{"captains": set[int], "vice_captains": set[int]}`` of user ids.
+        add_as_members: Per-relation flag for adding arrivals to the roster.
+        admin_user_id: The acting admin, for logging.
+
+    Returns:
+        Human-readable warnings about leaders who fail the squad's own limits.
+
+    """
+    now = {
+        "captains": set(squad.captains.values_list("pk", flat=True)),
+        "vice_captains": set(squad.vice_captains.values_list("pk", flat=True)),
+    }
+    still_leading = now["captains"] | now["vice_captains"]
+    was_leading = before["captains"] | before["vice_captains"]
+
+    for relation in ("captains", "vice_captains"):
+        arrivals = now[relation] - before[relation]
+        for user in User.objects.filter(pk__in=arrivals):
+            if user.pk not in was_leading:
+                _assign_discord_role(
+                    user, squad.discord_captain_role, f"{squad.name} Captain", admin_user_id=admin_user_id
+                )
+            if add_as_members.get(relation):
+                _, created = SquadMember.objects.update_or_create(
+                    squad=squad, user=user, defaults={"status": SquadMember.Status.MEMBER}
+                )
+                if created:
+                    _assign_discord_role(user, squad.team_discord_role, squad.name, admin_user_id=admin_user_id)
+                    _assign_region_role(user, squad, admin_user_id=admin_user_id)
+                    signup_status.clear_waiting(squad.event, user)
+
+    for user in User.objects.filter(pk__in=was_leading - still_leading):
+        _unassign_discord_role(user, squad.discord_captain_role, admin_user_id=admin_user_id)
+
+    logfire.info(
+        "Squad leadership updated from the squad form",
+        squad_id=squad.pk,
+        captains=len(now["captains"]),
+        vice_captains=len(now["vice_captains"]),
+        admin_user_id=admin_user_id,
+    )
+
+    warnings: list[str] = []
+    for user in User.objects.filter(pk__in=still_leading):
+        for ok, reason in (
+            squad.check_gender_eligibility(user.gender),
+            squad.check_zauth_eligibility(user.is_zauth_verified),
+            squad.check_zftp_eligibility(user.z_ftp, user.z_ftp_wkg),
+            squad.check_zmap_eligibility(user.z_map, user.z_map_wkg),
+        ):
+            if not ok:
+                warnings.append(f"{user.get_full_name() or user.username}: {reason}")
+    return warnings
+
+
+def _apply_timezone_roles(user, event, *, before=None, after=None, admin_user_id: int) -> None:
+    """Grant (and on edit, retract) the event's timezone/region roles for a rider.
+
+    Adds a role for every mapped option the rider selected. On an edit, a role dropped
+    from the selection is removed **only** when the rider does not still hold it for an
+    unrelated reason: another registered signup on an event mapping the same role, or a
+    squad ``region_role``. A timezone role and a squad region role are very plausibly the
+    same Discord role, so this must not undo the squad flow.
+
+    Args:
+        user: The rider.
+        event: The event whose map applies.
+        before: The rider's previous signup_timezone (edit flow), or None on first signup.
+        after: The rider's new signup_timezone.
+        admin_user_id: The user performing the action, for logging.
+
+    """
+    from apps.events.timezone_roles import mapped_roles, roles_for_selection, roles_to_drop
+    from apps.team.models import DiscordRole
+
+    if not user.discord_id or not mapped_roles(event):
+        return
+
+    wanted = roles_for_selection(event, after)
+    dropped = roles_to_drop(event, before=before, after=after) if before is not None else []
+    role_names = dict(
+        DiscordRole.objects.filter(role_id__in=set(wanted) | set(dropped)).values_list("role_id", "name")
+    )
+    for role_id in wanted:
+        _assign_discord_role(user, int(role_id), role_names.get(role_id) or "Region Role", admin_user_id=admin_user_id)
+
+    for role_id in dropped:
+        if _timezone_role_still_earned(user, event, role_id):
+            continue
+        _unassign_discord_role(user, int(role_id), admin_user_id=admin_user_id)
+
+
+def _timezone_role_still_earned(user, event, role_id: str) -> bool:
+    """Check whether a rider keeps a timezone role for some reason other than this event.
+
+    Args:
+        user: The rider.
+        event: The event the role is being dropped for.
+        role_id: The Discord role ID under consideration.
+
+    Returns:
+        True when the role is still earned elsewhere and must not be removed.
+
+    """
+    from apps.events.timezone_roles import roles_for_selection
+
+    # A squad the rider is in carries this as its region role.
+    if SquadMember.objects.filter(
+        user=user, status=SquadMember.Status.MEMBER, squad__region_role=int(role_id)
+    ).exists():
+        return True
+    # Another event's timezone map grants it for a signup they still hold.
+    others = (
+        EventSignup.objects.filter(user=user, status=EventSignup.Status.REGISTERED)
+        .exclude(event_id=event.pk)
+        .select_related("event")
+    )
+    return any(role_id in roles_for_selection(s.event, s.signup_timezone) for s in others)
+
+
+def _assign_region_role(user, squad, *, admin_user_id: int) -> bool | None:
+    """Add a squad's region role to a rider when they join it.
+
+    Args:
+        user: The User joining the squad.
+        squad: The Squad the user is being assigned to.
+        admin_user_id: The admin performing the action.
+
+    Returns:
+        None if the squad has no region role, else the result of the role add.
+
+    """
+    if not squad.region_role:
+        return None
+    from apps.team.models import DiscordRole
+
+    role_name = (
+        DiscordRole.objects.filter(role_id=str(squad.region_role)).values_list("name", flat=True).first()
+        or f"Region role {squad.region_role}"
+    )
+    return _assign_discord_role(user, squad.region_role, role_name, admin_user_id=admin_user_id)
+
+
+def _unassign_region_role_if_unused(user, squad, *, admin_user_id: int) -> bool | None:
+    """Remove a squad's region role from a rider who left it, unless still earned elsewhere.
+
+    Keeps the role when the rider is still a MEMBER of another squad (in any
+    event) that carries the same ``region_role``. Call this *after* the leaving
+    squad's membership row has been deleted so the check reflects the new state.
+
+    Args:
+        user: The User who left the squad.
+        squad: The Squad the user was removed from.
+        admin_user_id: The admin performing the action.
+
+    Returns:
+        None if there is no region role or it is still earned elsewhere, else
+        the result of the role removal.
+
+    """
+    role_id = squad.region_role
+    if not role_id or not user.discord_id:
+        return None
+    still_earned = (
+        SquadMember.objects.filter(
+            user=user,
+            status=SquadMember.Status.MEMBER,
+            squad__region_role=role_id,
+        )
+        .exclude(squad=squad)
+        .exists()
+    )
+    if still_earned:
+        logfire.info(
+            "Kept Discord region role — rider still in another squad with it",
+            user_id=user.id,
+            role_id=str(role_id),
+            squad_id=squad.pk,
+            admin_user_id=admin_user_id,
+        )
+        return None
+    return _unassign_discord_role(user, role_id, admin_user_id=admin_user_id)
+
+
+def _build_role_badges(user, event):
+    """Build role badge dicts for a single user in the context of an event.
+
+    Args:
+        user: The User instance (must have up-to-date discord_roles).
+        event: The Event instance.
+
+    Returns:
+        List of dicts with 'name' and 'has_role' keys.
+
+    """
+    badges = []
+    if event.event_role:
+        badges.append({"name": "Event", "has_role": user.has_discord_role(event.event_role)})
+
+    user_squads = list(
+        Squad.objects.filter(
+            pk__in=SquadMember.objects.filter(squad__event=event, user=user).values_list("squad_id", flat=True),
+        ).prefetch_related("captains", "vice_captains")
+    )
+    for sq in user_squads:
+        if sq.team_discord_role:
+            badges.append({"name": sq.name, "has_role": user.has_discord_role(sq.team_discord_role)})
+        if sq.discord_captain_role and sq.is_leader(user):
+            badges.append({"name": f"{sq.name} Cpt", "has_role": user.has_discord_role(sq.discord_captain_role)})
+    return badges
+
+
+# Wall-clock "HH:MM" as the grid fields store it. Module level because three views
+# validate it now -- the builder save, the template save, and applying a template.
+_HHMM_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _enrich_squad_members(event):
+    """Build enriched member data grouped by squad for an event.
+
+    Queries ZP/ZR data for all squad members in one batch, then groups by squad.
+
+    Args:
+        event: Event instance to look up squad members for.
+
+    Returns:
+        Dict mapping squad pk to list of enriched member dicts.
+
+    """
+    all_sms = list(
+        SquadMember.objects.filter(squad__event=event, status=SquadMember.Status.MEMBER)
+        .select_related("user", "squad")
+        .prefetch_related("squad__captains", "squad__vice_captains")
+    )
+    if not all_sms:
+        return {}
+
+    zwids = [sm.user.zwid for sm in all_sms if sm.user.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+    # A member who has left the team's Discord server still holds their place until someone
+    # frees it, so the squad panels say so beside the name.
+    departed = signup_status.departed_user_ids(sm.user for sm in all_sms)
+
+    by_squad = {}
+    for sm in all_sms:
+        user = sm.user
+        zwid = user.zwid
+        zp = zp_by_zwid.get(zwid)
+        zp_ftp = zp.ftp if zp else None
+        zp_weight = zp.weight if zp else None
+        wkg = round(Decimal(zp_ftp) / zp_weight, 2) if zp_ftp and zp_weight and zp_weight > 0 else None
+
+        squad_role_id = sm.squad.team_discord_role
+        has_discord_role = user.has_discord_role(squad_role_id) if squad_role_id else None
+        captain_role_id = sm.squad.discord_captain_role
+        is_captain_or_vc = sm.squad.is_leader(user)
+        has_captain_role = user.has_discord_role(captain_role_id) if captain_role_id and is_captain_or_vc else None
+
+        entry = {
+            "user": user,
+            "zwid": zwid,
+            "gender": user.gender or "",
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "in_zwiftpower": zp is not None,
+            "zp_category": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_category_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            "zp_ftp": zp_ftp,
+            "wkg": wkg,
+            "z_ftp": user.z_ftp,
+            "z_map": user.z_map,
+            "z_ftp_wkg": user.z_ftp_wkg,
+            "z_map_wkg": user.z_map_wkg,
+            **rider_stats.zr_fields(profiles.get(zwid), gender=user.gender),
+            "rider_profile": profiles.get(zwid),
+            "has_discord_role": has_discord_role,
+            "has_captain_role": has_captain_role,
+            "departed": user.pk in departed,
+        }
+        by_squad.setdefault(sm.squad_id, []).append(entry)
+
+    return by_squad
+
+
+def _rider_categories(signups) -> dict[int, dict]:
+    """Batch the ZwiftPower/ZwiftRacing categories for a set of signups.
+
+    One query per source for the whole list, so the caller can test eligibility for
+    every rider against every squad without an N+1.
+
+    Args:
+        signups: EventSignup instances, with ``user`` already selected.
+
+    Returns:
+        ``{user_id: {"zp", "zp_w", "zr"}}``; missing riders simply get blanks.
+
+    """
+    zwids = [s.user.zwid for s in signups if s.user.zwid]
+    if not zwids:
+        return {}
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)}
+    zr_by_zwid = {r.zwid: r for r in ZRRider.objects.filter(zwid__in=zwids)}
+    out: dict[int, dict] = {}
+    for signup in signups:
+        zp = zp_by_zwid.get(signup.user.zwid)
+        zr = zr_by_zwid.get(signup.user.zwid)
+        out[signup.user_id] = {
+            "zp": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            "zr": getattr(zr, "race_current_category", "") or "" if zr else "",
+        }
+    return out
+
+
+def _mark_eligibility(squad, signups, categories) -> None:
+    """Tag each signup with whether it satisfies this squad's membership rules.
+
+    Sets ``is_eligible`` on every signup, so the add-rider picker can offer an
+    "Eligible only" filter. Runs the same checks the assignment itself enforces, so a
+    rider the filter keeps is one the POST will actually accept -- were these to drift,
+    the filter would promise riders that then bounce.
+
+    Args:
+        squad: The squad the picker belongs to.
+        signups: EventSignup instances to tag, mutated in place.
+        categories: Output of :func:`_rider_categories`.
+
+    """
+    for signup in signups:
+        cats = categories.get(signup.user_id, {})
+        user = signup.user
+        signup.is_eligible = all(
+            ok
+            for ok, _reason in (
+                squad.check_gender_eligibility(user.gender),
+                squad.check_zwift_eligibility(cats.get("zp", "")),
+                squad.check_womens_zwift_eligibility(cats.get("zp_w", "")),
+                squad.check_zr_eligibility(cats.get("zr", "")),
+                squad.check_zauth_eligibility(user.is_zauth_verified),
+                squad.check_zftp_eligibility(user.z_ftp, user.z_ftp_wkg),
+                squad.check_zmap_eligibility(user.z_map, user.z_map_wkg),
+            )
+        )
+
+
+def _group_available_signups(available_signups, squad_names_by_user) -> list[tuple[str, list]]:
+    """Group assignable signups by where they stand: needing a squad, waiting, then by squad.
+
+    Riders can hold membership in more than one squad, so a rider assigned to two squads is
+    listed under each of them. A rider in no squad whose signup carries a waiting status
+    (``waiting_status``, set by the caller) is listed apart, after those who need a squad.
+
+    Args:
+        available_signups: Signups that may be added to the squad being rendered, already
+            sorted by display name.
+        squad_names_by_user: Map of user id to the names of the squads they belong to.
+
+    Returns:
+        List of ``(group label, signups)`` pairs: "Needs a squad" first, then "Waiting for a
+        squad", then squads A-Z.
+
+    """
+    needs = []
+    waiting = []
+    by_squad: dict[str, list] = {}
+    for signup in available_signups:
+        names = squad_names_by_user.get(signup.user_id) or []
+        if not names:
+            (waiting if getattr(signup, "waiting_status", None) else needs).append(signup)
+            continue
+        for name in sorted(names):
+            by_squad.setdefault(name, []).append(signup)
+
+    groups: list[tuple[str, list]] = []
+    if needs:
+        groups.append((signup_status.LABELS[signup_status.NEEDS], needs))
+    if waiting:
+        groups.append((signup_status.LABELS[signup_status.WAITING], waiting))
+    groups.extend((name, by_squad[name]) for name in sorted(by_squad))
+    return groups
+
+
+def _placeable_signups(event, signups) -> list:
+    """Pick the signups the add-rider pickers offer: registered, still on the team, not set aside.
+
+    A withdrawn rider and one who has left the team's Discord server cannot be put in a squad
+    at all (``squad_assign_view`` refuses both); a set-aside rider is held back until someone
+    changes their status. Each signup kept carries ``waiting_status`` -- its waiting status,
+    or None -- which ``_group_available_signups`` groups by.
+
+    Args:
+        event: The event.
+        signups: The event's signups, with ``user`` already selected.
+
+    Returns:
+        The signups, in the order given.
+
+    """
+    statuses = signup_status.statuses_by_id(event)
+    departed = signup_status.departed_user_ids(s.user for s in signups)
+    placeable = []
+    for signup in signups:
+        status = statuses.get(signup.staff_status_id)
+        if (
+            signup.status != EventSignup.Status.REGISTERED
+            or signup.user_id in departed
+            or (status is not None and not status.is_waiting)
+        ):
+            continue
+        signup.waiting_status = status
+        placeable.append(signup)
+    return placeable
+
+
+def _build_manage_squad_context(request, event, squad):
+    """Build template context for the self-contained roster panel on the manage-squads page.
+
+    Computes enriched members (with signup ids for remove forms), the list of signups
+    available to add to this squad (all event signups not already members), and Discord
+    role names for display.
+
+    Args:
+        request: The HTTP request (used to resolve the manage permission).
+        event: The parent Event.
+        squad: The Squad whose panel is being rendered.
+
+    Returns:
+        Context dict for ``events/_squad_manage_panel.html``.
+
+    """
+    squad_members_data = _enrich_squad_members(event)
+    members = squad_members_data.get(squad.pk, [])
+    all_signups = list(EventSignup.objects.filter(event=event).select_related("user"))
+    signup_by_user = {s.user_id: s.pk for s in all_signups}
+    for member in members:
+        member["signup_id"] = signup_by_user.get(member["user"].pk)
+
+    member_user_ids = {m["user"].pk for m in members}
+    available_signups = sorted(
+        (s for s in _placeable_signups(event, all_signups) if s.user_id not in member_user_ids),
+        key=lambda s: (s.user.get_full_name() or s.user.discord_username or "").lower(),
+    )
+    _mark_eligibility(squad, available_signups, _rider_categories(available_signups))
+
+    event_role_name = _annotate_squad_role_names([squad], event=event)
+
+    squad_names_by_user: dict[int, list[str]] = {}
+    for user_id, squad_name in SquadMember.objects.filter(squad__event=event).values_list(
+        "user_id", "squad__name"
+    ):
+        squad_names_by_user.setdefault(user_id, []).append(squad_name)
+
+    return {
+        "squad": squad,
+        "members": members,
+        "available_signups": available_signups,
+        "available_groups": _group_available_signups(available_signups, squad_names_by_user),
+        "event_role_name": event_role_name,
+        "event_pk": event.pk,
+        # Per-squad: a squad's captain/VC manages their own roster; full managers manage all.
+        "can_manage": _can_manage_squad_availability(request.user, squad),
+        "oob": False,
+        "htmx_count_oob": True,
+    }
+
+
+def _render_manage_squad_panel(request, event, squad_pk):
+    """Render the manage-squads roster panel for a single squad as an HTMX response.
+
+    Args:
+        request: The HTTP request.
+        event: The parent Event.
+        squad_pk: Primary key of the squad to re-render.
+
+    Returns:
+        An ``HttpResponse`` containing the rendered panel.
+
+    """
+    squad = get_object_or_404(
+        Squad.objects.prefetch_related("captains", "vice_captains"), pk=squad_pk, event=event
+    )
+    html = render_to_string(
+        "events/_squad_manage_panel.html",
+        _build_manage_squad_context(request, event, squad),
+        request=request,
+    )
+    return HttpResponse(html)
+
+
+def _enrich_signups(signups, event=None):
+    """Enrich signup queryset with ZP/ZR data and squad assignment for display.
+
+    Args:
+        signups: EventSignup queryset with select_related("user").
+        event: Optional Event instance to look up squad assignments.
+
+    Returns:
+        List of dicts with signup + rider data for template rendering.
+
+    """
+    zwids = [s.user.zwid for s in signups if s.user.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+
+    squads_by_user: dict[int, list] = {}
+    if event:
+        for sm in (
+            SquadMember.objects.filter(squad__event=event)
+            .select_related("squad")
+            .order_by("squad__name")          # so the Squads column reads the same every load
+        ):
+            squads_by_user.setdefault(sm.user_id, []).append(sm.squad)
+
+    event_role_id = str(event.event_role) if event and event.event_role else ""
+    signup_questions = active_questions(event) if event else []
+    # Where each signup stands (apps.events.signup_status): the event's statuses in one
+    # query rather than one per row, and who has left the team's Discord server in another.
+    statuses = signup_status.statuses_by_id(event) if event else {}
+    departed = signup_status.departed_user_ids(s.user for s in signups)
+
+    # Build captain/VC lookup: user_id -> set of squad PKs where they are captain/VC
+    captain_squads: dict[int, set] = {}
+    if event:
+        for sq in event.squads.prefetch_related("captains", "vice_captains").all():
+            for leader in (*sq.captains.all(), *sq.vice_captains.all()):
+                captain_squads.setdefault(leader.pk, set()).add(sq.pk)
+
+    enriched = []
+    for signup in signups:
+        user = signup.user
+        zwid = user.zwid
+        zp = zp_by_zwid.get(zwid)
+        profile = profiles.get(zwid) if zwid else None
+
+        zp_ftp = zp.ftp if zp else None
+        zp_weight = zp.weight if zp else None
+        wkg = round(Decimal(zp_ftp) / zp_weight, 2) if zp_ftp and zp_weight and zp_weight > 0 else None
+
+        # Build role badges
+        role_badges = []
+        if event_role_id:
+            role_badges.append({"name": "Event", "has_role": user.has_discord_role(event_role_id)})
+        user_squads = squads_by_user.get(user.pk, [])
+        user_captain_squad_pks = captain_squads.get(user.pk, set())
+        for sq in user_squads:
+            if sq.team_discord_role:
+                role_badges.append({"name": sq.name, "has_role": user.has_discord_role(sq.team_discord_role)})
+            if sq.discord_captain_role and sq.pk in user_captain_squad_pks:
+                role_badges.append({
+                    "name": f"{sq.name} Cpt",
+                    "has_role": user.has_discord_role(sq.discord_captain_role),
+                })
+
+        staff_status = statuses.get(signup.staff_status_id)
+        is_departed = user.pk in departed
+        withdrawn = signup.status == EventSignup.Status.WITHDRAWN
+        bucket = signup_status.bucket(signup, staff_status, in_squad=bool(user_squads), departed=is_departed)
+        if withdrawn:
+            status_text = "Withdrawn"
+        elif is_departed:
+            status_text = "Left the team"
+        else:
+            status_text = staff_status.name if staff_status else "no status"
+
+        enriched.append({
+            "signup": signup,
+            "user": user,
+            "zwid": zwid,
+            "gender": user.gender or "",
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "has_event_role": user.has_discord_role(event_role_id) if event_role_id else False,
+            "in_zwiftpower": zp is not None,
+            "zp_category": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_category_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            "zp_ftp": zp_ftp,
+            "wkg": wkg,
+            "z_ftp": user.z_ftp,
+            "z_map": user.z_map,
+            "z_ftp_wkg": user.z_ftp_wkg,
+            "z_map_wkg": user.z_map_wkg,
+            **rider_stats.zr_fields(profile, gender=user.gender),
+            "rider_profile": profile,
+            "assigned_squads": user_squads,
+            "role_badges": role_badges,
+            "custom_answers": resolve_signup_answers(signup, signup_questions),
+            "staff_status": staff_status,
+            "departed": is_departed,
+            "withdrawn": withdrawn,
+            "bucket": bucket,
+            "status_text": status_text,
+            # Neither a withdrawn rider nor one who has left the team can be put in a squad
+            # (squad_assign_view refuses both), so their rows offer no squad picker.
+            "can_add_to_squad": not withdrawn and not is_departed,
+        })
+    return enriched
+
+
+@require_GET
+@login_required
+@team_member_required()
+def my_events_view(request: HttpRequest) -> HttpResponse:
+    """Display the current user's event signups with squad and availability info.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered my events page.
+
+    """
+    show_past = request.GET.get("show_past") == "on"
+    signups = (
+        EventSignup.objects
+        .filter(user=request.user, status=EventSignup.Status.REGISTERED)
+        .select_related("event")
+        .order_by("-event__start_date")
+    )
+    if not show_past:
+        signups = signups.filter(event__end_date__gte=timezone.now().date())
+    squad_memberships = (
+        SquadMember.objects.filter(user=request.user, status=SquadMember.Status.MEMBER)
+        .select_related("squad", "squad__event")
+        .prefetch_related("squad__captains", "squad__vice_captains")
+    )
+    # Being signed up is not a way round the hidden switch -- and the event page these
+    # rows link to now answers 404, so leaving them here would only offer dead links.
+    hidden_event_ids = _events_hidden_from(
+        request.user,
+        Event.objects.filter(
+            Q(pk__in=signups.values("event_id")) | Q(pk__in=squad_memberships.values("squad__event_id"))
+        ),
+    )
+    if hidden_event_ids:
+        signups = signups.exclude(event_id__in=hidden_event_ids)
+        squad_memberships = squad_memberships.exclude(squad__event_id__in=hidden_event_ids)
+
+    squads_by_event: dict[int, list] = {}
+    for sm in squad_memberships:
+        squads_by_event.setdefault(sm.squad.event_id, []).append(sm.squad)
+
+    signup_event_ids = [s.event_id for s in signups]
+    squad_event_ids = [eid for eid in squads_by_event if eid not in signup_event_ids]
+
+    grids = AvailabilityGrid.objects.filter(
+        squad__event_id__in=signup_event_ids + squad_event_ids,
+        status__in=[AvailabilityGrid.Status.PUBLISHED, AvailabilityGrid.Status.CLOSED],
+    ).select_related("squad", "squad__event")
+    grids_by_squad: dict[int, list] = {}
+    for grid in grids:
+        grids_by_squad.setdefault(grid.squad_id, []).append(grid)
+
+    responded_grid_ids = set(
+        AvailabilityResponse.objects.filter(
+            user=request.user,
+            grid__in=grids,
+        ).values_list("grid_id", flat=True)
+    )
+
+    all_squad_ids = [sq.pk for squads in squads_by_event.values() for sq in squads]
+
+    # A series sheet counts as answered only once every timed stage has an answer for its
+    # current time, and each one lists the rider's stages on the squad's card.
+    from apps.events.series_views import my_series_stages  # local import: series_views imports this module
+
+    series_by_squad = my_series_stages(request, [grid for grid in grids if grid.squad_id in all_squad_ids])
+
+    user_tz = getattr(request.user, "timezone", "") or ""
+
+    user_selections = []
+    if all_squad_ids:
+        user_selections = list(
+            AvailabilitySlotSelection.objects
+            .filter(selected_users=request.user, grid__squad_id__in=all_squad_ids)
+            .select_related("grid", "grid__squad")
+            .prefetch_related("selected_users")
+            .order_by("slot_date", "slot_time")
+        )
+
+    all_sms: list = []
+    if all_squad_ids:
+        all_sms = list(
+            SquadMember.objects
+            .filter(squad_id__in=all_squad_ids, status=SquadMember.Status.MEMBER)
+            .select_related("user")
+            .order_by("user__first_name", "user__last_name")
+        )
+
+    users_for_lookup: dict[int, User] = {sm.user.pk: sm.user for sm in all_sms}
+    for sel in user_selections:
+        for u in sel.selected_users.all():
+            users_for_lookup.setdefault(u.pk, u)
+
+    zwids = [u.zwid for u in users_for_lookup.values() if u.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+
+    def _enrich(user: User) -> dict:
+        zwid = user.zwid
+        zp = zp_by_zwid.get(zwid) if zwid else None
+        zr = rider_stats.zr_fields(profiles.get(zwid) if zwid else None, gender=user.gender)
+        return {
+            "user": user,
+            "zwid": zwid,
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "in_zwiftpower": zp is not None,
+            "zp_category": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_category_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            **{key: zr[key] for key in rider_stats.TOOLTIP_FIELDS},
+        }
+
+    enriched_by_user_id = {pk: _enrich(u) for pk, u in users_for_lookup.items()}
+
+    members_by_squad: dict[int, list] = {}
+    for sm in all_sms:
+        members_by_squad.setdefault(sm.squad_id, []).append(enriched_by_user_id[sm.user.pk])
+
+    # Slot selections that include the requesting user, grouped by squad
+    slot_selections_by_squad: dict[int, list] = {}
+    now_utc = timezone.now()
+    today_local = now_utc.astimezone(ZoneInfo(user_tz) if user_tz else now_utc.tzinfo).date()
+    for sel in user_selections:
+        display_tz = user_tz or sel.grid.grid_timezone or "UTC"
+        try:
+            tz_obj = ZoneInfo(display_tz)
+        except Exception:
+            tz_obj = ZoneInfo("UTC")
+            display_tz = "UTC"
+        utc_dt = datetime.combine(
+            sel.slot_date,
+            datetime.strptime(sel.slot_time, "%H:%M").time(),  # noqa: DTZ007  # clock-only parse, no date used
+            tzinfo=ZoneInfo("UTC"),
+        )
+        local_dt = utc_dt.astimezone(tz_obj)
+        days_until = (local_dt.date() - today_local).days
+        if days_until < 0 and not show_past:
+            continue
+        if days_until > 1:
+            days_label = f"in {days_until} days"
+            days_class = "badge-info"
+        elif days_until == 1:
+            days_label = "tomorrow"
+            days_class = "badge-warning"
+        elif days_until == 0:
+            days_label = "today"
+            days_class = "badge-warning"
+        else:
+            days_label = f"{abs(days_until)} day{'s' if abs(days_until) != 1 else ''} ago"
+            days_class = "badge-ghost"
+        riders = [
+            enriched_by_user_id[u.pk]
+            for u in sel.selected_users.all()
+            if u.pk in enriched_by_user_id
+        ]
+        if sel.status == AvailabilitySlotSelection.Status.CONFIRMED:
+            status_class = "badge-success"
+        elif sel.status == AvailabilitySlotSelection.Status.PENDING:
+            status_class = "badge-warning"
+        else:
+            status_class = ""
+        slot_selections_by_squad.setdefault(sel.grid.squad_id, []).append({
+            "selection": sel,
+            "grid_title": sel.grid.title or "Availability Grid",
+            "local_day": local_dt.strftime("%a"),
+            "local_date": local_dt.strftime("%b %-d"),
+            "local_time": local_dt.strftime("%H:%M"),
+            "display_timezone": display_tz,
+            "days_until": days_until,
+            "days_label": days_label,
+            "days_class": days_class,
+            "status_label": sel.get_status_display(),
+            "status_class": status_class,
+            "is_status_visible": sel.status != AvailabilitySlotSelection.Status.NONE,
+            "riders": riders,
+            **race_calendar_urls(sel, request),
+        })
+
+    events_data = []
+    for signup in signups:
+        event = signup.event
+        event_squads = squads_by_event.get(event.pk, [])
+        squad_data = []
+        ended_grid_count = 0
+        for squad in event_squads:
+            squad_grids = grids_by_squad.get(squad.pk, [])
+            pending_count = 0
+            squad_ended_count = 0
+            has_current_grids = False
+            for g in squad_grids:
+                if g.is_series and squad.pk in series_by_squad:
+                    g.user_responded = not series_by_squad[squad.pk]["needs_answer"]
+                else:
+                    g.user_responded = g.pk in responded_grid_ids
+                # A grid is "ended" once the availability window it collected for has fully passed.
+                g.is_ended = g.end_date < today_local
+                if g.is_ended:
+                    squad_ended_count += 1
+                else:
+                    has_current_grids = True
+                if g.is_published and not g.user_responded and not g.is_ended:
+                    pending_count += 1
+            ended_grid_count += squad_ended_count
+            squad_data.append({
+                "squad": squad,
+                "grids": squad_grids,
+                "has_current_grids": has_current_grids,
+                "pending_availability_count": pending_count,
+                "ended_grid_count": squad_ended_count,
+                # Suffix for the `av-ended-<key>` class the "Show ended" toggle flips. Event and
+                # squad keys are prefixed because the two pk spaces overlap, and the per-squad
+                # dropdown repeats rows the event-wide one already renders.
+                "ended_key": f"s{squad.pk}",
+                "members": members_by_squad.get(squad.pk, []),
+                "user_slot_selections": slot_selections_by_squad.get(squad.pk, []),
+                "series": series_by_squad.get(squad.pk),
+                "can_manage_availability": _can_manage_squad_availability(request.user, squad),
+            })
+        event_pending = sum(sq["pending_availability_count"] for sq in squad_data)
+        has_grids = any(sq["grids"] for sq in squad_data)
+        # Managing any squad the user belongs to already implies squad-manage page access, so only
+        # fall back to the event-wide gate (which costs extra queries) when nothing short-circuits.
+        can_view_squad_manage = (
+            any(sq["can_manage_availability"] for sq in squad_data)
+            or _can_view_squad_manage(request.user, event)
+        )
+        events_data.append({
+            "event": event,
+            "squads": squad_data,
+            "pending_availability_count": event_pending,
+            "has_availability_grids": has_grids,
+            "ended_grid_count": ended_grid_count,
+            "ended_key": f"e{event.pk}",
+            # Keeps the Availability menu reachable before the first grid exists, so a captain
+            # can still get to "New availability".
+            "can_create_availability": any(sq["can_manage_availability"] for sq in squad_data),
+            "can_view_squad_manage": can_view_squad_manage,
+        })
+
+    logfire.debug("My events viewed", user_id=request.user.id, event_count=len(events_data))
+    return render(
+        request,
+        "events/my_events.html",
+        {
+            "events_data": events_data,
+            "show_past": show_past,
+            "guild_id": config.GUILD_ID,
+        },
+    )
+
+
+@require_GET
+@login_required
+@team_member_required()
+def event_list_view(request: HttpRequest) -> HttpResponse:
+    """Display list of visible events.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered event list page.
+
+    """
+    events = (
+        Event.objects
+        .filter(visible=True)
+        .annotate(
+            signup_count=Count("signups", filter=Q(signups__status="registered")),
+        )
+        .order_by("start_date")
+    )
+    search_query = request.GET.get("q", "").strip()
+    show_past = request.GET.get("show_past") == "on"
+    if search_query:
+        events = events.filter(Q(title__icontains=search_query) | Q(description__icontains=search_query))
+    if not show_past:
+        events = events.filter(end_date__gte=timezone.now().date())
+    user_signup_event_ids = set(
+        EventSignup.objects.filter(user=request.user, status=EventSignup.Status.REGISTERED).values_list(
+            "event_id", flat=True
+        )
+    )
+    logfire.debug("Event list viewed", user_id=request.user.id, event_count=events.count())
+    return render(
+        request,
+        "events/event_list.html",
+        {
+            "events": events,
+            "search_query": search_query,
+            "show_past": show_past,
+            "is_event_admin": request.user.is_event_admin,
+            "user_signup_event_ids": user_signup_event_ids,
+            "today": timezone.now().date(),
+        },
+    )
+
+
+@require_GET
+@login_required
+@team_member_required()
+def event_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Display event detail with related races.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Rendered event detail page.
+
+    Raises:
+        Http404: If the event is hidden from this viewer.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    # A hidden event is not merely absent from the list: this page is the whole event,
+    # signup table included, and it answers to any id a member cares to type. 404 rather
+    # than 403 so the reply does not confirm the id belongs to an event at all.
+    if not _can_view_event(request.user, event):
+        logfire.info("Hidden event detail withheld", event_id=event.pk, user_id=request.user.id)
+        raise Http404
+    races = event.races.all()
+    squads = list(
+        event.squads.prefetch_related("captains", "vice_captains").annotate(member_count=Count("squad_members")).all()
+    )
+    signups = event.signups.select_related("user").all()
+    # One aggregate rather than a .count() round trip, and it replaces the separate
+    # signups.count() the template's badge used to trigger.
+    # Registered only. Withdrawing flips the status instead of deleting the row, so an
+    # unfiltered count reports riders who have pulled out as though they were still in. The
+    # four other views that count signups already filter this way; this one did not. The
+    # table below still lists withdrawn riders, marked, because who pulled out is worth
+    # seeing -- it is the number that should not include them.
+    registered = Q(status=EventSignup.Status.REGISTERED)
+    signup_totals = signups.aggregate(total=Count("pk", filter=registered))
+    user_signup = event.signups.filter(user=request.user).first()
+    # What would stop this rider signing up, with where to fix each -- shown in the signup dialog
+    # instead of the form. Only asked while signups are open and they are not already on the event.
+    signup_blocker_details = (
+        blocker_details(signup_blockers(event, request.user))
+        if event.signups_open and not (user_signup and user_signup.status == EventSignup.Status.REGISTERED)
+        else []
+    )
+    # Event admins and anyone who passes the eligibility gate (head captain, squad
+    # captains/vice-captains) get the full signup table so they can filter by answers.
+    # With show_signups on, any other team member can expand a names-only list.
+    can_view_signup_table = request.user.is_event_admin or _can_view_v_report(request.user, event)
+    can_view_signups = can_view_signup_table or event.show_signups
+    # Anyone who can export the signup CSV already gets the notes column inside it, so
+    # hiding the column from them in the UI protected nothing -- it only meant a head
+    # captain had to download a file to read what the page would not show. The two sets
+    # are otherwise disjoint (the export excludes event admins), hence the union.
+    can_view_signup_notes = request.user.is_event_admin or _can_export_event_signups(request.user, event)
+    enriched_signups = _enrich_signups(signups, event=event) if can_view_signups else []
+
+    # Signup statuses (apps.events.signup_status). Everyone who sees the full table sees each
+    # rider's status; event staff can change it, and only they see the notes behind it -- the
+    # same people who see the riders' own notes.
+    can_set_status = _can_manage_event_squads(request.user, event)
+    table_entries = enriched_signups if can_view_signup_table else []
+    status_counts = signup_status.bucket_counts(table_entries)
+    status_still_placed = [e for e in table_entries if e["departed"] and e["assigned_squads"] and not e["withdrawn"]]
+    status_key = {
+        "waiting": any(e["bucket"] == signup_status.WAITING for e in table_entries),
+        "set_aside": any(e["bucket"] == signup_status.SET_ASIDE for e in table_entries),
+        "withdrawn": any(e["withdrawn"] for e in table_entries),
+        "left": any(e["bucket"] == signup_status.LEFT for e in table_entries),
+    }
+    # The rider's own status, when it carries a message for them. The staff note never does.
+    my_status = None
+    if user_signup and user_signup.status == EventSignup.Status.REGISTERED and user_signup.staff_status_id:
+        my_status = SignupStatus.objects.filter(pk=user_signup.staff_status_id).exclude(rider_message="").first()
+
+    # Attach enriched member data and tooltip to each squad
+    squad_members_data = _enrich_squad_members(event) if squads else {}
+    user_squad_ids = set(
+        SquadMember.objects.filter(squad__event=event, user=request.user).values_list("squad_id", flat=True)
+    )
+    published_grids_by_squad: dict[int, list] = {}
+    for grid in AvailabilityGrid.objects.filter(squad__event=event, status__in=["published", "closed"]):
+        published_grids_by_squad.setdefault(grid.squad_id, []).append(grid)
+    # The event's squad tags drive the Tags column, its menu entry and the tag filter; with
+    # none, all three are left out.
+    event_squad_tags = normalize_tags(event.squad_tags)
+
+    # The By Squad view offers the signup table's rider columns to the same viewers, so each
+    # member carries their signup's row: its timezone, notes and answers, and the key the
+    # Zwift Racing columns are looked up by. Nobody else's members get one.
+    signup_entries = {entry["user"].pk: entry for entry in enriched_signups} if can_view_signup_table else {}
+
+    for squad in squads:
+        squad.enriched_members = squad_members_data.get(squad.pk, [])
+        for member in squad.enriched_members:
+            member["signup_entry"] = signup_entries.get(member["user"].pk)
+        names = [m["user"].get_full_name() or m["user"].discord_username for m in squad.enriched_members]
+        squad.member_names_tooltip = ", ".join(names) if names else "No members"
+        squad.user_is_member = squad.pk in user_squad_ids
+        squad.published_grids = published_grids_by_squad.get(squad.pk, [])
+        # Squad.tag_list is the squad's tags as the event spells and orders them -- the same
+        # list the Tags column renders. Carried here as JSON for the tag filter's data
+        # attribute, so the filter can never disagree with the badges beside it (rendered
+        # auto-escaped, never |safe).
+        squad.tags_json = json.dumps(squad.tag_list)
+
+    # The By Category tab: each squad's members counted on Zwift's categories, vELO 1's tiers
+    # and vELO 2's, mixed and (for a woman) women's, all from the rider profile cache.
+    category_tables = rider_stats.category_tables(squads)
+
+    signup_questions = active_questions(event)
+    signup_question_fields = build_question_fields(
+        signup_questions, user_signup.custom_answers if user_signup else None
+    )
+
+    # Answer facets are built only for event admins. Non-admins can reach this page with
+    # show_signups on, and they see a names-only list; handing them the answer payload
+    # would let them read every rider's answers straight out of the HTML.
+    answer_facets: list[dict] = []
+    answer_payload: dict = {}
+    answer_panel_open = False
+    if signup_questions and can_view_signup_table:
+        signup_list = list(signups)
+        answer_facets = build_facets(signup_questions, signup_list)
+        answer_payload = answers_payload(signup_list, signup_questions)
+        answer_panel_open = panel_starts_open(signup_questions)
+
+    logfire.debug("Event detail viewed", user_id=request.user.id, event_id=pk)
+    return render(
+        request,
+        "events/event_detail.html",
+        {
+            "event": event,
+            "races": races,
+            "squads": squads,
+            "event_squad_tags": event_squad_tags,
+            "signups": enriched_signups,
+            "signup_count": signup_totals["total"],
+            "user_signup": user_signup,
+            "signup_blockers": signup_blocker_details,
+            "signup_questions": signup_questions,
+            "signup_question_fields": signup_question_fields,
+            "answer_facets": answer_facets,
+            "answer_payload": answer_payload,
+            "answer_panel_open": answer_panel_open,
+            "can_view_signup_table": can_view_signup_table,
+            # The signups table's extra Zwift Racing columns, built in the page from this JSON. Only
+            # for those who see the full table: a names-only list must not carry everyone's power.
+            "signup_stat_groups": rider_stats.STAT_GROUPS if can_view_signup_table else (),
+            "signup_stat_columns": rider_stats.stat_columns_json() if can_view_signup_table else [],
+            "signup_stat_values": rider_stats.stat_rows(enriched_signups) if can_view_signup_table else {},
+            "signup_velo2_options": rider_stats.velo2_filter_options(enriched_signups) if can_view_signup_table else {},
+            "can_view_signup_notes": can_view_signup_notes,
+            # Narrower than viewing the table: the export is a bulk extract of every
+            # rider's details, so only the people running the event get the button.
+            "can_export_signups": _can_export_event_signups(request.user, event),
+            "can_manage_signup_questions": _can_manage_signup_questions(request.user),
+            "is_event_admin": request.user.is_event_admin,
+            "can_view_signups": can_view_signups,
+            "guild_id": config.GUILD_ID,
+            "category_tables": category_tables,
+            "can_manage_roles": _can_manage_event_roles(request.user, event),
+            "can_view_squad_manage": _can_view_squad_manage(request.user, event),
+            "can_add_members": _can_add_members(request.user, event),
+            "can_view_v_report": _can_view_v_report(request.user, event),
+            "can_set_status": can_set_status,
+            "status_counts": status_counts,
+            "status_still_placed": status_still_placed,
+            "status_key": status_key,
+            "status_next": reverse("events:event_detail", args=[event.pk]) + "?tab=signups",
+            "my_status": my_status,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def event_create_view(request: HttpRequest) -> HttpResponse:
+    """Create a new event.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    if not request.user.is_event_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized event creation attempt",
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to create events.")
+        return redirect("events:event_list")
+
+    if request.method == "POST":
+        form = EventForm(request.POST, request.FILES)
+        if form.is_valid():
+            event = form.save(commit=False)
+            event.created_by = request.user
+            event.save()
+            logfire.info(
+                "Event created",
+                event_id=event.pk,
+                event_title=event.title,
+                user_id=request.user.id,
+                username=request.user.username,
+            )
+            if event.is_race_series:
+                # A series is not usable until it has stages, so go straight to them.
+                messages.success(request, "Event created. Now add its stages.")
+                return redirect("events:series_stages", pk=event.pk)
+            messages.success(request, "Event created successfully!")
+            return redirect("events:event_detail", pk=event.pk)
+        # Field names only: a refused save is otherwise invisible in Logfire.
+        logfire.info("Event create refused", user_id=request.user.id, fields=sorted(form.errors))
+    else:
+        form = EventForm()
+
+    return render(
+        request,
+        "events/event_form.html",
+        {"form": form, "page_title": "Create Event", "submit_label": "Create Event"},
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def event_edit_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Edit an existing event.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+
+    if not request.user.is_event_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized event edit attempt",
+            event_id=pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to edit events.")
+        return redirect("events:event_detail", pk=pk)
+
+    if request.method == "POST":
+        form = EventForm(request.POST, request.FILES, instance=event)
+        if form.is_valid():
+            form.save()
+            # Parsed after save so it reads the options just stored, and so an option the
+            # admin removed cannot keep its mapping.
+            event.timezone_role_map = parse_role_map(
+                request.POST,
+                event.timezone_options,
+                allowed_role_ids=_timezone_allowed_role_ids(event),
+                current=Event.objects.filter(pk=pk).values_list("timezone_role_map", flat=True).first(),
+            )
+            event.save(update_fields=["timezone_role_map"])
+            # The event's list is the only source of squad tags: a tag removed here leaves
+            # every squad, and a case-only rename is rewritten on each of them.
+            prune_squad_tags(event)
+            logfire.info(
+                "Event updated",
+                event_id=pk,
+                event_title=event.title,
+                user_id=request.user.id,
+                username=request.user.username,
+            )
+            messages.success(request, "Event updated successfully!")
+            return redirect("events:event_detail", pk=pk)
+        # Field names only: a refused save is otherwise invisible in Logfire.
+        logfire.info("Event edit refused", event_id=pk, user_id=request.user.id, fields=sorted(form.errors))
+    else:
+        form = EventForm(instance=event)
+
+    enriched_signups = _enrich_signups(event.signups.select_related("user").all(), event=event)
+
+    # Build read-only role display names
+    from apps.team.models import DiscordRole
+
+    role_display = {}
+    for field_name, field_value in [
+        ("head_captain_role_id", event.head_captain_role_id),
+        ("event_role", event.event_role),
+    ]:
+        if field_value and field_value != 0:
+            role = DiscordRole.objects.filter(role_id=str(field_value)).first()
+            role_display[field_name] = f"@{role.name}" if role else f"Unknown ({field_value})"
+        else:
+            role_display[field_name] = "(none)"
+
+    return render(
+        request,
+        "events/event_form.html",
+        {
+            "form": form,
+            "event": event,
+            "signups": enriched_signups,
+            "page_title": "Edit Event",
+            "submit_label": "Save Changes",
+            "can_manage_roles": _can_manage_event_roles(request.user, event),
+            "role_display": role_display,
+            # Rendered server-side from the SAVED options, so the selects never drift out
+            # of sync with the client-side timezone chip editor above them.
+            "timezone_role_rows": _timezone_role_rows(event),
+            # The Signup section lists the statuses staff can give a signup on this event.
+            "signup_statuses": list(event.signup_statuses.filter(retired=False)),
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def event_role_setup_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """View and optionally edit Discord role settings for an event.
+
+    Users with event_admin, assign_roles, or the event's head captain role can view.
+    Users with assign_roles or head captain role can edit.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Rendered role setup form or redirect on success.
+
+    Raises:
+        PermissionDenied: If the user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    can_edit = _can_manage_event_roles(request.user, event)
+    if not can_edit and not request.user.has_permission(Permissions.EVENT_ADMIN):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied
+
+    if request.method == "POST" and can_edit:
+        form = EventRoleSetupForm(request.POST, instance=event)
+        if form.is_valid():
+            form.save()
+            logfire.info(
+                "Event role setup updated",
+                event_id=pk,
+                event_title=event.title,
+                user_id=request.user.id,
+            )
+            messages.success(request, "Role setup updated successfully!")
+            # Backstop for the live check: warn if the bot doesn't hold the head
+            # captain role (so it can't reach head-captain channels).
+            if event.head_captain_role_id and bot_has_role(event.head_captain_role_id) is False:
+                messages.warning(
+                    request,
+                    "Heads up: the bot doesn't have the selected head captain role. Add this role to "
+                    "the bot in Discord so it can access channels restricted to head captains.",
+                )
+            return redirect("events:event_role_setup", pk=pk)
+        # A field error can sit far down a page of three long checkbox lists, so say
+        # plainly at the top that nothing was saved -- otherwise the reload reads as
+        # success and the edit is silently lost.
+        messages.error(request, "Role setup was not saved. See the highlighted field(s) below.")
+        logfire.info(
+            "Event role setup rejected",
+            event_id=pk,
+            user_id=request.user.id,
+            errors=list(form.errors),
+        )
+    else:
+        form = EventRoleSetupForm(instance=event)
+
+    # Look up display names for read-only mode
+    from apps.team.models import DiscordRole
+
+    role_display = {}
+    for field_name, field_value in [
+        ("head_captain_role_id", event.head_captain_role_id),
+        ("event_role", event.event_role),
+    ]:
+        if field_value and field_value != 0:
+            role = DiscordRole.objects.filter(role_id=str(field_value)).first()
+            role_display[field_name] = f"@{role.name}" if role else f"Unknown ({field_value})"
+        else:
+            role_display[field_name] = "(none)"
+
+    # Resolve coordinator role IDs to names for the read-only display.
+    coord_ids = [str(rid) for rid in (event.coordinator_role_ids or [])]
+    if coord_ids:
+        coord_names_by_id = dict(
+            DiscordRole.objects.filter(role_id__in=coord_ids).values_list("role_id", "name")
+        )
+        role_display["coordinator_names"] = [
+            coord_names_by_id.get(rid, f"Unknown ({rid})") for rid in coord_ids
+        ]
+    else:
+        role_display["coordinator_names"] = []
+
+    try:
+        allowed_prefixes = json.loads(config.EVENT_ROLE_PREFIXES)
+    except json.JSONDecodeError, ValueError, TypeError:
+        allowed_prefixes = ["$", ">", "¡", "~", "^"]
+
+    return render(
+        request,
+        "events/event_role_setup.html",
+        {
+            "form": form,
+            "event": event,
+            "can_edit": can_edit,
+            "role_display": role_display,
+            "allowed_prefixes": "  ".join(allowed_prefixes),
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_GET
+def event_bot_role_check_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """HTMX endpoint: report whether the bot account holds the given role.
+
+    Powers the read-only status shown under the Head Captain Role field on the
+    role-setup page (it never assigns roles). ``?head_captain_role_id=`` is the
+    selected role (sent via hx-include); ``?refresh=1`` bypasses the cache.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Rendered bot-role status partial.
+
+    Raises:
+        PermissionDenied: If the user can't view the event's role setup.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    if not _can_manage_event_roles(request.user, event) and not request.user.has_permission(Permissions.EVENT_ADMIN):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied
+
+    role_id = str(request.GET.get("head_captain_role_id", "0") or "0")
+    force = request.GET.get("refresh") == "1"
+
+    if role_id in ("", "0"):
+        status, role_name = "none", ""
+    else:
+        from apps.team.models import DiscordRole
+
+        role = DiscordRole.objects.filter(role_id=role_id).first()
+        role_name = role.name if role else role_id
+        has = bot_has_role(role_id, force=force)
+        status = "has" if has is True else "missing" if has is False else "unknown"
+
+    return render(
+        request,
+        "events/_bot_role_status.html",
+        {
+            "status": status,
+            "role_name": role_name,
+            "check_url": reverse("events:event_bot_role_check", args=[event.pk]),
+        },
+    )
+
+
+_PUBLIC_CHANNELS_CACHE_KEY = "squad_public_channel_ids"  # per-guild suffix appended
+_PUBLIC_CHANNELS_TTL = 60  # 1 min -- channel permissions change rarely, pages reload often
+
+
+def _public_channel_ids(channels: list[dict] | None, roles: list[dict] | None) -> set[str] | None:
+    """Work out which channels the whole server can see.
+
+    A thread inherits its parent channel's visibility, so a squad's race thread -- rider
+    names, availability, who was picked -- is readable by everyone in the guild whenever the
+    channel is. Discord thread type is not the lever here; the parent channel is.
+
+    Args:
+        channels: Guild channels, each with ``permission_overwrites``.
+        roles: Guild roles, for the ``@everyone`` base permissions.
+
+    Returns:
+        Ids of channels a member holding no role but ``@everyone`` can view, or None when
+        Discord could not be reached -- which is not the same as "none are public".
+
+    """
+    if channels is None or roles is None:
+        return None
+
+    guild_id = str(config.GUILD_ID)
+    roles_by_id = {r["id"]: r for r in roles}
+    public = set()
+    for channel in channels:
+        visible = can_view(
+            member_role_ids=set(),
+            member_id="",
+            guild_id=guild_id,
+            roles_by_id=roles_by_id,
+            overwrites=channel.get("permission_overwrites") or [],
+        )
+        if visible:
+            public.add(str(channel["id"]))
+    return public
+
+
+def _squad_channel_warnings(squad: Squad, public_channel_ids: set[str] | None) -> list[str]:
+    """Flag a squad whose Discord channel the whole server can read.
+
+    Args:
+        squad: The squad to check.
+        public_channel_ids: From ``_public_channel_ids``, or None when unknown.
+
+    Returns:
+        One human-readable line per problem, empty when the channel is private or unknown.
+
+    """
+    if not squad.discord_channel_id or public_channel_ids is None:
+        return []
+    if str(squad.discord_channel_id) not in public_channel_ids:
+        return []
+    return [
+        "Everyone on the server can see this squad's Discord channel, so race threads "
+        "created in it - rider names, availability and selections - are visible team-wide."
+    ]
+
+
+def _squad_role_violations(squad: Squad, event: Event, role_names: dict[str, str]) -> list[str]:
+    """Describe squad roles that the event's Role Setup would no longer permit.
+
+    Squads keep whatever role was stored before an event's allowed lists were narrowed,
+    and ``SquadForm`` drops an out-of-list value from ``initial`` rather than offering it
+    back -- which keeps the form saveable but means the value disappears the next time
+    anyone edits that squad. Naming the mismatch here is what makes that visible first.
+
+    The event's head captain role is checked separately: it is refused on every squad role
+    field, so holding it anywhere is a privilege problem rather than a stale-list one.
+
+    Args:
+        squad: The squad to check.
+        event: Its event, carrying the allowed lists and prefixes.
+        role_names: Discord role id -> name, for readable messages.
+
+    Returns:
+        One human-readable line per violation, empty when the squad is clean.
+
+    """
+    def _label(role_id: int) -> str:
+        name = role_names.get(str(role_id), "")
+        return f"@{name}" if name else f"role {role_id}"
+
+    head_captain = str(event.head_captain_role_id or 0)
+    checks = (
+        ("Captain role", squad.discord_captain_role, [str(r) for r in (event.captain_role_ids or [])]),
+        ("Region role", squad.region_role, [str(r) for r in (event.region_role_ids or [])]),
+        (
+            "Coordinator role",
+            squad.regional_coordinator_role,
+            [str(r) for r in (event.coordinator_role_ids or [])],
+        ),
+    )
+
+    violations = []
+    for label, role_id, allowed in checks:
+        if not role_id:
+            continue
+        if head_captain != "0" and str(role_id) == head_captain:
+            violations.append(f"{label} {_label(role_id)} is the event's Head Captain role")
+            continue
+        if not allowed:
+            violations.append(f"{label} {_label(role_id)} is set, but Role Setup allows none")
+        elif str(role_id) not in allowed:
+            violations.append(f"{label} {_label(role_id)} is not allowed by Role Setup")
+
+    prefixes = [str(p) for p in (event.prefixes or []) if str(p)]
+    if prefixes and squad.team_discord_role:
+        name = role_names.get(str(squad.team_discord_role), "")
+        if name and not any(name.startswith(p) for p in prefixes):
+            violations.append(f"Squad role @{name} does not match the event's prefixes")
+    return violations
+
+
+@login_required
+@team_member_required()
+@require_GET
+def squad_manage_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Manage squads for an event.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Rendered squad management page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    if not _can_view_squad_manage(request.user, event):
+        logfire.warning(
+            "Unauthorized squad manage attempt",
+            event_id=event_pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to manage squads.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    can_manage_all = _can_manage_event_squads(request.user, event)
+
+    squads = list(
+        event.squads.prefetch_related("captains", "vice_captains")
+        .annotate(member_count=Count("squad_members"))
+        .order_by("name")
+    )
+
+    # Which channels the whole server can read. One guild-wide fetch rather than one call
+    # per squad; None means Discord could not be reached, which is deliberately different
+    # from "none are public" so an outage does not quietly clear every warning.
+    #
+    # Cached for a minute. Without it this page makes two blocking Discord calls on every
+    # render, each with a 10s timeout, on a page captains reload constantly -- a slow
+    # Discord would turn into a twenty-second page. A failed read is never cached, so the
+    # next render retries rather than holding on to an outage.
+    public_channel_ids: set[str] | None = set()
+    if any(s.discord_channel_id for s in squads):
+        cache_key = f"{_PUBLIC_CHANNELS_CACHE_KEY}:{config.GUILD_ID}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            public_channel_ids = cached
+        else:
+            from apps.accounts.discord_service import get_guild_channels, get_guild_roles
+
+            public_channel_ids = _public_channel_ids(get_guild_channels(), get_guild_roles())
+            if public_channel_ids is not None:
+                cache.set(cache_key, public_channel_ids, _PUBLIC_CHANNELS_TTL)
+
+    # Build ID→name lookups for Discord channels and roles
+    channel_ids = set()
+    role_ids = set()
+    for s in squads:
+        if s.discord_channel_id:
+            channel_ids.add(str(s.discord_channel_id))
+        if s.audio_channel_id:
+            channel_ids.add(str(s.audio_channel_id))
+        if s.team_discord_role:
+            role_ids.add(str(s.team_discord_role))
+        if s.discord_captain_role:
+            role_ids.add(str(s.discord_captain_role))
+        if s.regional_coordinator_role:
+            role_ids.add(str(s.regional_coordinator_role))
+        if s.region_role:
+            role_ids.add(str(s.region_role))
+
+    if event.event_role:
+        role_ids.add(str(event.event_role))
+
+    from apps.team.models import DiscordChannel, DiscordRole
+
+    channel_names = (
+        dict(DiscordChannel.objects.filter(channel_id__in=channel_ids).values_list("channel_id", "name"))
+        if channel_ids
+        else {}
+    )
+    role_names = (
+        dict(DiscordRole.objects.filter(role_id__in=role_ids).values_list("role_id", "name")) if role_ids else {}
+    )
+    event_role_name = role_names.get(str(event.event_role), "") if event.event_role else ""
+
+    # Attach availability grids (published/closed) grouped by squad
+    grids_by_squad: dict[int, list] = {}
+    for grid in AvailabilityGrid.objects.filter(
+        squad__event=event,
+        status__in=[AvailabilityGrid.Status.PUBLISHED, AvailabilityGrid.Status.CLOSED],
+    ):
+        grids_by_squad.setdefault(grid.squad_id, []).append(grid)
+
+    # Enriched members + add-rider options for the expandable Riders section
+    squad_members_data = _enrich_squad_members(event)
+    all_signups = list(EventSignup.objects.filter(event=event).select_related("user"))
+    signup_by_user = {s.user_id: s.pk for s in all_signups}
+
+    # user id -> names of the squads they already belong to, for grouping the add-rider picker.
+    squad_names_by_user: dict[int, list[str]] = {}
+    for sq in squads:
+        for m in squad_members_data.get(sq.pk, []):
+            squad_names_by_user.setdefault(m["user"].pk, []).append(sq.name)
+
+    rider_categories = _rider_categories(all_signups)
+    placeable = _placeable_signups(event, all_signups)
+    for s in squads:
+        s.channel_name = channel_names.get(str(s.discord_channel_id), "") if s.discord_channel_id else ""
+        s.audio_name = channel_names.get(str(s.audio_channel_id), "") if s.audio_channel_id else ""
+        s.role_name = role_names.get(str(s.team_discord_role), "") if s.team_discord_role else ""
+        s.captain_role_name = (
+            role_names.get(str(s.discord_captain_role), "") if s.discord_captain_role else ""
+        )
+        s.coordinator_role_name = (
+            role_names.get(str(s.regional_coordinator_role), "") if s.regional_coordinator_role else ""
+        )
+        s.region_role_name = role_names.get(str(s.region_role), "") if s.region_role else ""
+        s.active_grids = grids_by_squad.get(s.pk, [])
+        # Roles this squad uses that Role Setup no longer allows. A squad keeps whatever
+        # was stored before the event's lists were narrowed, and the squad form drops such
+        # a value silently on the next edit -- so surface it here rather than let it
+        # vanish unnoticed.
+        s.role_violations = _squad_role_violations(s, event, role_names)
+        # Channel visibility is read live rather than from the synced DiscordChannel rows,
+        # which carry no permissions -- and it is checked on every render because the
+        # permissions live in Discord and can change after a squad is set up.
+        s.channel_warnings = _squad_channel_warnings(s, public_channel_ids)
+        # Per-squad management: full managers, or this squad's captain/VC.
+        s.can_manage = can_manage_all or _can_manage_squad_availability(request.user, s)
+
+        members = squad_members_data.get(s.pk, [])
+        for member in members:
+            member["signup_id"] = signup_by_user.get(member["user"].pk)
+        s.enriched_members = members
+        member_user_ids = {m["user"].pk for m in members}
+        s.available_signups = sorted(
+            (su for su in placeable if su.user_id not in member_user_ids),
+            key=lambda su: (su.user.get_full_name() or su.user.discord_username or "").lower(),
+        )
+        # Categories are batched once for the whole event above; eligibility is
+        # per-squad, so only the cheap comparison repeats per squad.
+        _mark_eligibility(s, s.available_signups, rider_categories)
+        s.available_groups = _group_available_signups(s.available_signups, squad_names_by_user)
+
+    # Filter options — only the values actually in use by this event's squads.
+    squad_timezones = sorted({s.squad_timezone for s in squads if s.squad_timezone})
+    squad_genders = sorted({s.gender for s in squads if s.gender})
+
+    return render(
+        request,
+        "events/squad_manage.html",
+        {
+            "event": event,
+            "squads": squads,
+            "event_role_name": event_role_name,
+            "can_manage_all": can_manage_all,
+            "can_manage_roles": _can_manage_event_roles(request.user, event),
+            # The Assign Riders page is event_admin-only (stricter than can_manage_all, which
+            # also covers head captains and coordinators). Mirror its gate exactly so the
+            # button isn't shown to people who would just get a 403.
+            "can_assign_riders": request.user.is_event_admin,
+            # Narrower than this page: a squad's Discord captain role opens Manage Squads but not the board.
+            "can_view_series_board": event.is_race_series and _can_view_v_report(request.user, event),
+            "squad_timezones": squad_timezones,
+            "squad_genders": squad_genders,
+        },
+    )
+
+
+def _availability_state(grid: AvailabilityGrid, slots: int | None) -> dict:
+    """Describe one rider's answer to one availability grid.
+
+    Args:
+        grid: The availability grid.
+        slots: How many slots the rider marked available, or None if they never
+            submitted a response.
+
+    Returns:
+        ``{"state", "label", "detail"}`` where state is "yes", "no" or "none".
+
+    """
+    if slots is None:
+        return {"state": "none", "label": "\u2013", "detail": "No response yet"}
+    if grid.is_series:
+        # For a series sheet ``slots`` counts the stages the rider is Available for.
+        if slots == 0:
+            return {"state": "no", "label": "No", "detail": "Responded: not available for any stage"}
+        return {"state": "yes", "label": "Yes", "detail": f"Available for {slots} stage{'s' if slots != 1 else ''}"}
+    if slots == 0:
+        # A response with nothing marked. On a single-slot grid that is literally the
+        # "No" button; on a full grid it is a rider saying no date works.
+        return {"state": "no", "label": "No", "detail": "Responded: not available"}
+    if grid.single_slot:
+        return {"state": "yes", "label": "Yes", "detail": "Available"}
+    return {
+        "state": "yes",
+        "label": "Yes",
+        "detail": f"{slots} slot{'s' if slots != 1 else ''} marked available",
+    }
+
+
+def _availability_columns(event: Event, tz_obj: ZoneInfo, today_local: date) -> dict[int, list[dict]]:
+    """Group the event's availability grids by squad, with display labels.
+
+    Every non-draft grid counts -- published *and* closed. Restricting this to grids
+    still open for responses empties the column set for most squads: captains close a
+    sheet once they have picked the squad, and the window passes anyway, so a squad
+    that runs week by week would show nothing while one that published a month of
+    sheets up front showed everything. Drafts are excluded because riders were never
+    asked. ``is_open`` keeps the distinction visible in the header.
+
+    Args:
+        event: The event.
+        tz_obj: Timezone used to render the column labels.
+        today_local: Today's date in that timezone, for the open/closed split.
+
+    Returns:
+        ``{squad_id: [{"grid", "label", "detail", "is_open"}]}`` oldest-first within each
+        squad. ``detail`` carries the time the label drops, for the header tooltip.
+
+    """
+    utc = ZoneInfo("UTC")
+
+    def _start_of(grid: AvailabilityGrid) -> datetime:
+        """Return a grid's start moment in the viewer's timezone.
+
+        Args:
+            grid: The availability grid.
+
+        Returns:
+            The localized start datetime.
+
+        """
+        return datetime.combine(
+            grid.start_date, time.fromisoformat(grid.start_time), tzinfo=utc
+        ).astimezone(tz_obj)
+
+    def _label(grid: AvailabilityGrid, start: datetime) -> str:
+        """Build the column heading for a grid.
+
+        Deliberately without a time: a weekly series is read as a row of dates, and
+        "Sep 22 06:00" spent most of a narrow column on a number that is the same every
+        week. The time is not lost -- it moves to the tooltip, and comes back into the
+        label only where two sheets share a day (see below).
+
+        ``start.day`` rather than ``%d`` because ``%d`` pads, and "Sep 02" beside
+        "Sep 22" reads as a wider column for no gain. Matches the race badges.
+
+        Args:
+            grid: The availability grid.
+            start: Its localized start.
+
+        Returns:
+            The heading text.
+
+        """
+        if grid.single_slot:
+            return f"{start:%b} {start.day}"
+        end = datetime.combine(
+            grid.end_date, time.fromisoformat(grid.end_time), tzinfo=utc
+        ).astimezone(tz_obj)
+        return f"{start:%b} {start.day}\u2013{end:%b} {end.day}"
+
+    by_squad: dict[int, list[dict]] = defaultdict(list)
+    grids = (
+        AvailabilityGrid.objects
+        .filter(squad__event=event)
+        .exclude(status=AvailabilityGrid.Status.DRAFT)
+        # pk breaks the tie so two sheets starting at the same moment keep a stable
+        # column order between requests.
+        .order_by("start_date", "start_time", "end_date", "pk")
+    )
+    for grid in grids:
+        start = _start_of(grid)
+        by_squad[grid.squad_id].append({
+            "grid": grid,
+            "label": _label(grid, start),
+            "detail": f"{start:%A %d %B %Y, %H:%M}",
+            "start": start,
+            "is_open": (
+                grid.status == AvailabilityGrid.Status.PUBLISHED and grid.end_date >= today_local
+            ),
+        })
+
+    # Dropping the time is only safe while the dates stay distinct. Two sheets on the same
+    # day -- a morning and an evening race, or two divisions -- would otherwise be two
+    # columns with identical headings, which is worse than the time we removed. Put it back
+    # on exactly those, and leave every other column short.
+    for cols in by_squad.values():
+        counts = Counter(col["label"] for col in cols)
+        for col in cols:
+            if counts[col["label"]] > 1:
+                col["label"] = f"{col['label']} {col['start']:%H:%M}"
+
+    return by_squad
+
+
+@login_required
+@team_member_required()
+@require_GET
+def signup_export_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Download the event's registered signups as CSV.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        A CSV attachment.
+
+    Raises:
+        PermissionDenied: If the user may not export this event's signups.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_export_event_signups(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        logfire.warning(
+            "Unauthorized signup export attempt",
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        raise PermissionDenied("Only the event's head captain or a coordinator can export signups.")
+
+    signups = event.signups.select_related("user").filter(status=EventSignup.Status.REGISTERED)
+    enriched = _enrich_signups(signups, event=event)
+    enriched.sort(key=lambda e: (e["user"].get_full_name() or e["user"].discord_username or "").lower())
+    questions = active_questions(event)
+    header, rows = _signup_export_rows(event, enriched, questions)
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", event.title).strip("-").lower() or "event"
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="{slug}-signups.csv"'
+    writer = csv.writer(response)
+    writer.writerow(header)
+    writer.writerows(rows)
+
+    logfire.info(
+        "Event signups exported",
+        event_id=event_pk,
+        user_id=request.user.id,
+        row_count=len(rows),
+    )
+    return response
+
+
+def _can_export_event_signups(user: User, event: Event) -> bool:
+    """Check if a user may download the event's signup list.
+
+    Deliberately narrower than viewing the table: an export is a bulk extract of
+    every rider's details in one file, so it is limited to the people running the
+    event -- its head captain and its regional/group coordinators. Superusers pass
+    as they do everywhere.
+
+    Args:
+        user: The requesting user.
+        event: The event whose signups would be exported.
+
+    Returns:
+        True if the user may export this event's signups.
+
+    """
+    if user.is_superuser:
+        return True
+    if event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id):
+        return True
+    return _is_event_coordinator(user, event)
+
+
+def _signup_export_rows(event: Event, enriched: list[dict], questions: list) -> tuple[list[str], list[list]]:
+    """Build the header and data rows for the signup CSV.
+
+    Columns mirror the signup table on the event page, including the ones hidden
+    behind the column picker -- the export is the whole list, not the current view.
+
+    Args:
+        event: The event being exported.
+        enriched: Enriched signup dicts from ``_enrich_signups``.
+        questions: The event's active signup questions, one column each.
+
+    Returns:
+        ``(header, rows)`` ready to hand to ``csv.writer``.
+
+    """
+    header = ["Name", "Discord", "ZWID", "Timezone"]
+    if event.squad_gender_required:
+        header.append("Squad Gender")
+    header += [
+        "Gender", "ZP Category", "ZP Category (W)", "ZR Category", "FTP", "WKG",
+        "zFTP", "zFTP W/kg", "zMAP", "zMAP W/kg", "Zauth", "Race Verified",
+    ]
+    if event.event_role:
+        header.append("Event Role")
+    header += [
+        "Squads", "Notes", "Signed Up", "Age", "Current Rating", "Current Cat",
+        "Max30 Rating", "Max30 Cat", "Max90 Rating", "Max90 Cat", "Phenotype",
+    ]
+    header += [q.label for q in questions]
+
+    def _zauth(user: User) -> str:
+        if user.is_zauth_verified:
+            return "Zauth"
+        if user.zwid_verified:
+            return user.get_zwid_verification_method_display() or "Other"
+        return ""
+
+    rows = []
+    for e in enriched:
+        user = e["user"]
+        signup = e["signup"]
+        row = [
+            user.get_full_name() or user.discord_username or "",
+            user.discord_username or "",
+            e["zwid"] or "",
+            ", ".join(signup.signup_timezone or []),
+        ]
+        if event.squad_gender_required:
+            row.append(", ".join(signup.signup_squad_gender or []))
+        row += [
+            e["gender"],
+            e["zp_category"], e["zp_category_w"], e["zr_category"],
+            e["zp_ftp"] or "", e["wkg"] or "",
+            e["z_ftp"] or "", e["z_ftp_wkg"] or "",
+            e["z_map"] or "", e["z_map_wkg"] or "",
+            _zauth(user),
+            "Extra Verified" if e["is_extra_verified"] else ("Yes" if e["is_race_ready"] else "No"),
+        ]
+        if event.event_role:
+            row.append("Yes" if e["has_event_role"] else "No")
+        row += [
+            ", ".join(sq.name for sq in e["assigned_squads"]),
+            signup.notes or "",
+            signup.created_at.isoformat() if signup.created_at else "",
+            e["zr_age"], e["zr_current_rating"] or "", e["zr_current_category"],
+            e["zr_max30_rating"] or "", e["zr_max30_category"],
+            e["zr_max90_rating"] or "", e["zr_max90_category"],
+            e["zr_phenotype"],
+        ]
+        answers = {a["question"].pk: a["display"] for a in e["custom_answers"]}
+        row += [answers.get(q.pk, "") for q in questions]
+        rows.append([csv_safe(cell) for cell in row])
+    return header, rows
+
+
+def _build_participation_report(event: Event, tz_obj: ZoneInfo, now_utc: datetime) -> list[dict]:
+    """Build the per-squad participation report for an event.
+
+    Each squad member is enriched with ZP/ZR data (for the rider tooltip) and
+    annotated with the scheduled races they have already raced (past) plus their
+    upcoming ones -- each as both a count and a list of ``{"name", "date"}``.
+    Tallies are scoped to this event's scheduled races
+    (``AvailabilitySlotSelection``).
+
+    Each row also carries an ``availability`` list aligned with its squad's
+    ``grids``: the rider's yes / no / no-response state for every availability
+    sheet the squad ran, behind the page's "View Availability" toggle.
+
+    Args:
+        event: The event.
+        tz_obj: Timezone used to render upcoming-race dates.
+        now_utc: Current time, used to split past vs future races.
+
+    Returns:
+        List of ``{"squad", "rows"}`` dicts, one per squad ordered by name.
+
+    """
+    # Collect each rider's past ("raced") and future scheduled races, keyed by user id.
+    # Both lists stay in the query's chronological order so the two columns read
+    # left-to-right in time, in the order the season actually ran.
+    raced: dict[int, list[dict]] = defaultdict(list)
+    upcoming: dict[int, list[dict]] = defaultdict(list)
+    selections = (
+        AvailabilitySlotSelection.objects
+        .filter(grid__squad__event=event)
+        .prefetch_related("selected_users")
+        .order_by("slot_date", "slot_time")
+    )
+    for sel in selections:
+        race_dt = sel.race_datetime_utc
+        is_future = race_dt >= now_utc
+        local_dt = race_dt.astimezone(tz_obj)
+        # "SEP 22", not "Sep 22, 2026": these badges sit two-to-a-cell in a narrow column,
+        # and the year is redundant inside a single event. %-d is not portable, so the day
+        # is formatted separately to avoid the zero padding of %d ("SEP 02").
+        local_date = f"{local_dt:%b} {local_dt.day}".upper()
+        local_date_full = local_dt.strftime("%A %d %B %Y")
+        for rider in sel.selected_users.all():
+            race = {"name": sel.name, "date": local_date, "date_full": local_date_full}
+            if is_future:
+                upcoming[rider.pk].append(race)
+            else:
+                raced[rider.pk].append(race)
+
+    grids_by_squad = _availability_columns(event, tz_obj, now_utc.astimezone(tz_obj).date())
+
+    # (grid, rider) -> how many slots the rider marked available. The count is kept
+    # rather than a bool because a submitted response with nothing marked is a
+    # deliberate "no", which reads very differently from never having answered.
+    grid_ids = [col["grid"].pk for cols in grids_by_squad.values() for col in cols]
+    # A series sheet's "slots" are the stages the rider is Available for at their current time.
+    series_ids = {col["grid"].pk for cols in grids_by_squad.values() for col in cols if col["grid"].is_series}
+    sheet_stages: dict = defaultdict(list)
+    for sheet_stage in SheetStage.objects.filter(grid_id__in=series_ids) if series_ids else []:
+        sheet_stages[sheet_stage.grid_id].append(sheet_stage)
+    marked_slots: dict[tuple, int] = {}
+    if grid_ids:
+        for grid_id, user_id, cells, stage_answers in AvailabilityResponse.objects.filter(
+            grid_id__in=grid_ids
+        ).values_list("grid_id", "user_id", "available_cells", "stage_answers"):
+            if grid_id in series_ids:
+                marked_slots[grid_id, user_id] = sum(
+                    1
+                    for sheet_stage in sheet_stages[grid_id]
+                    if series.answer_state(stage_answers, sheet_stage) == series.ANSWER.AVAILABLE
+                )
+            else:
+                marked_slots[grid_id, user_id] = len(cells or [])
+
+    # Enriched squad members (ZP/ZR data for the rider tooltip) grouped by
+    # squad, with each rider's race tallies merged in.
+    enriched_by_squad = _enrich_squad_members(event)
+
+    report = []
+    for squad in event.squads.order_by("name"):
+        squad_grids = grids_by_squad.get(squad.pk, [])
+        rows = []
+        for member in sorted(
+            enriched_by_squad.get(squad.pk, []),
+            key=lambda m: (m["user"].get_full_name() or m["user"].discord_username or "").lower(),
+        ):
+            rider_raced = raced.get(member["user"].pk, [])
+            rider_upcoming = upcoming.get(member["user"].pk, [])
+            rows.append({
+                **member,
+                "raced_count": len(rider_raced),
+                "raced": rider_raced,
+                "upcoming_count": len(rider_upcoming),
+                "upcoming": rider_upcoming,
+                "availability": [
+                    _availability_state(col["grid"], marked_slots.get((col["grid"].pk, member["user"].pk)))
+                    for col in squad_grids
+                ],
+            })
+        # How many of this squad's riders said yes to each sheet. Computed here rather than
+        # in the template because the answer lives on the rows, one per column, and a
+        # template cannot cross that axis. Counted against the rows actually rendered, so
+        # the denominator matches what the reader can see.
+        for index, col in enumerate(squad_grids):
+            col["available_count"] = sum(1 for row in rows if row["availability"][index]["state"] == "yes")
+            col["member_count"] = len(rows)
+
+        report.append({
+            "squad": squad,
+            "rows": rows,
+            "grids": squad_grids,
+            # The fixed columns (rider, past races, raced, upcoming, next races) plus one
+            # per open grid, for the "no riders" row's colspan.
+            "colspan": 5 + len(squad_grids),
+        })
+    return report
+
+
+def _build_scheduled_race_slots(
+    selections: list[AvailabilitySlotSelection],
+    user_tz: str,
+    today_local: date,
+    *,
+    include_event: bool = False,
+) -> list[dict]:
+    """Build per-slot display dicts shared by the scheduled-race pages.
+
+    Used by both ``event_all_races_view`` (one event) and
+    ``all_scheduled_races_view`` (every event). Selected riders are enriched
+    with ZP/ZR data in a single batched lookup, UTC slot times are converted to
+    the viewer's timezone, and the days-until / status badge metadata is
+    computed.
+
+    Args:
+        selections: The slot selections for the current page.
+        user_tz: The viewer's IANA timezone (may be empty).
+        today_local: Today's date in the viewer's timezone.
+        include_event: When True, add ``event`` to each slot dict so the
+            cross-event template can label which event each race belongs to.
+
+    Returns:
+        List of slot display dicts consumed by the races templates.
+
+    """
+    # Collect every selected user across the visible window for one zp/zr lookup
+    users_for_lookup: dict[int, User] = {}
+    for sel in selections:
+        for u in sel.selected_users.all():
+            users_for_lookup.setdefault(u.pk, u)
+
+    zwids = [u.zwid for u in users_for_lookup.values() if u.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+
+    def _enrich(user: User) -> dict:
+        zwid = user.zwid
+        zp = zp_by_zwid.get(zwid) if zwid else None
+        zr = rider_stats.zr_fields(profiles.get(zwid) if zwid else None, gender=user.gender)
+        return {
+            "user": user,
+            "zwid": zwid,
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "in_zwiftpower": zp is not None,
+            "zp_category": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_category_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            **{key: zr[key] for key in rider_stats.TOOLTIP_FIELDS},
+        }
+
+    enriched_by_user_id = {pk: _enrich(u) for pk, u in users_for_lookup.items()}
+
+    slots: list[dict] = []
+    for sel in selections:
+        display_tz = user_tz or sel.grid.grid_timezone or "UTC"
+        try:
+            tz_obj = ZoneInfo(display_tz)
+        except Exception:
+            tz_obj = ZoneInfo("UTC")
+            display_tz = "UTC"
+        utc_dt = datetime.combine(
+            sel.slot_date,
+            datetime.strptime(sel.slot_time, "%H:%M").time(),  # noqa: DTZ007  # clock-only parse, no date used
+            tzinfo=ZoneInfo("UTC"),
+        )
+        local_dt = utc_dt.astimezone(tz_obj)
+        days_until = (local_dt.date() - today_local).days
+        if days_until > 1:
+            days_label = f"in {days_until} days"
+            days_class = "badge-info"
+        elif days_until == 1:
+            days_label = "tomorrow"
+            days_class = "badge-warning"
+        elif days_until == 0:
+            days_label = "today"
+            days_class = "badge-warning"
+        else:
+            days_label = f"{abs(days_until)} day{'s' if abs(days_until) != 1 else ''} ago"
+            days_class = "badge-ghost"
+        if sel.status == AvailabilitySlotSelection.Status.CONFIRMED:
+            status_class = "badge-success"
+        elif sel.status == AvailabilitySlotSelection.Status.PENDING:
+            status_class = "badge-warning"
+        else:
+            status_class = ""
+        riders = [
+            enriched_by_user_id[u.pk]
+            for u in sel.selected_users.all()
+            if u.pk in enriched_by_user_id
+        ]
+        slot = {
+            "selection": sel,
+            "squad": sel.grid.squad,
+            "squad_name": sel.grid.squad.name,
+            "grid_title": sel.grid.title or "Availability Grid",
+            "local_day": local_dt.strftime("%a"),
+            "local_date": local_dt.strftime("%b %-d"),
+            "local_time": local_dt.strftime("%H:%M"),
+            "display_timezone": display_tz,
+            "days_until": days_until,
+            "days_label": days_label,
+            "days_class": days_class,
+            "status_label": sel.get_status_display(),
+            "status_class": status_class,
+            "is_status_visible": sel.status != AvailabilitySlotSelection.Status.NONE,
+            "riders": riders,
+        }
+        if include_event:
+            slot["event"] = sel.grid.squad.event
+        slots.append(slot)
+    return slots
+
+
+def _races_matching(
+    selections: list[AvailabilitySlotSelection], query: str
+) -> tuple[list[AvailabilitySlotSelection], set[int]]:
+    """Keep the races whose name, squad's name or a picked rider's name contains ``query``.
+
+    A rider's name is the one the race card shows: their full name, or their Discord
+    username when they have none -- so every match can be seen. Compared with the
+    roster's ``fold`` (case and accents ignored, the same on SQLite and Postgres), which
+    is why this runs in Python: one event's upcoming races are a few hundred at most.
+
+    Args:
+        selections: The races to search, with ``grid__squad`` and ``selected_users`` loaded.
+        query: The text typed.
+
+    Returns:
+        The matching races, in the order given, and the ids of those a rider matched,
+        whose rider list the page opens so the reason for the match is on screen.
+
+    """
+    needle = fold(query)
+    matches: list[AvailabilitySlotSelection] = []
+    found_by_rider: set[int] = set()
+    for sel in selections:
+        if any(needle in fold(rider.get_full_name() or rider.discord_username) for rider in sel.selected_users.all()):
+            found_by_rider.add(sel.pk)
+        if sel.pk in found_by_rider or needle in fold(sel.name) or needle in fold(sel.grid.squad.name):
+            matches.append(sel)
+    return matches, found_by_rider
+
+
+@login_required
+@team_member_required()
+@require_GET
+def event_all_races_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Paginated list of every scheduled race in the event from today forward.
+
+    25 races per page, ordered chronologically. ``?page=N`` selects a page
+    (out-of-range falls back to the last available page). ``?q=`` narrows the list to
+    races whose name, squad or picked rider contains the text (``_races_matching``); a
+    live search asks with ``HX-Target: all-races-results`` and gets that region alone,
+    without the participation report.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Rendered all-races page.
+
+    Raises:
+        Http404: If the event is hidden from this viewer.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_view_event(request.user, event):
+        logfire.info("Hidden event races withheld", event_id=event.pk, user_id=request.user.id)
+        raise Http404
+
+    user_tz = getattr(request.user, "timezone", "") or ""
+    now_utc = timezone.now()
+    try:
+        tz_obj = ZoneInfo(user_tz) if user_tz else ZoneInfo("UTC")
+    except Exception:
+        tz_obj = ZoneInfo("UTC")
+    today_local = now_utc.astimezone(tz_obj).date()
+
+    all_selections = (
+        AvailabilitySlotSelection.objects
+        .filter(grid__squad__event=event, slot_date__gte=today_local)
+        .select_related("grid", "grid__squad")
+        .prefetch_related("selected_users", "grid__squad__captains", "grid__squad__vice_captains")
+        .order_by("slot_date", "slot_time", "grid__squad__name")
+    )
+    query = (request.GET.get("q") or "").strip()
+    found_by_rider: set[int] = set()
+    if query:
+        all_selections = list(all_selections)
+        total_races = len(all_selections)
+        all_selections, found_by_rider = _races_matching(all_selections, query)
+
+    paginator = Paginator(all_selections, 25)
+    page_number = request.GET.get("page") or 1
+    try:
+        page_obj = paginator.page(page_number)
+    except Exception:
+        page_obj = paginator.page(paginator.num_pages or 1)
+    selections = list(page_obj.object_list)
+    if not query:
+        total_races = paginator.count
+
+    slots = _build_scheduled_race_slots(selections, user_tz, today_local)
+    for slot in slots:
+        slot["open_riders"] = slot["selection"].pk in found_by_rider
+
+    htmx = getattr(request, "htmx", None)
+    live_search = bool(htmx and not htmx.history_restore_request and htmx.target == "all-races-results")
+
+    logfire.debug(
+        "Event all races viewed",
+        event_id=event_pk,
+        user_id=request.user.id,
+        page=page_obj.number,
+        total_pages=paginator.num_pages,
+        slot_count=len(slots),
+        total_count=paginator.count,
+        # The length only: a search is free text, often a rider's name.
+        query_length=len(query),
+        live_search=live_search,
+    )
+
+    context = {
+        "event": event,
+        "slots": slots,
+        "page_obj": page_obj,
+        "paginator": paginator,
+        "query": query,
+        "total_races": total_races,
+        "live_search": live_search,
+    }
+    if live_search:
+        response = render(request, "events/_all_races_results.html", context)
+        # The address bar follows the search, so a reload or a shared link keeps it; a
+        # new search starts on page 1, and clearing the box gives back the plain URL.
+        response["HX-Replace-Url"] = reverse("events:event_all_races", args=[event.pk]) + (
+            f"?{urlencode({'q': query})}" if query else ""
+        )
+    else:
+        participation = _build_participation_report(event, tz_obj, now_utc)
+        response = render(
+            request,
+            "events/event_all_races.html",
+            {
+                **context,
+                "today": today_local,
+                "participation": participation,
+                # Option lists for the participation filters, built from the squads actually
+                # present so a value that would match nothing is never offered.
+                "participation_timezones": sorted(
+                    {g["squad"].squad_timezone for g in participation if g["squad"].squad_timezone}
+                ),
+                "participation_genders": sorted({g["squad"].gender for g in participation if g["squad"].gender}),
+                # Drives the "View Availability" toggle: nothing to toggle when no squad
+                # has an availability sheet.
+                "has_open_grids": any(group["grids"] for group in participation),
+                "display_timezone": str(tz_obj),
+                "active_tab": request.GET.get("tab") or "races",
+                "guild_id": config.GUILD_ID,
+                # Anyone who can see the event sees this page; the board is for those running it.
+                "can_view_series_board": event.is_race_series and _can_view_v_report(request.user, event),
+            },
+        )
+    # One URL answers with a whole page or with a fragment, so a cache must keep them apart.
+    patch_vary_headers(response, ("HX-Request",))
+    return response
+
+
+@login_required
+@team_member_required()
+@require_GET
+def all_scheduled_races_view(request: HttpRequest) -> HttpResponse:
+    """Paginated list of every scheduled race across all events from today forward.
+
+    Mirrors ``event_all_races_view`` but spans every event, labelling each race
+    with the event it belongs to. 25 races per page, ordered chronologically;
+    ``?page=N`` selects a page (out-of-range falls back to the last page).
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered all-events scheduled races page.
+
+    """
+    user_tz = getattr(request.user, "timezone", "") or ""
+    now_utc = timezone.now()
+    today_local = now_utc.astimezone(ZoneInfo(user_tz) if user_tz else now_utc.tzinfo).date()
+
+    base_qs = (
+        AvailabilitySlotSelection.objects
+        .filter(slot_date__gte=today_local)
+        .select_related("grid", "grid__squad", "grid__squad__event")
+        .prefetch_related("selected_users", "grid__squad__captains", "grid__squad__vice_captains")
+        .order_by("slot_date", "slot_time", "grid__squad__event__title", "grid__squad__name")
+    )
+    # An event nobody is meant to see does not get to show its races here. This page is
+    # where a hidden event leaked furthest: a race card names the event, the race, and
+    # every rider selected for it, down to their zwid.
+    hidden_event_ids = _events_hidden_from(
+        request.user, Event.objects.filter(pk__in=base_qs.values("grid__squad__event_id"))
+    )
+    if hidden_event_ids:
+        base_qs = base_qs.exclude(grid__squad__event_id__in=hidden_event_ids)
+
+    # Section 1: races the viewer is personally selected in.
+    my_selections = list(base_qs.filter(selected_users=request.user))
+    my_ids = {s.pk for s in my_selections}
+
+    # Section 2: races in the viewer's squads they are not personally selected in.
+    my_squad_ids = list(
+        SquadMember.objects
+        .filter(user=request.user, status=SquadMember.Status.MEMBER)
+        .values_list("squad_id", flat=True)
+    )
+    squad_selections = (
+        [s for s in base_qs.filter(grid__squad_id__in=my_squad_ids) if s.pk not in my_ids]
+        if my_squad_ids
+        else []
+    )
+
+    # Section 3: every other race, paginated.
+    other_qs = base_qs.exclude(pk__in=my_ids)
+    if my_squad_ids:
+        other_qs = other_qs.exclude(grid__squad_id__in=my_squad_ids)
+
+    paginator = Paginator(other_qs, 25)
+    page_number = request.GET.get("page") or 1
+    try:
+        page_obj = paginator.page(page_number)
+    except Exception:
+        page_obj = paginator.page(paginator.num_pages or 1)
+
+    my_slots = _build_scheduled_race_slots(my_selections, user_tz, today_local, include_event=True)
+    squad_slots = _build_scheduled_race_slots(squad_selections, user_tz, today_local, include_event=True)
+    other_slots = _build_scheduled_race_slots(list(page_obj.object_list), user_tz, today_local, include_event=True)
+
+    logfire.debug(
+        "All scheduled races viewed",
+        user_id=request.user.id,
+        page=page_obj.number,
+        total_pages=paginator.num_pages,
+        my_count=len(my_slots),
+        squad_count=len(squad_slots),
+        other_count=paginator.count,
+    )
+
+    return render(
+        request,
+        "events/all_scheduled_races.html",
+        {
+            "my_slots": my_slots,
+            "squad_slots": squad_slots,
+            "other_slots": other_slots,
+            "page_obj": page_obj,
+            "paginator": paginator,
+            "today": today_local,
+            "guild_id": config.GUILD_ID,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_GET
+def squad_v_report_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Display verification report for all registered signups.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Rendered V Report page with per-rider verification day counts.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    if not _can_view_v_report(request.user, event):
+        logfire.warning(
+            "Unauthorized squad v-report attempt",
+            event_id=event_pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to view Eligibility.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    signups = event.signups.filter(status=EventSignup.Status.REGISTERED).select_related("user")
+    enriched = _enrich_signups(signups, event=event)
+
+    from apps.team.services import verification_days_bulk
+
+    verification_by_user = verification_days_bulk([entry["user"] for entry in enriched])
+    for entry in enriched:
+        entry["verification"] = verification_by_user[entry["user"].id]
+
+    # Riders who cannot race are the ones this page exists to surface, so they lead:
+    # first anyone not race verified (no record, or an expired one), then whoever expires
+    # soonest. Note race_ready_days is None both for "nothing to expire" and for a rider
+    # whose records never expire, so is_race_ready -- the authoritative cached field -- is
+    # what decides eligibility here, not the day count.
+    enriched.sort(
+        key=lambda e: (
+            e["user"].is_race_ready,
+            e["verification"]["race_ready_days"] if e["verification"]["race_ready_days"] is not None else 0,
+            (e["user"].get_full_name() or e["user"].discord_username or "").lower(),
+        ),
+    )
+
+    # Counted before any filter, so the badge is a stable "this many need attention"
+    # rather than a number that changes with whatever view you are currently in.
+    not_eligible_count = sum(1 for e in enriched if not e["user"].is_race_ready)
+
+    # Filter: eligible (currently race verified) or not.
+    eligible_raw = request.GET.get("eligible", "").strip()
+    if eligible_raw == "yes":
+        enriched = [e for e in enriched if e["user"].is_race_ready]
+    elif eligible_raw == "no":
+        enriched = [e for e in enriched if not e["user"].is_race_ready]
+    else:
+        eligible_raw = ""
+
+    # Filter: riders whose eligibility (race-ready) expiration falls within N days.
+    expiring_raw = request.GET.get("expiring", "").strip()
+    expiring_days = int(expiring_raw) if expiring_raw.isdigit() else None
+    if expiring_days is not None:
+        enriched = [
+            e
+            for e in enriched
+            if e["verification"]["race_ready_days"] is not None
+            and e["verification"]["race_ready_days"] <= expiring_days
+        ]
+
+    # Grouping: optionally group riders by squad (a rider in multiple squads appears
+    # in each), with an "Unassigned" group for riders in no squad.
+    group_by = request.GET.get("group", "")
+    groups = None
+    if group_by == "squad":
+        member_ids_by_squad: dict[int, set[int]] = {}
+        assigned: set[int] = set()
+        for squad_id, user_id in SquadMember.objects.filter(
+            squad__event=event, status=SquadMember.Status.MEMBER
+        ).values_list("squad_id", "user_id"):
+            member_ids_by_squad.setdefault(squad_id, set()).add(user_id)
+            assigned.add(user_id)
+
+        groups = []
+        for squad in event.squads.order_by("name"):
+            ids = member_ids_by_squad.get(squad.id, set())
+            rows = [e for e in enriched if e["user"].id in ids]
+            if rows:
+                groups.append({"name": squad.name, "rows": rows})
+        unassigned = [e for e in enriched if e["user"].id not in assigned]
+        if unassigned:
+            groups.append({"name": "Unassigned", "rows": unassigned})
+
+    # Squads tab: squad members whose current category/gender now violates their
+    # squad's enforced limits (e.g. a rider upgraded after being assigned).
+    members_by_squad = _enrich_squad_members(event)
+    squad_violations = []
+    for squad in event.squads.order_by("name"):
+        rows = []
+        for member in members_by_squad.get(squad.id, []):
+            checks = (
+                squad.check_zwift_eligibility(member["zp_category"]),
+                squad.check_womens_zwift_eligibility(member["zp_category_w"]),
+                squad.check_zr_eligibility(member["zr_category"]),
+                squad.check_gender_eligibility(member["gender"]),
+                squad.check_zauth_eligibility(member["user"].is_zauth_verified),
+                squad.check_zftp_eligibility(member["z_ftp"], member["z_ftp_wkg"]),
+                squad.check_zmap_eligibility(member["z_map"], member["z_map_wkg"]),
+            )
+            reasons = [reason for ok, reason in checks if not ok]
+            if reasons:
+                rows.append({"member": member, "reasons": reasons})
+        if rows:
+            squad_violations.append({"name": squad.name, "rows": rows})
+
+    logfire.info(
+        "Squad v-report viewed",
+        event_id=event_pk,
+        user_id=request.user.id,
+        username=request.user.username,
+        rider_count=len(enriched),
+        group_by=group_by,
+        expiring_days=expiring_days,
+        eligible=eligible_raw or None,
+        squad_violation_count=sum(len(s["rows"]) for s in squad_violations),
+    )
+
+    return render(
+        request,
+        "events/squad_v_report.html",
+        {
+            "event": event,
+            "signups": enriched,
+            "groups": groups,
+            "group_by": group_by,
+            "expiring": expiring_raw if expiring_days is not None else "",
+            "eligible": eligible_raw,
+            "not_eligible_count": not_eligible_count,
+            "height_never_expires": config.HEIGHT_VERIFICATION_DAYS == 0,
+            "squad_violations": squad_violations,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_delete_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Delete an event.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Redirect to event list.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+
+    if not request.user.is_event_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized event delete attempt",
+            event_id=pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to delete events.")
+        return redirect("events:event_list")
+
+    event_title = event.title
+    event.delete()
+    logfire.info(
+        "Event deleted",
+        event_id=pk,
+        event_title=event_title,
+        user_id=request.user.id,
+        username=request.user.username,
+    )
+    messages.success(request, f'Event "{event_title}" deleted successfully!')
+    return redirect("events:event_list")
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_signup_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Sign up the current user for an event.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+
+    if not event.signups_open:
+        messages.error(request, "Signups are not open for this event.")
+        return redirect("events:event_detail", pk=pk)
+
+    # Withdrawing keeps the row, and the pair is unique, so signing up again brings that row
+    # back rather than adding a second. Only a live signup means "already signed up" -- the
+    # page offers a withdrawn rider the Sign up button, which used to end right here.
+    existing = event.signups.filter(user=request.user).first()
+    if existing and existing.status == EventSignup.Status.REGISTERED:
+        messages.warning(request, "You are already signed up for this event.")
+        return redirect("events:event_detail", pk=pk)
+
+    blockers = signup_blockers(event, request.user)
+    if blockers:
+        logfire.info(
+            "Event signup refused by signup requirements", event_id=pk, user_id=request.user.id, blockers=blockers
+        )
+        messages.error(
+            request,
+            f"You can't sign up yet: this event requires {requirement_phrase(blockers)}. "
+            "Press Sign up to see how to fix it.",
+        )
+        return redirect("events:event_detail", pk=pk)
+
+    signup_timezone = []
+    if event.timezone_options:
+        signup_timezone = request.POST.getlist("signup_timezone")
+        if event.timezone_required and not signup_timezone:
+            messages.error(request, "Please select at least one timezone.")
+            return redirect("events:event_detail", pk=pk)
+        invalid = [tz for tz in signup_timezone if tz not in event.timezone_options]
+        if invalid:
+            messages.error(request, "Invalid timezone selection.")
+            return redirect("events:event_detail", pk=pk)
+
+    signup_squad_gender = []
+    if event.squad_gender_required and event.squad_gender_options:
+        signup_squad_gender = request.POST.getlist("signup_squad_gender")
+        if not signup_squad_gender:
+            messages.error(request, "Please select at least one squad gender preference.")
+            return redirect("events:event_detail", pk=pk)
+        invalid = [g for g in signup_squad_gender if g not in event.squad_gender_options]
+        if invalid:
+            messages.error(request, "Invalid squad gender preference selection.")
+            return redirect("events:event_detail", pk=pk)
+
+    notes = request.POST.get("notes", "").strip()
+
+    custom_answers, answer_error = parse_custom_answers(event, request.POST)
+    if answer_error:
+        messages.error(request, answer_error)
+        return redirect("events:event_detail", pk=pk)
+
+    answers = {
+        "signup_timezone": signup_timezone,
+        "signup_squad_gender": signup_squad_gender,
+        "notes": notes,
+        "custom_answers": custom_answers,
+    }
+    if existing:
+        for field, value in answers.items():
+            setattr(existing, field, value)
+        existing.status = EventSignup.Status.REGISTERED
+        existing.save(update_fields=[*answers, "status", "updated_at"])
+        signup = existing
+    else:
+        signup = EventSignup.objects.create(event=event, user=request.user, **answers)
+    logfire.info(
+        "Event signup created",
+        event_id=pk,
+        event_title=event.title,
+        user_id=request.user.id,
+        signup_timezone=signup_timezone,
+        signup_squad_gender=signup_squad_gender,
+        signed_up_again=existing is not None,
+    )
+    from apps.events.tasks import enqueue_signup_notification
+
+    enqueue_signup_notification(signup, request=request)
+
+    # Grant any timezone/region roles this event maps for the options the rider picked.
+    _apply_timezone_roles(request.user, event, after=signup_timezone, admin_user_id=request.user.id)
+
+    # Grant the event's Discord role on signup (if configured and the rider has Discord linked).
+    # The squad self-join flow already assigns event_role; plain event signup was missing it.
+    if event.event_role and request.user.discord_id and not request.user.has_discord_role(event.event_role):
+        role_id_str = str(event.event_role)
+        if add_discord_role(request.user.discord_id, role_id_str):
+            from apps.team.models import DiscordRole
+
+            roles_updated = dict(request.user.discord_roles or {})
+            roles_updated[role_id_str] = (
+                DiscordRole.objects.filter(role_id=role_id_str).values_list("name", flat=True).first() or "Event Role"
+            )
+            request.user.discord_roles = roles_updated
+            request.user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Event Discord role assigned on signup",
+                event_id=pk,
+                user_id=request.user.id,
+                role_id=role_id_str,
+            )
+        else:
+            logfire.error(
+                "Failed to assign event Discord role on signup",
+                event_id=pk,
+                user_id=request.user.id,
+                role_id=role_id_str,
+            )
+            messages.warning(
+                request,
+                "You're signed up, but the event Discord role couldn't be assigned. Contact an admin.",
+            )
+
+    messages.success(request, "You have signed up for this event!")
+    return redirect("events:event_detail", pk=pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_signup_edit_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Update the current user's signup for an event.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    signup = get_object_or_404(EventSignup, event=event, user=request.user, status=EventSignup.Status.REGISTERED)
+
+    signup_timezone = []
+    if event.timezone_options:
+        signup_timezone = request.POST.getlist("signup_timezone")
+        if event.timezone_required and not signup_timezone:
+            messages.error(request, "Please select at least one timezone.")
+            return redirect("events:event_detail", pk=pk)
+        invalid = [tz for tz in signup_timezone if tz not in event.timezone_options]
+        if invalid:
+            messages.error(request, "Invalid timezone selection.")
+            return redirect("events:event_detail", pk=pk)
+
+    signup_squad_gender = []
+    if event.squad_gender_required and event.squad_gender_options:
+        signup_squad_gender = request.POST.getlist("signup_squad_gender")
+        if not signup_squad_gender:
+            messages.error(request, "Please select at least one squad gender preference.")
+            return redirect("events:event_detail", pk=pk)
+        invalid = [g for g in signup_squad_gender if g not in event.squad_gender_options]
+        if invalid:
+            messages.error(request, "Invalid squad gender preference selection.")
+            return redirect("events:event_detail", pk=pk)
+
+    custom_answers, answer_error = parse_custom_answers(event, request.POST, existing=signup.custom_answers)
+    if answer_error:
+        messages.error(request, answer_error)
+        return redirect("events:event_detail", pk=pk)
+
+    previous_timezone = list(signup.signup_timezone or [])
+    signup.signup_timezone = signup_timezone
+    signup.signup_squad_gender = signup_squad_gender
+    signup.notes = request.POST.get("notes", "").strip()
+    signup.custom_answers = custom_answers
+    signup.save(
+        update_fields=["signup_timezone", "signup_squad_gender", "notes", "custom_answers", "updated_at"]
+    )
+    logfire.info(
+        "Event signup updated",
+        event_id=pk,
+        event_title=event.title,
+        user_id=request.user.id,
+        signup_timezone=signup_timezone,
+        signup_squad_gender=signup_squad_gender,
+    )
+    # Reconcile timezone/region roles: grant newly-picked options, and drop ones the
+    # rider deselected unless they still earn the role elsewhere.
+    _apply_timezone_roles(
+        request.user, event, before=previous_timezone, after=signup_timezone, admin_user_id=request.user.id
+    )
+
+    messages.success(request, "Your signup has been updated.")
+    return redirect("events:event_detail", pk=pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_signup_delete_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Delete the current user's signup for an event.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    signup = get_object_or_404(EventSignup, event=event, user=request.user, status=EventSignup.Status.REGISTERED)
+    removed_squads, _ = SquadMember.objects.filter(squad__event=event, user=request.user).delete()
+    signup.delete()
+    logfire.info(
+        "Event signup deleted",
+        event_id=pk,
+        event_title=event.title,
+        user_id=request.user.id,
+        squad_memberships_removed=removed_squads,
+    )
+    messages.success(request, "Your signup has been removed.")
+    return redirect("events:event_detail", pk=pk)
+
+
+def _can_manage_signup_questions(user) -> bool:
+    """Whether a user may manage an event's signup questions.
+
+    Mirrors the event-edit gate (global event admins and superusers).
+
+    Args:
+        user: The requesting user.
+
+    Returns:
+        True if allowed.
+
+    """
+    return bool(user.is_event_admin or user.is_superuser)
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def signup_questions_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """List and add an event's custom signup questions.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+
+    Returns:
+        Rendered management page (GET / invalid POST) or redirect on add.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    if not _can_manage_signup_questions(request.user):
+        messages.error(request, "You don't have permission to manage signup questions.")
+        return redirect("events:event_detail", pk=pk)
+
+    questions = active_questions(event)
+    at_limit = len(questions) >= MAX_QUESTIONS_PER_EVENT
+
+    if request.method == "POST":
+        if at_limit:
+            messages.error(request, f"An event can have at most {MAX_QUESTIONS_PER_EVENT} signup questions.")
+            return redirect("events:signup_questions", pk=pk)
+        form = SignupQuestionForm(request.POST)
+        if form.is_valid():
+            question = form.save(commit=False)
+            question.event = event
+            question.save()
+            logfire.info(
+                "Signup question added",
+                event_id=pk,
+                question_id=question.pk,
+                question_type=question.question_type,
+                user_id=request.user.id,
+            )
+            messages.success(request, "Question added.")
+            return redirect("events:signup_questions", pk=pk)
+    else:
+        form = SignupQuestionForm(initial={"order": len(questions)})
+
+    return render(
+        request,
+        "events/signup_questions.html",
+        {
+            "event": event,
+            "questions": questions,
+            "add_form": form,
+            "at_limit": at_limit,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def signup_question_edit_view(request: HttpRequest, pk: int, question_pk: int) -> HttpResponse:
+    """Edit one of an event's custom signup questions.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+        question_pk: The signup question primary key.
+
+    Returns:
+        Rendered edit page (GET / invalid POST) or redirect on save.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    if not _can_manage_signup_questions(request.user):
+        messages.error(request, "You don't have permission to manage signup questions.")
+        return redirect("events:event_detail", pk=pk)
+    question = get_object_or_404(SignupQuestion, pk=question_pk, event=event)
+    answers_exist = question.has_answers
+
+    if request.method == "POST":
+        form = SignupQuestionForm(request.POST, instance=question, answers_exist=answers_exist)
+        if form.is_valid():
+            form.save()
+            logfire.info(
+                "Signup question updated",
+                event_id=pk,
+                question_id=question.pk,
+                user_id=request.user.id,
+            )
+            messages.success(request, "Question updated.")
+            return redirect("events:signup_questions", pk=pk)
+    else:
+        form = SignupQuestionForm(instance=question, answers_exist=answers_exist)
+
+    return render(
+        request,
+        "events/signup_question_edit.html",
+        {
+            "event": event,
+            "question": question,
+            "form": form,
+            "answers_exist": answers_exist,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def signup_question_delete_view(request: HttpRequest, pk: int, question_pk: int) -> HttpResponse:
+    """Delete one of an event's custom signup questions.
+
+    Stored answers to the deleted question remain on each EventSignup's
+    ``custom_answers`` (orphaned, harmless) and are simply no longer displayed.
+
+    Args:
+        request: The HTTP request.
+        pk: The event primary key.
+        question_pk: The signup question primary key.
+
+    Returns:
+        Redirect to the signup-questions management page.
+
+    """
+    event = get_object_or_404(Event, pk=pk)
+    if not _can_manage_signup_questions(request.user):
+        messages.error(request, "You don't have permission to manage signup questions.")
+        return redirect("events:event_detail", pk=pk)
+    question = get_object_or_404(SignupQuestion, pk=question_pk, event=event)
+    logfire.info(
+        "Signup question deleted",
+        event_id=pk,
+        question_id=question.pk,
+        user_id=request.user.id,
+    )
+    question.delete()
+    messages.success(request, "Question deleted.")
+    return redirect("events:signup_questions", pk=pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_signup_withdraw_view(request: HttpRequest, event_pk: int, signup_pk: int) -> HttpResponse:
+    """Withdraw a signup (admin only).
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        signup_pk: The signup primary key.
+
+    Returns:
+        Redirect to event edit page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    if not request.user.is_event_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized signup withdraw attempt",
+            event_id=event_pk,
+            signup_id=signup_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage signups.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    signup = get_object_or_404(EventSignup, pk=signup_pk, event=event)
+    removed_squads = signup_status.withdraw(signup)
+    signup.save(update_fields=["status", "staff_status", "updated_at"])
+    logfire.info(
+        "Event signup withdrawn",
+        event_id=event_pk,
+        signup_id=signup_pk,
+        signup_user_id=signup.user_id,
+        admin_user_id=request.user.id,
+        squad_memberships_removed=removed_squads,
+    )
+    messages.success(request, f"Signup for {signup.user} has been withdrawn.")
+    return redirect("events:event_edit", pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def squad_create_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Create a new squad for an event.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    if not _can_manage_event_squads(request.user, event):
+        logfire.warning(
+            "Unauthorized squad creation attempt",
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage squads.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if request.method == "POST":
+        form = SquadForm(
+            request.POST,
+            event_prefixes=event.prefixes or [],
+            coordinator_role_ids=event.coordinator_role_ids or [],
+            region_role_ids=event.region_role_ids or [],
+            captain_role_ids=event.captain_role_ids or [],
+            squad_tags=event.squad_tags or [],
+            event=event,
+        )
+        if form.is_valid():
+            squad = form.save(commit=False)
+            squad.event = event
+            squad.created_by = request.user
+            squad.save()
+            # commit=False skips the m2m write; captains/vice_captains live there.
+            form.save_m2m()
+            for warning in _apply_squad_leadership(
+                squad,
+                before={"captains": set(), "vice_captains": set()},
+                add_as_members={
+                    "captains": form.cleaned_data.get("captains_add_as_members", False),
+                    "vice_captains": form.cleaned_data.get("vice_captains_add_as_members", False),
+                },
+                admin_user_id=request.user.id,
+            ):
+                messages.warning(request, warning)
+            logfire.info(
+                "Squad created",
+                squad_id=squad.pk,
+                squad_name=squad.name,
+                event_id=event_pk,
+                user_id=request.user.id,
+            )
+            messages.success(request, f'Squad "{squad.name}" created successfully!')
+            # Back to Manage Squads, which is where the form was opened from and where
+            # the next thing you do with a new squad lives. The edit view already
+            # returns there.
+            return redirect("events:squad_manage", event_pk=event_pk)
+    else:
+        form = SquadForm(
+            event_prefixes=event.prefixes or [],
+            coordinator_role_ids=event.coordinator_role_ids or [],
+            region_role_ids=event.region_role_ids or [],
+            captain_role_ids=event.captain_role_ids or [],
+            squad_tags=event.squad_tags or [],
+            event=event,
+        )
+
+    return render(
+        request,
+        "events/squad_form.html",
+        {
+            "form": form,
+            "event": event,
+            "page_title": "Add Squad",
+            "submit_label": "Create Squad",
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def squad_edit_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Edit an existing squad.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized squad edit attempt",
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage this squad.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if request.method == "POST":
+        form = SquadForm(
+            request.POST,
+            instance=squad,
+            event_prefixes=event.prefixes or [],
+            coordinator_role_ids=event.coordinator_role_ids or [],
+            region_role_ids=event.region_role_ids or [],
+            captain_role_ids=event.captain_role_ids or [],
+            squad_tags=event.squad_tags or [],
+            event=event,
+        )
+        if form.is_valid():
+            # Snapshot before the save, so only real arrivals/departures hit Discord.
+            before = {
+                "captains": set(squad.captains.values_list("pk", flat=True)),
+                "vice_captains": set(squad.vice_captains.values_list("pk", flat=True)),
+            }
+            form.save()
+            for warning in _apply_squad_leadership(
+                squad,
+                before=before,
+                add_as_members={
+                    "captains": form.cleaned_data.get("captains_add_as_members", False),
+                    "vice_captains": form.cleaned_data.get("vice_captains_add_as_members", False),
+                },
+                admin_user_id=request.user.id,
+            ):
+                messages.warning(request, warning)
+            logfire.info(
+                "Squad updated",
+                squad_id=squad_pk,
+                squad_name=squad.name,
+                event_id=event_pk,
+                user_id=request.user.id,
+            )
+            messages.success(request, f'Squad "{squad.name}" updated successfully!')
+            return redirect("events:squad_manage", event_pk=event_pk)
+    else:
+        form = SquadForm(
+            instance=squad,
+            event_prefixes=event.prefixes or [],
+            coordinator_role_ids=event.coordinator_role_ids or [],
+            region_role_ids=event.region_role_ids or [],
+            captain_role_ids=event.captain_role_ids or [],
+            squad_tags=event.squad_tags or [],
+            event=event,
+        )
+
+    return render(
+        request,
+        "events/squad_form.html",
+        {
+            "form": form,
+            "event": event,
+            "squad": squad,
+            "page_title": "Edit Squad",
+            "submit_label": "Save Changes",
+        },
+    )
+
+
+@login_required
+@team_member_required()
+def squad_availability_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Manage availability grids for a squad.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Rendered availability management page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized squad availability access attempt",
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    availability_grids = squad.availability_grids.all()
+    availability_templates = squad.availability_templates.all()
+    # Templates other squads of this event have shared. Sharing never crosses events
+    # (Vincent's call): a template is built for one event's sessions. Excludes this
+    # squad's own, which are already listed above -- a squad's shared template should
+    # not appear twice to its owner.
+    shared_templates = (
+        AvailabilityGridTemplate.objects.filter(shared=True, squad__event=event)
+        .exclude(squad=squad)
+        .select_related("squad")
+        .order_by("squad__name", "name")
+    )
+
+    return render(
+        request,
+        "events/squad_availability.html",
+        {
+            "event": event,
+            "squad": squad,
+            "availability_grids": availability_grids,
+            "availability_templates": availability_templates,
+            "shared_templates": shared_templates,
+            # A race series has one sheet of stage times per squad instead of grids.
+            "series_sheet": next((grid for grid in availability_grids if grid.is_series), None),
+            # Only the shared-template dialog offers a timezone; a squad's own template
+            # already carries its own clock.
+            "timezone_choices": TIMEZONE_CHOICES,
+            "today": timezone.now().date().isoformat(),
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def squad_delete_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Delete a squad.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Redirect to event detail.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_event_squads(request.user, event):
+        logfire.warning(
+            "Unauthorized squad delete attempt",
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage squads.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    squad_name = squad.name
+    squad.delete()
+    logfire.info(
+        "Squad deleted",
+        squad_id=squad_pk,
+        squad_name=squad_name,
+        event_id=event_pk,
+        user_id=request.user.id,
+    )
+    messages.success(request, f'Squad "{squad_name}" deleted successfully!')
+    return redirect("events:event_detail", pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def squad_assign_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Assign or unassign a signed-up user to a squad.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    signup_id = request.POST.get("signup_id")
+    squad_id = request.POST.get("squad_id")
+
+    if not signup_id or squad_id is None:
+        messages.error(request, "Missing signup or squad selection.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    signup = get_object_or_404(EventSignup, pk=signup_id, event=event)
+    squad_id = int(squad_id)
+    is_htmx = bool(request.headers.get("HX-Request"))
+    remove_squad_id = request.POST.get("remove_squad_id")
+
+    # Permission is scoped to the squad actually being changed, so a squad captain can build
+    # their own roster (add a rider, or remove one of their members) without being able to
+    # touch squads they don't lead. Clearing a rider out of *every* squad stays event-wide.
+    if squad_id:
+        target_squad = get_object_or_404(Squad, pk=squad_id, event=event)
+        allowed = _can_manage_squad_availability(request.user, target_squad)
+    elif remove_squad_id:
+        target_squad = get_object_or_404(Squad, pk=int(remove_squad_id), event=event)
+        allowed = _can_manage_squad_availability(request.user, target_squad)
+    else:
+        target_squad = None
+        allowed = _can_manage_event_squads(request.user, event)
+
+    if not allowed:
+        logfire.warning(
+            "Unauthorized squad assign attempt",
+            event_id=event_pk,
+            user_id=request.user.id,
+            target_squad_id=target_squad.pk if target_squad else None,
+        )
+        messages.error(request, "You don't have permission to assign squads.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if squad_id == 0:
+        # Unassign from a specific squad or all squads
+        if remove_squad_id:
+            remove_squad = target_squad
+            deleted, _ = SquadMember.objects.filter(squad=remove_squad, user=signup.user).delete()
+            if deleted:
+                logfire.info(
+                    "Squad assignment removed",
+                    event_id=event_pk,
+                    squad_id=remove_squad.pk,
+                    squad_name=remove_squad.name,
+                    user_id=signup.user_id,
+                    admin_user_id=request.user.id,
+                )
+                _unassign_discord_role(signup.user, remove_squad.team_discord_role, admin_user_id=request.user.id)
+                _unassign_region_role_if_unused(signup.user, remove_squad, admin_user_id=request.user.id)
+                # If user was captain/VC, drop them from those roles and remove the captain Discord role
+                was_leader = (
+                    remove_squad.captains.filter(pk=signup.user_id).exists()
+                    or remove_squad.vice_captains.filter(pk=signup.user_id).exists()
+                )
+                if was_leader:
+                    remove_squad.captains.remove(signup.user_id)
+                    remove_squad.vice_captains.remove(signup.user_id)
+                    _unassign_discord_role(
+                        signup.user, remove_squad.discord_captain_role, admin_user_id=request.user.id
+                    )
+                if not is_htmx:
+                    messages.success(request, f"{signup.user} removed from {remove_squad.name}.")
+            elif not is_htmx:
+                messages.info(request, f"{signup.user} was not in {remove_squad.name}.")
+        else:
+            # Collect squads before deleting so we can remove roles
+            user_squad_members = list(
+                SquadMember.objects.filter(squad__event=event, user=signup.user).select_related("squad")
+            )
+            deleted, _ = SquadMember.objects.filter(squad__event=event, user=signup.user).delete()
+            if deleted:
+                logfire.info(
+                    "All squad assignments removed",
+                    event_id=event_pk,
+                    user_id=signup.user_id,
+                    admin_user_id=request.user.id,
+                )
+                for sm in user_squad_members:
+                    sq = sm.squad
+                    _unassign_discord_role(signup.user, sq.team_discord_role, admin_user_id=request.user.id)
+                    _unassign_region_role_if_unused(signup.user, sq, admin_user_id=request.user.id)
+                    was_leader = (
+                        sq.captains.filter(pk=signup.user_id).exists()
+                        or sq.vice_captains.filter(pk=signup.user_id).exists()
+                    )
+                    if was_leader:
+                        sq.captains.remove(signup.user_id)
+                        sq.vice_captains.remove(signup.user_id)
+                        _unassign_discord_role(signup.user, sq.discord_captain_role, admin_user_id=request.user.id)
+                if not is_htmx:
+                    messages.success(request, f"{signup.user} removed from all squads.")
+            elif not is_htmx:
+                messages.info(request, f"{signup.user} was not assigned to any squad.")
+    else:
+        squad = target_squad
+        # A withdrawn rider is not racing, and one who has left the team's Discord server can
+        # neither see the squad's channel nor be given its roles: neither may be put in a squad.
+        # A withdrawn rider is brought back from the status dialog first.
+        if signup.status == EventSignup.Status.WITHDRAWN:
+            refusal = "they have withdrawn from the event"
+        elif signup_status.departed_user_ids([signup.user]):
+            refusal = "they have left the team's Discord server"
+        else:
+            refusal = ""
+        if refusal:
+            logfire.info(
+                "Squad assignment refused by signup status",
+                event_id=event_pk,
+                squad_id=squad.pk,
+                user_id=signup.user_id,
+                admin_user_id=request.user.id,
+                withdrawn=signup.status == EventSignup.Status.WITHDRAWN,
+            )
+            block_msg = f"Cannot add {signup.user} to {squad.name}: {refusal}."
+            if is_htmx:
+                resp = HttpResponse(status=204)
+                resp["HX-Trigger"] = json.dumps({"showToast": [{"message": block_msg, "tags": "error"}]})
+                return resp
+            messages.error(request, block_msg)
+            return redirect("events:event_detail", pk=event_pk)
+        rider_zr = ""
+        rider_zwift_cat = ""
+        rider_womens_cat = ""
+        if signup.user.zwid:
+            zr = ZRRider.objects.filter(zwid=signup.user.zwid).first()
+            rider_zr = getattr(zr, "race_current_category", "") or "" if zr else ""
+            zp = ZPTeamRiders.objects.filter(zwid=signup.user.zwid).first()
+            if zp:
+                rider_zwift_cat = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp.div else ""
+                rider_womens_cat = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp.divw else ""
+        for ok, reason in (
+            squad.check_gender_eligibility(signup.user.gender),
+            squad.check_zwift_eligibility(rider_zwift_cat),
+            squad.check_womens_zwift_eligibility(rider_womens_cat),
+            squad.check_zr_eligibility(rider_zr),
+            squad.check_zauth_eligibility(signup.user.is_zauth_verified),
+            squad.check_zftp_eligibility(signup.user.z_ftp, signup.user.z_ftp_wkg),
+            squad.check_zmap_eligibility(signup.user.z_map, signup.user.z_map_wkg),
+        ):
+            if ok:
+                continue
+            logfire.info(
+                "Squad assignment blocked by squad requirements",
+                event_id=event_pk,
+                squad_id=squad.pk,
+                squad_name=squad.name,
+                user_id=signup.user_id,
+                admin_user_id=request.user.id,
+                rider_zr_category=rider_zr,
+                rider_gender=signup.user.gender,
+                reason=reason,
+            )
+            block_msg = f"Cannot add {signup.user} to {squad.name}: {reason}."
+            if is_htmx:
+                resp = HttpResponse(status=204)
+                resp["HX-Trigger"] = json.dumps({"showToast": [{"message": block_msg, "tags": "error"}]})
+                return resp
+            messages.error(request, block_msg)
+            return redirect("events:event_detail", pk=event_pk)
+        SquadMember.objects.update_or_create(
+            squad=squad,
+            user=signup.user,
+            defaults={"status": SquadMember.Status.MEMBER},
+        )
+        signup_status.clear_waiting(event, signup.user)
+        _assign_discord_role(signup.user, squad.team_discord_role, squad.name, admin_user_id=request.user.id)
+        _assign_region_role(signup.user, squad, admin_user_id=request.user.id)
+        logfire.info(
+            "Squad assignment created",
+            event_id=event_pk,
+            squad_id=squad.pk,
+            squad_name=squad.name,
+            user_id=signup.user_id,
+            admin_user_id=request.user.id,
+        )
+        if not is_htmx:
+            messages.success(request, f"{signup.user} assigned to {squad.name}.")
+
+    # HTMX: return just the updated squad cell instead of full page reload
+    if request.headers.get("HX-Request"):
+        hx_url = request.headers.get("HX-Current-URL", "")
+        # Manage-squads page: re-render just the affected squad's self-contained roster panel
+        if "squads/manage" in hx_url:
+            affected_pk = squad_id if squad_id != 0 else int(request.POST.get("remove_squad_id") or 0)
+            if affected_pk:
+                return _render_manage_squad_panel(request, event, affected_pk)
+
+        assigned_squads = list(
+            Squad.objects.filter(
+                pk__in=SquadMember.objects.filter(squad__event=event, user=signup.user).values_list(
+                    "squad_id", flat=True
+                ),
+            )
+        )
+        all_squads = list(event.squads.all())
+        cell_html = render_to_string(
+            "events/_squad_cell.html",
+            {
+                "assigned_squads": assigned_squads,
+                "squads": all_squads,
+                "event_pk": event_pk,
+                "signup_id": signup.pk,
+                "can_add": signup.status == EventSignup.Status.REGISTERED
+                and not signup_status.departed_user_ids([signup.user]),
+            },
+            request=request,
+        )
+
+        # If request came from the assign-riders page, include OOB squad panel updates
+        if "assign-riders" in hx_url:
+            squad_members_data = _enrich_squad_members(event)
+            # Map user_id -> signup pk for remove buttons in squad panels
+            signup_by_user = dict(EventSignup.objects.filter(event=event).values_list("user_id", "pk"))
+            for members in squad_members_data.values():
+                for member in members:
+                    member["signup_id"] = signup_by_user.get(member["user"].pk)
+
+            # Resolve role names for squad panels
+            event_role_name = _annotate_squad_role_names(all_squads, event=event)
+
+            is_event_admin = request.user.is_event_admin or request.user.is_superuser
+            oob_html = ""
+            for sq in all_squads:
+                oob_html += render_to_string(
+                    "events/_squad_panel.html",
+                    {
+                        "squad": sq,
+                        "members": squad_members_data.get(sq.pk, []),
+                        "event_role_name": event_role_name,
+                        "event_pk": event_pk,
+                        "oob": True,
+                        "is_event_admin": is_event_admin,
+                    },
+                    request=request,
+                )
+            # OOB update for role badges of the affected user
+            signup.user.refresh_from_db(fields=["discord_roles"])
+            role_badges = _build_role_badges(signup.user, event)
+            oob_html += render_to_string(
+                "events/_role_badges.html",
+                {"signup_id": signup.pk, "role_badges": role_badges, "oob": True},
+                request=request,
+            )
+
+            return HttpResponse(cell_html + oob_html)
+
+        return HttpResponse(cell_html)
+
+    # The add-riders page posts where it wants to come back to. Validated against this
+    # host before use -- an unchecked `next` is an open redirect, and this form is
+    # reachable by any squad captain.
+    next_url = request.POST.get("next", "")
+    if next_url and url_has_allowed_host_and_scheme(
+        next_url, allowed_hosts={request.get_host()}, require_https=request.is_secure()
+    ):
+        return redirect(next_url)
+    return redirect("events:event_detail", pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def squad_set_captain_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Set or unset a squad's captain or vice-captain.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Updated squad panel HTML (HTMX) or redirect.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_event_squads(request.user, event):
+        logfire.warning("Unauthorized squad captain set attempt", event_id=event_pk, user_id=request.user.id)
+        messages.error(request, "You don't have permission to set squad captains.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    user_id = request.POST.get("user_id")
+    role = request.POST.get("role")  # "captain", "vice_captain", or "none"
+
+    if not user_id or role not in ("captain", "vice_captain", "none"):
+        messages.error(request, "Invalid request.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    target_user = get_object_or_404(User, pk=int(user_id))
+
+    if role == "captain":
+        # A user holds at most one leadership role per squad; promote to captain.
+        squad.vice_captains.remove(target_user)
+        squad.captains.add(target_user)
+        logfire.info(
+            "Squad captain added",
+            event_id=event_pk,
+            squad_id=squad_pk,
+            captain_id=target_user.id,
+            admin_user_id=request.user.id,
+        )
+        _assign_discord_role(
+            target_user, squad.discord_captain_role, f"{squad.name} Captain", admin_user_id=request.user.id
+        )
+    elif role == "vice_captain":
+        squad.captains.remove(target_user)
+        squad.vice_captains.add(target_user)
+        logfire.info(
+            "Squad vice captain added",
+            event_id=event_pk,
+            squad_id=squad_pk,
+            vice_captain_id=target_user.id,
+            admin_user_id=request.user.id,
+        )
+        _assign_discord_role(
+            target_user, squad.discord_captain_role, f"{squad.name} Captain", admin_user_id=request.user.id
+        )
+    elif role == "none":
+        was_leader = (
+            squad.captains.filter(pk=target_user.pk).exists()
+            or squad.vice_captains.filter(pk=target_user.pk).exists()
+        )
+        if was_leader:
+            squad.captains.remove(target_user)
+            squad.vice_captains.remove(target_user)
+            logfire.info(
+                "Squad captain role removed",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                user_id=target_user.id,
+                admin_user_id=request.user.id,
+            )
+            _unassign_discord_role(target_user, squad.discord_captain_role, admin_user_id=request.user.id)
+
+    if request.headers.get("HX-Request"):
+        # Manage-squads page: re-render just this squad's self-contained roster panel
+        if "squads/manage" in request.headers.get("HX-Current-URL", ""):
+            return _render_manage_squad_panel(request, event, squad_pk)
+
+        squad_members_data = _enrich_squad_members(event)
+        signup_by_user = dict(EventSignup.objects.filter(event=event).values_list("user_id", "pk"))
+        for members in squad_members_data.values():
+            for member in members:
+                member["signup_id"] = signup_by_user.get(member["user"].pk)
+
+        # Refresh squad from DB to get updated captain/vice_captain. select_related("event")
+        # because the card reads squad.tag_list, which needs the event's own tag list.
+        squad.refresh_from_db()
+        squad = (
+            Squad.objects.select_related("event").prefetch_related("captains", "vice_captains").get(pk=squad_pk)
+        )
+        event_role_name = _annotate_squad_role_names([squad], event=event)
+
+        panel_html = render_to_string(
+            "events/_squad_panel.html",
+            {
+                "squad": squad,
+                "members": squad_members_data.get(squad.pk, []),
+                "event_role_name": event_role_name,
+                "event_pk": event_pk,
+                "oob": False,
+                "is_event_admin": True,
+            },
+            request=request,
+        )
+
+        # OOB update for role badges of the affected user
+        target_user.refresh_from_db(fields=["discord_roles"])
+        role_badges = _build_role_badges(target_user, event)
+        signup_pk = signup_by_user.get(target_user.pk)
+        if signup_pk:
+            panel_html += render_to_string(
+                "events/_role_badges.html",
+                {"signup_id": signup_pk, "role_badges": role_badges, "oob": True},
+                request=request,
+            )
+
+        return HttpResponse(panel_html)
+
+    return redirect("events:event_detail", pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_GET
+def squad_channel_access_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Show who can actually see a squad's Discord channel, read live from Discord.
+
+    The Discord Roles page compares the app's cached role data against squad membership.
+    This goes to the source instead: it reads the channel's permission overwrites and the
+    guild's roles from Discord, computes VIEW_CHANNEL for every current guild member, and
+    diffs the result against the squad roster. Channel access is what actually leaks, and
+    it is not the same question as "who holds the squad role" -- any other role or a
+    member-specific overwrite can grant it.
+
+    Read-only. Nothing here changes Discord or the app.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        The rendered channel-access panel, for HTMX to swap in.
+
+    Raises:
+        PermissionDenied: If the user cannot manage this event's squads.
+
+    """
+    from django.core.exceptions import PermissionDenied
+
+    from apps.accounts.discord_service import get_channel, get_guild_roles
+    from apps.accounts.models import GuildMember
+    from apps.events.channel_access import can_view, describe_overwrites
+
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    if not _can_manage_event_squads(request.user, event):
+        raise PermissionDenied("You cannot manage this event's squads.")
+
+    context: dict = {"event": event, "squad": squad}
+    if not squad.discord_channel_id:
+        context["error"] = "This squad has no Discord channel configured."
+        return render(request, "events/_squad_channel_access.html", context)
+
+    channel = get_channel(squad.discord_channel_id)
+    roles = get_guild_roles()
+    if channel is None or roles is None:
+        context["error"] = "Could not read the channel from Discord. Check the bot's access and try again."
+        return render(request, "events/_squad_channel_access.html", context)
+
+    guild_id = str(config.GUILD_ID)
+    roles_by_id = {r["id"]: r for r in roles}
+    role_names = {r["id"]: r["name"] for r in roles}
+    overwrites = channel.get("permission_overwrites") or []
+
+    # Members still in the guild. GuildMember.roles is the app's synced copy, so this half
+    # is only as fresh as the last guild-member sync -- the channel config above is live.
+    members = GuildMember.objects.filter(date_left__isnull=True).exclude(is_bot=True).select_related("user")
+    viewers = [
+        member
+        for member in members
+        if can_view(
+            member_role_ids={str(r) for r in (member.roles or [])},
+            member_id=str(member.discord_id),
+            guild_id=guild_id,
+            roles_by_id=roles_by_id,
+            overwrites=overwrites,
+        )
+    ]
+
+    roster_discord_ids = {
+        str(did)
+        for did in SquadMember.objects.filter(squad=squad, status=SquadMember.Status.MEMBER)
+        .exclude(user__discord_id="")
+        .values_list("user__discord_id", flat=True)
+        if did
+    }
+    viewer_ids = {str(m.discord_id) for m in viewers}
+
+    def _label(member) -> str:
+        """Best available display name for a guild member.
+
+        Returns:
+            The name to show in the list.
+
+        """
+        return member.nickname or member.display_name or member.username or str(member.discord_id)
+
+    context.update({
+        "channel_name": channel.get("name", ""),
+        "viewer_count": len(viewers),
+        "member_count": len(roster_discord_ids),
+        "overwrites": describe_overwrites(overwrites, role_names),
+        # The point of the page: people who can read the channel without being on the squad.
+        "outsiders": sorted(
+            ({"name": _label(m), "member": m} for m in viewers if str(m.discord_id) not in roster_discord_ids),
+            key=lambda row: row["name"].lower(),
+        ),
+        # The mirror: on the squad but shut out of its own channel.
+        "shut_out": sorted(
+            (
+                {"name": _label(m), "member": m}
+                for m in members
+                if str(m.discord_id) in roster_discord_ids and str(m.discord_id) not in viewer_ids
+            ),
+            key=lambda row: row["name"].lower(),
+        ),
+    })
+
+    logfire.info(
+        "Squad channel access audited",
+        event_id=event_pk,
+        squad_id=squad_pk,
+        user_id=request.user.id,
+        viewer_count=len(viewers),
+        outsider_count=len(context["outsiders"]),
+        shut_out_count=len(context["shut_out"]),
+    )
+    return render(request, "events/_squad_channel_access.html", context)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def squad_toggle_role_view(request: HttpRequest, event_pk: int, squad_pk: int, user_id: int) -> HttpResponse:
+    """Toggle a squad's Discord role for a member.
+
+    Adds the role if the member doesn't have it, removes it if they do.
+    Accessible to users with assign_roles permission or the event's head captain role.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        user_id: The target user primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    Raises:
+        PermissionDenied: If user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_manage_event_roles(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied("You need Assign Roles permission or the Head Captain role for this event.")
+
+    squad = get_object_or_404(Squad, pk=squad_pk, event_id=event_pk)
+    role_id = squad.team_discord_role
+    if not role_id:
+        messages.error(request, "This squad has no Discord role configured.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    target_user = get_object_or_404(User, pk=user_id)
+    if not target_user.discord_id:
+        messages.error(request, f"{target_user} has no linked Discord account.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    role_id_str = str(role_id)
+    if target_user.has_discord_role(role_id):
+        success = remove_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles.pop(role_id_str, None)
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Discord role removed from squad member",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Removed Discord role from {target_user}.")
+        else:
+            logfire.error(
+                "Failed to remove Discord role",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to remove Discord role. Check bot token configuration.")
+    else:
+        success = add_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles[role_id_str] = squad.name
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Discord role added to squad member",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Added Discord role to {target_user}.")
+        else:
+            logfire.error(
+                "Failed to add Discord role",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to add Discord role. Check bot token configuration.")
+
+    if request.headers.get("HX-Request"):
+        has_role = target_user.has_discord_role(role_id)
+        response = render(
+            request,
+            "events/_squad_role_cell.html",
+            {
+                "event_pk": event_pk,
+                "squad_pk": squad_pk,
+                "member_user_pk": user_id,
+                "has_role": has_role,
+                # Without this the swapped-in cell forgets the rider is not in the
+                # squad, so removing an unexpected role would redraw as a red "click
+                # to add" instead of the dash it should be.
+                "not_member": not SquadMember.objects.filter(
+                    squad_id=squad_pk, user_id=user_id, status=SquadMember.Status.MEMBER
+                ).exists(),
+            },
+        )
+        stored = messages.get_messages(request)
+        msg_list = [{"message": str(m), "tags": m.tags} for m in stored]
+        if msg_list:
+            response["HX-Trigger"] = json.dumps({"showToast": msg_list})
+        return response
+
+    return redirect("events:event_detail", pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def squad_toggle_captain_role_view(request: HttpRequest, event_pk: int, squad_pk: int, user_id: int) -> HttpResponse:
+    """Toggle a squad's captain Discord role for a member.
+
+    Adds the role if the member doesn't have it, removes it if they do.
+    Accessible to users with assign_roles permission or the event's head captain role.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        user_id: The target user primary key.
+
+    Returns:
+        Redirect to manage roles page or HTMX partial.
+
+    Raises:
+        PermissionDenied: If user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_manage_event_roles(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied("You need Assign Roles permission or the Head Captain role for this event.")
+
+    squad = get_object_or_404(Squad, pk=squad_pk, event_id=event_pk)
+    role_id = squad.discord_captain_role
+    if not role_id:
+        messages.error(request, "This squad has no captain Discord role configured.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    target_user = get_object_or_404(User, pk=user_id)
+    if not target_user.discord_id:
+        messages.error(request, f"{target_user} has no linked Discord account.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    role_id_str = str(role_id)
+    if target_user.has_discord_role(role_id):
+        success = remove_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles.pop(role_id_str, None)
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Captain Discord role removed from squad member",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Removed captain role from {target_user}.")
+        else:
+            logfire.error(
+                "Failed to remove captain Discord role",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to remove captain role. Check bot token configuration.")
+    else:
+        success = add_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles[role_id_str] = f"{squad.name} Captain"
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Captain Discord role added to squad member",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Added captain role to {target_user}.")
+        else:
+            logfire.error(
+                "Failed to add captain Discord role",
+                event_id=event_pk,
+                squad_id=squad_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to add captain role. Check bot token configuration.")
+
+    if request.headers.get("HX-Request"):
+        has_role = target_user.has_discord_role(role_id)
+        response = render(
+            request,
+            "events/_squad_captain_role_cell.html",
+            {
+                "event_pk": event_pk,
+                "squad_pk": squad_pk,
+                "member_user_pk": user_id,
+                "has_role": has_role,
+                # Without this the swapped-in cell forgets the rider is not in the
+                # squad, so removing an unexpected role would redraw as a red "click
+                # to add" instead of the dash it should be.
+                "not_member": not SquadMember.objects.filter(
+                    squad_id=squad_pk, user_id=user_id, status=SquadMember.Status.MEMBER
+                ).exists(),
+            },
+        )
+        stored = messages.get_messages(request)
+        msg_list = [{"message": str(m), "tags": m.tags} for m in stored]
+        if msg_list:
+            response["HX-Trigger"] = json.dumps({"showToast": msg_list})
+        return response
+
+    return redirect("events:discord_roles", event_pk=event_pk)
+
+
+@require_http_methods(["GET", "POST"])
+@login_required
+@team_member_required()
+def availability_create_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Display the availability grid builder or save a new grid.
+
+    GET: renders the builder UI.
+    POST: accepts JSON body, validates, creates an AvailabilityGrid, returns JSON.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Rendered availability builder page (GET) or JsonResponse (POST).
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability builder access",
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        if request.method == "POST":
+            return JsonResponse({"error": "Permission denied."}, status=403)
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if event.is_race_series:
+        # A race series asks per stage: the squad has one sheet of stage times, not grids.
+        if request.method == "POST":
+            return JsonResponse({"error": "This event collects availability per stage, not on grids."}, status=400)
+        return redirect("events:series_sheet", event_pk=event_pk, squad_pk=squad_pk)
+
+    if request.method == "POST":
+        return _handle_availability_save(request, event, squad)
+
+    user_tz = getattr(request.user, "timezone", "") or "UTC"
+    logfire.debug("Availability builder viewed", user_id=request.user.id, event_id=event_pk, squad_id=squad_pk)
+    return render(
+        request,
+        "events/availability_builder.html",
+        {
+            "event": event,
+            "squad": squad,
+            "timezone_choices_json": TIMEZONE_CHOICES,
+            "user_timezone": user_tz,
+            "event_requires_race_verified": bool(event.require_race_verified_availability),
+            "grid_event_defaults": grid_defaults.initial_values(event),
+            "grid_enforced": grid_defaults.enforced_map(event),
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def availability_edit_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Edit a draft availability grid in the builder.
+
+    GET pre-fills the builder from the stored grid (converted back to its own timezone).
+    POST re-validates and updates the grid in place. Draft and published sheets are both
+    editable; on a published sheet that already has responses the fields deciding which
+    cells exist are frozen, so stored answers cannot be orphaned. Closed sheets are not
+    editable at all.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Rendered builder (GET) or JsonResponse (POST), or a redirect when not allowed.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability edit access",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        if request.method == "POST":
+            return JsonResponse({"error": "Permission denied."}, status=403)
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if grid.is_series:
+        if request.method == "POST":
+            return JsonResponse({"error": "A series sheet is edited on its stage times page."}, status=400)
+        return redirect("events:series_sheet", event_pk=event_pk, squad_pk=squad_pk)
+
+    # A closed sheet is a finished record; draft and published stay editable, with the
+    # shape frozen on anything already answered (see _changed_shape_fields).
+    if grid.status == AvailabilityGrid.Status.CLOSED:
+        if request.method == "POST":
+            return JsonResponse({"error": "A closed sheet cannot be edited."}, status=400)
+        messages.error(request, "A closed sheet cannot be edited.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    if request.method == "POST":
+        return _handle_availability_save(request, event, squad, grid=grid)
+
+    # GET: pre-fill the builder from the stored (UTC) grid, converted back to its own timezone.
+    local_start_date, local_end_date, local_start_time, local_end_time = convert_utc_to_local_config(
+        grid.start_date, grid.end_date, grid.start_time, grid.end_time, grid.grid_timezone
+    )
+    grid_local = convert_grid_to_local(
+        grid.dates, grid.start_time, grid.end_time, grid.slot_duration, grid.blocked_cells, grid.grid_timezone
+    )
+    blocked_local = [
+        {"date": key.split("|")[0], "time": key.split("|")[1]} for key in grid_local["display_blocked"]
+    ]
+    initial_grid = {
+        "start_date": local_start_date.isoformat(),
+        "end_date": local_end_date.isoformat(),
+        "start_time": local_start_time,
+        "end_time": local_end_time,
+        "timezone": grid.grid_timezone,
+        "slot_duration": grid.slot_duration,
+        "blocked_cells": blocked_local,
+        "title": grid.title,
+        "expires": grid.expires.isoformat() if grid.expires else "",
+        "max_races_question": grid.max_races_question,
+        "rest_days_question": grid.rest_days_question,
+        "hide_empty_days": grid.hide_empty_days,
+        "require_race_verified_availability": grid.require_race_verified_availability,
+        "single_slot": grid.single_slot,
+        "expanded_features": grid.expanded_features,
+        "description": grid.description,
+        "website_url": grid.website_url,
+        "course_url": grid.course_url,
+        "recon_url": grid.recon_url,
+        "invite_url": grid.invite_url,
+    }
+    user_tz = getattr(request.user, "timezone", "") or "UTC"
+
+    # Once riders have answered, the shape is frozen and two of the still-editable
+    # settings have consequences worth naming before the captain ticks the box.
+    response_count = grid.active_responses().count()
+    unverified_responders = 0
+    if response_count and not grid.require_race_verified_availability:
+        unverified_responders = sum(
+            1 for r in grid.active_responses().select_related("user") if not r.user.is_race_ready
+        )
+
+    logfire.debug(
+        "Availability builder opened for edit",
+        grid_id=str(grid.id),
+        user_id=request.user.id,
+        event_id=event_pk,
+        squad_id=squad_pk,
+    )
+    return render(
+        request,
+        "events/availability_builder.html",
+        {
+            "event": event,
+            "squad": squad,
+            "timezone_choices_json": TIMEZONE_CHOICES,
+            "user_timezone": user_tz,
+            # |json_script, not json.dumps + |safe: initial_grid carries grid.description.
+            "initial_grid_json": initial_grid,
+            "page_heading": "Edit Availability Grid",
+            "event_requires_race_verified": bool(event.require_race_verified_availability),
+            "grid_event_defaults": grid_defaults.initial_values(event),
+            "grid_enforced": grid_defaults.enforced_map(event),
+            # Drives the frozen shape controls and the warnings below them. Counted here
+            # rather than in the template so the numbers are one query each.
+            "response_count": response_count,
+            "unverified_responders": unverified_responders,
+        },
+    )
+
+
+# Fields that decide which cells exist. A response stores UTC "date|time" strings with
+# no foreign key to a cell, so changing any of these silently orphans stored answers --
+# and the rider's next save is a wholesale replace, which turns "hidden" into "deleted".
+# Frozen once anyone has answered. Everything else about a grid stays editable.
+SHAPE_FIELDS = (
+    "start_date",
+    "end_date",
+    "start_time",
+    "end_time",
+    "slot_duration",
+    "grid_timezone",
+    "single_slot",
+    "blocked_cells",
+)
+
+SHAPE_FIELD_LABELS = {
+    "start_date": "start date",
+    "end_date": "end date",
+    "start_time": "start time",
+    "end_time": "end time",
+    "slot_duration": "slot length",
+    "grid_timezone": "timezone",
+    "single_slot": "single time slot",
+    "blocked_cells": "blocked cells",
+}
+
+
+def _changed_shape_fields(grid: AvailabilityGrid, field_values: dict) -> list[str]:
+    """Return the shape fields whose submitted value differs from the stored grid.
+
+    ``blocked_cells`` is compared as a set of "date|time" keys: it is a JSON list whose
+    order carries no meaning, so a reordered but identical list is not a change.
+
+    Args:
+        grid: The stored grid.
+        field_values: The values the save is about to apply.
+
+    Returns:
+        Names of the shape fields that would actually change, in declaration order.
+
+    """
+    changed = []
+    for name in SHAPE_FIELDS:
+        submitted = field_values[name]
+        stored = getattr(grid, name)
+        if name == "blocked_cells":
+            submitted = {f"{c.get('date')}|{c.get('time')}" for c in (submitted or [])}
+            stored = {f"{c.get('date')}|{c.get('time')}" for c in (stored or [])}
+        if submitted != stored:
+            changed.append(name)
+    return changed
+
+
+def _handle_availability_save(
+    request: HttpRequest, event: Event, squad: Squad, grid: AvailabilityGrid | None = None
+) -> JsonResponse:
+    """Validate and persist an AvailabilityGrid from a JSON POST body.
+
+    Args:
+        request: The HTTP request with JSON body.
+        event: The parent event.
+        squad: The squad to attach the grid to.
+        grid: An existing grid to update in place; when None a new draft grid is created.
+
+    Returns:
+        JsonResponse with grid id on success, or error details on failure.
+
+    """
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError, ValueError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    # --- Parse & validate fields ---
+    title = str(data.get("title", "")).strip()
+
+    # Resolved before the dates are parsed, not with the other settings further down:
+    # single_slot decides whether end_date/end_time are derived, so enforcing it
+    # afterwards would leave the grid shaped by the submitted value.
+    single_slot = grid_defaults.resolve(event, "single_slot", data.get("single_slot", False))
+
+    try:
+        start_date = date.fromisoformat(str(data.get("start_date", "")))
+        # A single-slot grid spans one day, so the client need not send an end date.
+        end_date = start_date if single_slot else date.fromisoformat(str(data.get("end_date", "")))
+    except ValueError, TypeError:
+        return JsonResponse({"error": "Invalid or missing start_date / end_date."}, status=400)
+
+    if start_date > end_date:
+        return JsonResponse({"error": "start_date must be on or before end_date."}, status=400)
+    if (end_date - start_date).days > 31:
+        return JsonResponse({"error": "Date range cannot exceed 31 days."}, status=400)
+
+    try:
+        slot_duration = int(data.get("slot_duration", 0))
+    except ValueError, TypeError:
+        return JsonResponse({"error": "slot_duration must be an integer."}, status=400)
+    if slot_duration not in (15, 30, 60):
+        return JsonResponse({"error": "slot_duration must be 15, 30, or 60."}, status=400)
+
+    start_time = str(data.get("start_time", ""))
+    if not _HHMM_RE.match(start_time):
+        return JsonResponse({"error": "start_time must be HH:MM format."}, status=400)
+
+    if single_slot:
+        # Derived here rather than trusted from the client, so exactly one slot is
+        # guaranteed: the generator emits slots while current < end, stepping by
+        # slot_duration. A late start wraps past midnight, which build_grid_data
+        # already handles (end <= start -> +1 day), so 23:30 + 60 is still one cell.
+        end_time = (
+            datetime.combine(date.min, time.fromisoformat(start_time)) + timedelta(minutes=slot_duration)
+        ).strftime("%H:%M")
+    else:
+        end_time = str(data.get("end_time", ""))
+        if not _HHMM_RE.match(end_time):
+            return JsonResponse({"error": "end_time must be HH:MM format."}, status=400)
+        if start_time >= end_time:
+            return JsonResponse({"error": "start_time must be before end_time."}, status=400)
+
+    blocked_cells = data.get("blocked_cells", [])
+    if not isinstance(blocked_cells, list):
+        return JsonResponse({"error": "blocked_cells must be a list."}, status=400)
+
+    # --- Timezone handling ---
+    grid_tz = str(data.get("timezone", "UTC")).strip() or "UTC"
+    if grid_tz != "UTC" and grid_tz not in available_timezones():
+        return JsonResponse({"error": f"Invalid timezone: {grid_tz}"}, status=400)
+
+    # --- Optional expires date ---
+    expires = None
+    raw_expires = data.get("expires")
+    if raw_expires:
+        try:
+            expires = date.fromisoformat(str(raw_expires))
+        except ValueError, TypeError:
+            return JsonResponse({"error": "Invalid expires date."}, status=400)
+
+    if grid_tz != "UTC":
+        start_date, end_date, start_time, end_time = convert_local_to_utc(
+            start_date,
+            end_date,
+            start_time,
+            end_time,
+            grid_tz,
+        )
+        blocked_cells = convert_blocked_cells_to_utc(blocked_cells, grid_tz, slot_duration)
+
+    field_values = {
+        "title": title,
+        "start_date": start_date,
+        "end_date": end_date,
+        "start_time": start_time,
+        "end_time": end_time,
+        "slot_duration": slot_duration,
+        "grid_timezone": grid_tz,
+        "blocked_cells": blocked_cells,
+        # Enforced settings are re-applied here: the builder disables the control, but
+        # it posts JSON, so a disabled checkbox constrains nothing on its own.
+        "max_races_question": grid_defaults.resolve(
+            event, "max_races_question", data.get("max_races_question", False)
+        ),
+        "rest_days_question": grid_defaults.resolve(
+            event, "rest_days_question", data.get("rest_days_question", False)
+        ),
+        "hide_empty_days": grid_defaults.resolve(
+            event, "hide_empty_days", data.get("hide_empty_days", False)
+        ),
+        # Event-level requirement is a floor: it forces the grid setting on and
+        # cannot be turned off here, regardless of what the client sends.
+        "require_race_verified_availability": (
+            bool(data.get("require_race_verified_availability", False)) or event.require_race_verified_availability
+        ),
+        "single_slot": single_slot,
+        "expanded_features": grid_defaults.resolve(
+            event, "expanded_features", data.get("expanded_features", False)
+        ),
+        "description": (data.get("description") or "").strip(),
+        "website_url": (data.get("website_url") or "").strip(),
+        "course_url": (data.get("course_url") or "").strip(),
+        "recon_url": (data.get("recon_url") or "").strip(),
+        "invite_url": (data.get("invite_url") or "").strip(),
+        "expires": expires,
+    }
+
+    if grid is None:
+        grid = AvailabilityGrid.objects.create(
+            squad=squad,
+            status=AvailabilityGrid.Status.DRAFT,
+            created_by=request.user,
+            **field_values,
+        )
+        logfire.info(
+            "Availability grid created",
+            grid_id=str(grid.id),
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+        )
+    else:
+        # Refuse shape changes once riders have answered. The builder disables these
+        # controls, but it posts JSON, so the check has to live here to mean anything.
+        # Current members only: answers from riders who have since left protect nobody in
+        # the squad, and counting them froze a sheet nobody here had answered.
+        if grid.active_responses().exists():
+            changed = _changed_shape_fields(grid, field_values)
+            if changed:
+                logfire.warning(
+                    "Blocked shape edit on a grid with responses",
+                    grid_id=str(grid.id),
+                    squad_id=squad.pk,
+                    event_id=event.pk,
+                    user_id=request.user.id,
+                    changed_fields=changed,
+                )
+                names = ", ".join(SHAPE_FIELD_LABELS[c] for c in changed)
+                return JsonResponse(
+                    {
+                        "error": (
+                            f"This sheet already has responses, so its {names} cannot be changed "
+                            "-- doing so would discard answers riders have already given. "
+                            "Everything else on the sheet is still editable."
+                        )
+                    },
+                    status=400,
+                )
+        for attr, value in field_values.items():
+            setattr(grid, attr, value)
+        grid.save()
+        logfire.info(
+            "Availability grid updated",
+            grid_id=str(grid.id),
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+        )
+    return JsonResponse({"id": str(grid.id), "status": "ok"})
+
+
+def _expand_utc_dates(start_date: date, end_date: date) -> list[str]:
+    """Return an inclusive list of ``YYYY-MM-DD`` strings between two dates.
+
+    Args:
+        start_date: First day in the range.
+        end_date: Last day in the range (inclusive).
+
+    Returns:
+        Sorted list of ISO date strings spanning the range.
+
+    """
+    out: list[str] = []
+    cur = start_date
+    while cur <= end_date:
+        out.append(cur.isoformat())
+        cur += timedelta(days=1)
+    return out
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_preview_view(request: HttpRequest, event_pk: int, squad_pk: int) -> JsonResponse:
+    """Return a draft grid converted to the requesting user's local timezone.
+
+    Used by the builder's Preview modal so the captain sees the same view a
+    rider would. Accepts the same JSON payload shape as the save view; runs
+    through the same UTC conversion + ``convert_grid_to_local`` pipeline but
+    targets ``request.user.timezone`` instead of the grid's authoring tz.
+
+    Args:
+        request: The HTTP request with the draft grid JSON.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        JSON with ``display_dates``, ``display_time_slots``, ``display_blocked``
+        (list of ``date|time`` keys), and ``display_timezone``.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return JsonResponse({"error": "Permission denied."}, status=403)
+
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    try:
+        start_date = date.fromisoformat(str(data.get("start_date", "")))
+        end_date = date.fromisoformat(str(data.get("end_date", "")))
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid start_date / end_date."}, status=400)
+    start_time = str(data.get("start_time", ""))
+    end_time = str(data.get("end_time", ""))
+    try:
+        slot_duration = int(data.get("slot_duration", 30))
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid slot_duration."}, status=400)
+    if slot_duration not in (15, 30, 60):
+        return JsonResponse({"error": "slot_duration must be 15, 30, or 60."}, status=400)
+
+    grid_tz = str(data.get("timezone", "UTC")).strip() or "UTC"
+    if grid_tz != "UTC" and grid_tz not in available_timezones():
+        return JsonResponse({"error": f"Invalid timezone: {grid_tz}"}, status=400)
+
+    blocked_cells = data.get("blocked_cells", [])
+    if not isinstance(blocked_cells, list):
+        return JsonResponse({"error": "blocked_cells must be a list."}, status=400)
+
+    # 1. Round-trip the grid's local-tz definition into UTC, matching the
+    #    save view's flow so the preview matches what a rider would see.
+    if grid_tz != "UTC":
+        utc_start_date, utc_end_date, utc_start_time, utc_end_time = convert_local_to_utc(
+            start_date, end_date, start_time, end_time, grid_tz,
+        )
+        utc_blocked = convert_blocked_cells_to_utc(blocked_cells, grid_tz, slot_duration)
+    else:
+        utc_start_date, utc_end_date, utc_start_time, utc_end_time = (
+            start_date, end_date, start_time, end_time,
+        )
+        utc_blocked = list(blocked_cells)
+
+    utc_dates = _expand_utc_dates(utc_start_date, utc_end_date)
+
+    # 2. Convert UTC → display timezone (preferring the user's profile tz).
+    user_tz = (getattr(request.user, "timezone", "") or "").strip()
+    display_tz = user_tz or grid_tz or "UTC"
+    if display_tz != "UTC" and display_tz not in available_timezones():
+        display_tz = "UTC"
+
+    grid_data = convert_grid_to_local(utc_dates, utc_start_time, utc_end_time, slot_duration, utc_blocked, display_tz)
+
+    if bool(data.get("hide_empty_days", False)):
+        grid_data = drop_fully_blocked_days(grid_data)
+
+    return JsonResponse({
+        "display_dates": list(grid_data["display_dates"]),
+        "display_time_slots": list(grid_data["display_time_slots"]),
+        "display_blocked": sorted(grid_data["display_blocked"]),
+        "display_timezone": display_tz,
+    })
+
+
+def _post_grid_published_notification(
+    request: HttpRequest,
+    event: Event,
+    squad: Squad,
+    grid: AvailabilityGrid,
+    *,
+    reminder: bool = False,
+) -> bool | str:
+    """Post a Discord channel message about an availability grid, pinging the squad role.
+
+    Returns ``True`` on success, or on failure a sentence or two for the person who pressed
+    the button: what went wrong and what would fix it (``_channel_post_problem``). Failures
+    are logged via Logfire with Discord's own error code. The grid's publish state is
+    independent of this call.
+
+    ``reminder`` changes only the wording. The mention, the channel and the link are
+    identical, because the point of a re-post is to reach exactly the people the first
+    one reached. What must NOT stay identical is the heading: a second message saying
+    "New Availability Requested" reads as a second sheet, and riders would go looking for
+    one that does not exist.
+
+    Date markdown uses ``<t:UNIX:D>`` so each Discord viewer sees the calendar
+    day rendered in their own client locale. To avoid date drift across
+    timezones, the unix timestamp is anchored at noon in the grid's authoring
+    timezone.
+
+    Args:
+        request: The HTTP request (used for ``build_absolute_uri``).
+        event: Parent event.
+        squad: Squad whose Discord channel/role we post to.
+        grid: The availability grid being announced.
+        reminder: Word it as a reminder about an already-published sheet.
+
+    Returns:
+        ``True`` on success, otherwise the explanation to show.
+
+    """
+    if not squad.discord_channel_id:
+        return "This squad has no Discord channel. Pick one on the Edit Squad page."
+
+    try:
+        grid_tz = ZoneInfo(grid.grid_timezone) if grid.grid_timezone else ZoneInfo("UTC")
+    except Exception:
+        grid_tz = ZoneInfo("UTC")
+
+    start_unix = int(datetime.combine(grid.start_date, time(12, 0), tzinfo=grid_tz).timestamp())
+    end_unix = int(datetime.combine(grid.end_date, time(12, 0), tzinfo=grid_tz).timestamp())
+
+    response_url = request.build_absolute_uri(
+        reverse(
+            "events:availability_respond",
+            kwargs={"event_pk": event.pk, "squad_pk": squad.pk, "grid_pk": grid.pk},
+        )
+    )
+
+    title = grid.title or "Availability Grid"
+    role_mention = f"<@&{squad.team_discord_role}>" if squad.team_discord_role else ""
+    lines = [
+        "**Availability Reminder**" if reminder else "**New Availability Requested**",
+        title,
+        f"<t:{start_unix}:D> – <t:{end_unix}:D>",  # noqa: RUF001
+        response_url,
+    ]
+    if reminder:
+        lines.append("Please open the sheet and check your availability is still correct.")
+    if role_mention:
+        lines.extend(["", role_mention])
+    body = "\n".join(lines)
+
+    allowed_role_ids = [str(squad.team_discord_role)] if squad.team_discord_role else None
+
+    with logfire.span(
+        "availability_publish_notify",
+        grid_id=str(grid.id),
+        squad_id=squad.pk,
+        channel_id=str(squad.discord_channel_id),
+        role_id=str(squad.team_discord_role) if squad.team_discord_role else None,
+        reminder=reminder,
+    ):
+        result = post_discord_channel_message(
+            squad.discord_channel_id,
+            body,
+            allowed_role_ids=allowed_role_ids,
+        )
+    if result.ok:
+        # Stamped only on success. A failed send reached nobody, so leaving the stamp
+        # alone lets the captain press the button again straight away instead of waiting
+        # out a cooldown for a message that was never delivered.
+        AvailabilityGrid.objects.filter(pk=grid.pk).update(last_notified_at=timezone.now())
+        logfire.info(
+            "Availability grid publish notification posted",
+            grid_id=str(grid.id),
+            squad_id=squad.pk,
+            channel_id=str(squad.discord_channel_id),
+            reminder=reminder,
+        )
+        return True
+    return _channel_post_problem(result)
+
+
+#: What would fix a squad channel the bot may not post in; said for every refusal.
+_CHANNEL_ACCESS_FIX = (
+    "Ask a Discord admin to give the bot View Channel and Send Messages in that channel, "
+    "or pick another channel on the Edit Squad page."
+)
+
+
+def _channel_post_problem(result: ChannelPostResult) -> str:
+    """Say why a post to a squad's Discord channel failed, and what would fix it.
+
+    Written for the captain who pressed the button. Discord's own error code is what tells
+    "the bot cannot see the channel" (50001) from "it can see it but may not post" (50013):
+    a 403 carries either. Anything not worth a captain's time points at Logfire.
+
+    Args:
+        result: The failed post.
+
+    Returns:
+        One or two sentences, ending with a full stop.
+
+    """
+    code, status = result.discord_code, result.status_code
+    if result.skipped == "no_token":
+        return "The Discord bot isn't set up on this site, so nothing can be posted. An app admin must add its token."
+    if code == DISCORD_MISSING_ACCESS:
+        return f"The bot can't see this squad's Discord channel. {_CHANNEL_ACCESS_FIX}"
+    if code == DISCORD_MISSING_PERMISSIONS:
+        return f"The bot can see this squad's Discord channel but isn't allowed to post in it. {_CHANNEL_ACCESS_FIX}"
+    if status == HTTPStatus.FORBIDDEN:
+        return f"Discord won't let the bot post in this squad's channel. {_CHANNEL_ACCESS_FIX}"
+    if code == DISCORD_UNKNOWN_CHANNEL or status == HTTPStatus.NOT_FOUND:
+        return "This squad's Discord channel no longer exists. Pick another one on the Edit Squad page."
+    if code == DISCORD_NON_TEXT_CHANNEL:
+        return (
+            "This squad's Discord channel doesn't take messages: it may be a forum, category or voice "
+            "channel. Pick a text channel on the Edit Squad page."
+        )
+    if status == HTTPStatus.TOO_MANY_REQUESTS:
+        return "Discord is limiting how fast the bot can post. Try again in a minute."
+    return "Discord didn't take the message. Try again shortly; if it keeps failing, the reason is in Logfire."
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_status_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Change the status of an availability grid (publish or close).
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Redirect to squad edit page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability status change",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    new_status = request.POST.get("status", "")
+    allowed_transitions = {
+        AvailabilityGrid.Status.DRAFT: AvailabilityGrid.Status.PUBLISHED,
+        AvailabilityGrid.Status.PUBLISHED: AvailabilityGrid.Status.CLOSED,
+    }
+
+    expected = allowed_transitions.get(grid.status)
+    if expected is None or new_status != expected:
+        messages.error(request, f'Cannot change status from "{grid.get_status_display()}" to "{new_status}".')
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    grid.status = new_status
+    grid.save(update_fields=["status", "updated_at"])
+
+    logfire.info(
+        "Availability grid status changed",
+        grid_id=str(grid.id),
+        new_status=new_status,
+        squad_id=squad_pk,
+        event_id=event_pk,
+        user_id=request.user.id,
+    )
+
+    notify = request.POST.get("notify") == "1"
+    if notify and new_status == AvailabilityGrid.Status.PUBLISHED:
+        notification_result = _post_grid_published_notification(request, event, squad, grid)
+        if notification_result is True:
+            messages.success(
+                request,
+                f'Grid "{grid.title}" is now published. Squad notified in Discord.',
+            )
+        else:
+            messages.warning(
+                request,
+                f'Grid "{grid.title}" is now published, but the squad wasn\'t notified in Discord. '
+                f"{notification_result}",
+            )
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    messages.success(request, f'Grid "{grid.title}" is now {grid.get_status_display().lower()}.')
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_repost_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Re-post a published availability sheet to the squad's Discord channel.
+
+    Same channel, same role mention and same link as the original publish notification --
+    the point is to reach the people that one reached -- worded as a reminder so it does
+    not read as a second sheet. Nothing about the grid changes; this only sends a message.
+
+    Published only. A draft has not been announced yet (that is what Publish & Notify is
+    for), and a closed sheet no longer accepts responses, so pinging a squad to go and
+    check it would send them to a page they cannot act on.
+
+    Args:
+        request: The HTTP request. ``return_to`` picks the redirect target.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Redirect to the response page or the squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    # Only ever one of two in-app pages, chosen by name rather than by URL, so this cannot
+    # become an open redirect however the form is tampered with.
+    back = (
+        redirect("events:availability_respond", event_pk=event_pk, squad_pk=squad_pk, grid_pk=grid_pk)
+        if request.POST.get("return_to") == "respond"
+        else redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+    )
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability re-post attempt",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if not grid.is_published:
+        messages.error(request, "Only a published sheet can be re-posted.")
+        return back
+
+    # Whether the squad has ever actually been told about this sheet -- read BEFORE the claim
+    # below overwrites it. "Publish only" leaves this null, so the first Discord message about
+    # such a sheet must announce it rather than ask riders to re-check something they have
+    # never seen.
+    already_announced = grid.last_notified_at is not None
+
+    # Claim the cooldown with a conditional UPDATE rather than reading the stamp and then
+    # sending. The Discord round trip is hundreds of milliseconds, and a check-then-send
+    # leaves that whole window open: two clicks, or two captains, both read an expired stamp
+    # and both ping the squad. Letting the database decide makes the rowcount the lock.
+    now = timezone.now()
+    claimed = (
+        AvailabilityGrid.objects.filter(pk=grid.pk)
+        .filter(Q(last_notified_at__isnull=True) | Q(last_notified_at__lte=now - AVAILABILITY_REPOST_COOLDOWN))
+        .update(last_notified_at=now)
+    )
+    if not claimed:
+        stamp = AvailabilityGrid.objects.filter(pk=grid.pk).values_list("last_notified_at", flat=True).first()
+        wait = AVAILABILITY_REPOST_COOLDOWN - (timezone.now() - stamp) if stamp else timedelta(0)
+        # Ceiling, not rounding: telling someone to wait 2 minutes when it is 2m40s sends them
+        # back to a button that refuses them again.
+        minutes = max(1, math.ceil(wait.total_seconds() / 60))
+        messages.warning(
+            request,
+            f"The squad was notified about this sheet recently. You can re-post again in {minutes} minute"
+            f"{'' if minutes == 1 else 's'}.",
+        )
+        return back
+
+    result = _post_grid_published_notification(request, event, squad, grid, reminder=already_announced)
+    if result is True:
+        logfire.info(
+            "Availability grid re-posted",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.success(request, f'Reminder posted to Discord for "{grid.title or "Availability Grid"}".')
+    else:
+        # Hand the claim back. The message reached nobody, so holding the captain to a
+        # cooldown for it would punish them for our failure.
+        AvailabilityGrid.objects.filter(pk=grid.pk).update(last_notified_at=grid.last_notified_at)
+        messages.warning(request, f"Nothing was posted to Discord. {result}")
+    return back
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_delete_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Delete an availability grid along with all its responses and slot selections.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Redirect to squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability delete attempt",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    grid_title = grid.title or "Availability Grid"
+    response_count = grid.active_responses().count()
+    selection_count = grid.slot_selections.count()
+    grid.delete()
+
+    logfire.info(
+        "Availability grid deleted",
+        grid_id=str(grid_pk),
+        grid_title=grid_title,
+        response_count=response_count,
+        selection_count=selection_count,
+        squad_id=squad_pk,
+        event_id=event_pk,
+        user_id=request.user.id,
+    )
+    messages.success(request, f'Availability grid "{grid_title}" deleted.')
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_copy_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Clone an availability grid with new start/end dates.
+
+    All other fields (times, slot duration, timezone, questions, blocked cells)
+    are copied verbatim. Blocked cells are shifted by the delta between the
+    source grid's start date and the new start date; cells whose shifted date
+    falls outside the new range are dropped. The new grid is always created as
+    a draft with ``expires=None`` and an auto-generated title.
+
+    Args:
+        request: The HTTP request with ``start_date`` and ``end_date`` POST fields.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The source availability grid UUID.
+
+    Returns:
+        Redirect to squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    source = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability copy attempt",
+            grid_id=str(source.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if source.is_series:
+        # A squad has one sheet of stage times; a second copy would put two races on each stage.
+        messages.error(request, "A series sheet can't be copied. Edit its stage times instead.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    try:
+        new_start_date = date.fromisoformat(request.POST.get("start_date", ""))
+        new_end_date = date.fromisoformat(request.POST.get("end_date", ""))
+    except (ValueError, TypeError):
+        messages.error(request, "Invalid or missing start/end date.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    if new_start_date > new_end_date:
+        messages.error(request, "Start date must be on or before end date.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+    if (new_end_date - new_start_date).days > 31:
+        messages.error(request, "Date range cannot exceed 31 days.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    delta_days = (new_start_date - source.start_date).days
+    shifted_blocked: list[dict] = []
+    for cell in source.blocked_cells or []:
+        raw_date = cell.get("date") if isinstance(cell, dict) else None
+        if not raw_date:
+            continue
+        try:
+            shifted_date = date.fromisoformat(str(raw_date)) + timedelta(days=delta_days)
+        except (ValueError, TypeError):
+            continue
+        if new_start_date <= shifted_date <= new_end_date:
+            shifted_blocked.append({"date": shifted_date.isoformat(), "time": cell.get("time", "")})
+
+    new_grid = AvailabilityGrid.objects.create(
+        squad=squad,
+        title="",
+        start_date=new_start_date,
+        end_date=new_end_date,
+        start_time=source.start_time,
+        end_time=source.end_time,
+        slot_duration=source.slot_duration,
+        grid_timezone=source.grid_timezone,
+        blocked_cells=shifted_blocked,
+        max_races_question=source.max_races_question,
+        rest_days_question=source.rest_days_question,
+        # hide_empty_days was already being dropped here before the expanded fields
+        # were added; a duplicated grid silently lost the setting.
+        hide_empty_days=source.hide_empty_days,
+        require_race_verified_availability=source.require_race_verified_availability,
+        single_slot=source.single_slot,
+        expanded_features=source.expanded_features,
+        description=source.description,
+        website_url=source.website_url,
+        course_url=source.course_url,
+        recon_url=source.recon_url,
+        invite_url=source.invite_url,
+        expires=None,
+        status=AvailabilityGrid.Status.DRAFT,
+        created_by=request.user,
+    )
+
+    logfire.info(
+        "Availability grid copied",
+        source_grid_id=str(source.id),
+        new_grid_id=str(new_grid.id),
+        squad_id=squad_pk,
+        event_id=event_pk,
+        user_id=request.user.id,
+        delta_days=delta_days,
+        blocked_cells_kept=len(shifted_blocked),
+        blocked_cells_source=len(source.blocked_cells or []),
+    )
+    messages.success(request, f'Created copy "{new_grid.title}" as a draft.')
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_template_create_view(request: HttpRequest, event_pk: int, squad_pk: int) -> JsonResponse:
+    """Save the builder's current configuration as a reusable per-squad template.
+
+    Accepts a JSON body with the grid shape (local times, timezone, slot duration, length,
+    and the optional questions). Blocked cells and dates are intentionally not stored.
+
+    Args:
+        request: The HTTP request with a JSON body.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        JsonResponse with the template id on success, or error details on failure.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return JsonResponse({"error": "Permission denied."}, status=403)
+
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    name = str(data.get("name", "")).strip()
+    if not name:
+        return JsonResponse({"error": "Template name is required."}, status=400)
+
+    start_time = str(data.get("start_time", ""))
+    end_time = str(data.get("end_time", ""))
+    if not _HHMM_RE.match(start_time) or not _HHMM_RE.match(end_time):
+        return JsonResponse({"error": "start_time and end_time must be HH:MM format."}, status=400)
+    if start_time >= end_time:
+        return JsonResponse({"error": "start_time must be before end_time."}, status=400)
+
+    try:
+        slot_duration = int(data.get("slot_duration", 0))
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "slot_duration must be an integer."}, status=400)
+    if slot_duration not in (15, 30, 60):
+        return JsonResponse({"error": "slot_duration must be 15, 30, or 60."}, status=400)
+
+    try:
+        length_days = int(data.get("length_days", 0))
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "length_days must be an integer."}, status=400)
+    if not 1 <= length_days <= 31:
+        return JsonResponse({"error": "length_days must be between 1 and 31."}, status=400)
+
+    grid_tz = str(data.get("timezone", "UTC")).strip() or "UTC"
+    if grid_tz != "UTC" and grid_tz not in available_timezones():
+        return JsonResponse({"error": f"Invalid timezone: {grid_tz}"}, status=400)
+
+    template = AvailabilityGridTemplate.objects.create(
+        squad=squad,
+        name=name,
+        start_time=start_time,
+        end_time=end_time,
+        grid_timezone=grid_tz,
+        slot_duration=slot_duration,
+        default_length_days=length_days,
+        max_races_question=bool(data.get("max_races_question", False)),
+        rest_days_question=bool(data.get("rest_days_question", False)),
+        shared=bool(data.get("shared", False)),
+        hide_empty_days=bool(data.get("hide_empty_days", False)),
+        single_slot=bool(data.get("single_slot", False)),
+        expanded_features=bool(data.get("expanded_features", False)),
+        description=(data.get("description") or "").strip(),
+        website_url=(data.get("website_url") or "").strip(),
+        course_url=(data.get("course_url") or "").strip(),
+        recon_url=(data.get("recon_url") or "").strip(),
+        invite_url=(data.get("invite_url") or "").strip(),
+        created_by=request.user,
+    )
+    logfire.info(
+        "Availability template created",
+        template_id=template.pk,
+        squad_id=squad.pk,
+        event_id=event.pk,
+        user_id=request.user.id,
+    )
+    return JsonResponse({"id": template.pk, "status": "ok"})
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_template_apply_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, template_pk: int
+) -> HttpResponse:
+    """Create a draft availability grid from a template and a chosen start date.
+
+    The end date is derived from the template's ``default_length_days``. The template's local
+    times are converted to UTC for the chosen dates (DST-aware), and a draft grid is created.
+
+    Args:
+        request: The HTTP request with a ``start_date`` POST field.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        template_pk: The template primary key.
+
+    Returns:
+        Redirect to the squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    # Either this squad's own template, or one another squad of the same event has shared
+    # (sharing never crosses events). Permission is still checked against the *target*
+    # squad below -- a template carries only grid configuration, never rider data, so
+    # borrowing one exposes nothing.
+    template = get_object_or_404(
+        AvailabilityGridTemplate.objects.filter(Q(squad=squad) | Q(shared=True, squad__event=event)),
+        pk=template_pk,
+    )
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability template apply attempt",
+            template_id=template.pk,
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if event.is_race_series:
+        messages.error(request, "This event collects availability per stage, so templates don't apply.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    try:
+        start_date = date.fromisoformat(request.POST.get("start_date", ""))
+    except (ValueError, TypeError):
+        messages.error(request, "Invalid or missing start date.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    end_date = start_date + timedelta(days=template.default_length_days - 1)
+
+    # A shared template arrives on the squad that built it clock. The dialog lets the
+    # borrowing squad set the time and timezone up front rather than create a draft and
+    # then correct it; both fall back to the template's own values.
+    local_start_time = str(request.POST.get("start_time") or template.start_time)
+    if not _HHMM_RE.match(local_start_time):
+        messages.error(request, "Start time must be in HH:MM format.")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    local_tz = str(request.POST.get("grid_timezone") or template.grid_timezone).strip()
+    if local_tz != "UTC" and local_tz not in available_timezones():
+        messages.error(request, f"Invalid timezone: {local_tz}")
+        return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+    # Shift the end time by however much the start moved, so a re-timed template keeps
+    # the span it was built with instead of being silently shortened.
+    span_minutes = (
+        datetime.combine(date.min, time.fromisoformat(template.end_time))
+        - datetime.combine(date.min, time.fromisoformat(template.start_time))
+    ).total_seconds() / 60
+    if span_minutes <= 0:
+        span_minutes += 24 * 60
+    local_end_time = (
+        datetime.combine(date.min, time.fromisoformat(local_start_time))
+        + timedelta(minutes=span_minutes)
+    ).strftime("%H:%M")
+
+    start_date_utc, end_date_utc, start_time_utc, end_time_utc = convert_local_to_utc(
+        start_date,
+        end_date,
+        local_start_time,
+        local_end_time,
+        local_tz,
+    )
+
+    if template.single_slot:
+        # Re-derive rather than trusting the conversion. A local time near midnight can
+        # land start and end on different UTC dates, and the grid generator would then
+        # emit one slot per date -- two cells from a template that means one. Same
+        # derivation the builder's save uses, so both routes agree.
+        end_date_utc = start_date_utc
+        end_time_utc = (
+            datetime.combine(date.min, time.fromisoformat(start_time_utc))
+            + timedelta(minutes=template.slot_duration)
+        ).strftime("%H:%M")
+
+    # A shared template names a specific session ("Round 3 Qualifier"), and several squads
+    # create grids from it -- carrying that name through beats the auto-generated
+    # "<event> <squad> <dates>" title. A squad's own templates keep the auto title.
+    grid = AvailabilityGrid.objects.create(
+        squad=squad,
+        title=template.name if template.shared else "",
+        start_date=start_date_utc,
+        end_date=end_date_utc,
+        start_time=start_time_utc,
+        end_time=end_time_utc,
+        slot_duration=template.slot_duration,
+        grid_timezone=local_tz,
+        blocked_cells=[],
+        max_races_question=template.max_races_question,
+        rest_days_question=template.rest_days_question,
+        hide_empty_days=template.hide_empty_days,
+        single_slot=template.single_slot,
+        expanded_features=template.expanded_features,
+        description=template.description,
+        website_url=template.website_url,
+        course_url=template.course_url,
+        recon_url=template.recon_url,
+        invite_url=template.invite_url,
+        expires=None,
+        status=AvailabilityGrid.Status.DRAFT,
+        created_by=request.user,
+    )
+    logfire.info(
+        "Availability grid created from template",
+        template_id=template.pk,
+        grid_id=str(grid.id),
+        squad_id=squad.pk,
+        event_id=event.pk,
+        user_id=request.user.id,
+    )
+    messages.success(request, f'Created draft "{grid.title}" from template "{template.name}".')
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_template_share_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, template_pk: int
+) -> HttpResponse:
+    """Toggle whether a template is offered to every squad of its event.
+
+    Scoped to the owning squad: sharing is the owner's call, so another squad using a
+    shared template cannot un-share it out from under them.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        template_pk: The template primary key.
+
+    Returns:
+        Redirect to the squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    template = get_object_or_404(AvailabilityGridTemplate, pk=template_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability template share attempt",
+            template_id=template.pk,
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    template.shared = not template.shared
+    template.save(update_fields=["shared", "updated_at"])
+    logfire.info(
+        "Availability template share toggled",
+        template_id=template.pk,
+        shared=template.shared,
+        squad_id=squad.pk,
+        event_id=event.pk,
+        user_id=request.user.id,
+    )
+    if template.shared:
+        messages.success(
+            request,
+            f'"{template.name}" is now shared with the other squads in this event. They see '
+            "its times and timezone, so they are told to check both before publishing.",
+        )
+    else:
+        messages.success(
+            request,
+            f'"{template.name}" is no longer shared. Drafts other squads already created '
+            "from it are unaffected.",
+        )
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def availability_template_delete_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, template_pk: int
+) -> HttpResponse:
+    """Delete a per-squad availability template.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        template_pk: The template primary key.
+
+    Returns:
+        Redirect to the squad availability page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    template = get_object_or_404(AvailabilityGridTemplate, pk=template_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized availability template delete attempt",
+            template_id=template.pk,
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage availability.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    template_name = template.name
+    template.delete()
+    logfire.info(
+        "Availability template deleted",
+        squad_id=squad.pk,
+        event_id=event.pk,
+        user_id=request.user.id,
+    )
+    messages.success(request, f'Deleted template "{template_name}".')
+    return redirect("events:squad_availability", event_pk=event_pk, squad_pk=squad_pk)
+
+
+@require_http_methods(["GET", "POST"])
+@login_required
+@team_member_required()
+def availability_respond_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Display the availability response form or save a member's response.
+
+    GET: renders the response grid pre-populated with any existing response.
+    POST: accepts JSON body with available_cells, creates/updates AvailabilityResponse.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Rendered response page (GET) or JsonResponse (POST).
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if grid.status != AvailabilityGrid.Status.PUBLISHED:
+        messages.error(request, "This availability grid is not open for responses.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if grid.is_series:
+        from apps.events.series_views import series_respond  # local import: series_views imports this module
+
+        return series_respond(request, event, squad, grid)
+
+    race_verified_required = bool(event.require_race_verified_availability or grid.require_race_verified_availability)
+    user_is_race_ready = bool(getattr(request.user, "is_race_ready", False))
+
+    if request.method == "POST":
+        if race_verified_required and not user_is_race_ready:
+            logfire.warning(
+                "Availability submission blocked: race verified required",
+                grid_id=str(grid.id),
+                squad_id=squad_pk,
+                event_id=event_pk,
+                user_id=request.user.id,
+            )
+            return JsonResponse(
+                {
+                    "error": (
+                        "You must be Race Verified to submit availability for this event. "
+                        "Complete your verification and try again."
+                    )
+                },
+                status=403,
+            )
+
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError, ValueError:
+            return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+        available_cells = data.get("available_cells", [])
+        if not isinstance(available_cells, list):
+            return JsonResponse({"error": "available_cells must be a list."}, status=400)
+
+        defaults = {"available_cells": available_cells}
+
+        for field, asked, prompt, noun in (
+            ("max_races", grid.max_races_question, "max number of races", "Max races"),
+            ("rest_days", grid.rest_days_question, "rest days between races", "Rest days"),
+        ):
+            if not asked:
+                continue
+            raw = data.get(field)
+            if raw is None or raw == "":
+                return JsonResponse({"error": f"Please answer: {prompt}."}, status=400)
+            try:
+                value = int(raw)
+            except ValueError, TypeError:
+                return JsonResponse({"error": f"{noun} must be a whole number."}, status=400)
+            # The upper bound is the point: these columns are PositiveSmallIntegerField,
+            # so anything over 32767 reached Postgres as "smallint out of range" and 500'd
+            # the submit. A mistyped number on a phone was enough. The limit below is far
+            # beyond any real answer, so it reads as a typo check rather than a rule.
+            if not 0 <= value <= MAX_AVAILABILITY_ANSWER:
+                return JsonResponse(
+                    {"error": f"{noun} must be between 0 and {MAX_AVAILABILITY_ANSWER}."},
+                    status=400,
+                )
+            defaults[field] = value
+
+        AvailabilityResponse.objects.update_or_create(
+            grid=grid,
+            user=request.user,
+            defaults=defaults,
+        )
+        logfire.info(
+            "Availability response saved",
+            grid_id=str(grid.id),
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+            cell_count=len(available_cells),
+        )
+        return JsonResponse({"status": "ok"})
+
+    existing_response = AvailabilityResponse.objects.filter(grid=grid, user=request.user).first()
+
+    # Determine display timezone: user profile → grid timezone → UTC
+    user_tz = getattr(request.user, "timezone", "") or ""
+    display_tz = user_tz or grid.grid_timezone or "UTC"
+    tz_is_default = not user_tz
+
+    grid_data = convert_grid_to_local(
+        grid.dates, grid.start_time, grid.end_time, grid.slot_duration, grid.blocked_cells, display_tz
+    )
+
+    if grid.hide_empty_days:
+        grid_data = drop_fully_blocked_days(grid_data)
+
+    # Convert existing response UTC keys → local keys
+    existing_local_keys: list[str] = []
+    if existing_response:
+        for cell in existing_response.available_cells:
+            utc_key = f"{cell['date']}|{cell['time']}"
+            local_key = grid_data["reverse_map"].get(utc_key)
+            if local_key:
+                existing_local_keys.append(local_key)
+
+    # Single-slot grids collapse to one Yes/No, so the date and time have to be stated
+    # in words -- there is no grid header left to read them off. Built from the already
+    # timezone-converted display data, so it matches what the hidden grid holds.
+    single_slot_label = ""
+    if grid.single_slot and grid_data["display_dates"] and grid_data["display_time_slots"]:
+        slot_date = date.fromisoformat(grid_data["display_dates"][0])
+        slot_time = grid_data["display_time_slots"][0]
+        single_slot_label = (
+            f"{slot_date.strftime('%a %d %b %Y')} at {slot_time} "
+            f"({grid.slot_duration} min, {grid.grid_timezone})"
+        )
+
+    logfire.debug(
+        "Availability respond page viewed",
+        grid_id=str(grid.id),
+        user_id=request.user.id,
+        event_id=event_pk,
+        squad_id=squad_pk,
+        display_tz=display_tz,
+    )
+    return render(
+        request,
+        "events/availability_respond.html",
+        {
+            "event": event,
+            "squad": squad,
+            "grid": grid,
+            "display_dates_json": grid_data["display_dates"],
+            "display_time_slots_json": grid_data["display_time_slots"],
+            "single_slot_label": single_slot_label,
+            "display_blocked_json": sorted(grid_data["display_blocked"]),
+            "existing_local_keys_json": existing_local_keys,
+            "cell_utc_map_json": grid_data["cell_map"],
+            "valid_cells_json": sorted(grid_data["valid_cells"]),
+            "display_timezone": display_tz,
+            "tz_is_default": tz_is_default,
+            "existing_max_races": existing_response.max_races if existing_response else None,
+            "existing_rest_days": existing_response.rest_days if existing_response else None,
+            "race_verified_required": race_verified_required,
+            "user_is_race_ready": user_is_race_ready,
+            # Drives the Re-Post control. Riders see this page too, so the button has to be
+            # gated on the same permission the view behind it enforces.
+            "can_manage_availability": _can_manage_squad_availability(request.user, squad),
+        },
+    )
+
+
+def _slot_modal_selections(slot_selections: list[AvailabilitySlotSelection]) -> dict[str, dict]:
+    """Describe a grid's scheduled races the way the race dialog prefills from them.
+
+    Args:
+        slot_selections: The grid's races, riders and substitutes prefetched.
+
+    Returns:
+        ``{"<utc date>|<utc time>": {the race's editable fields}}``.
+
+    """
+    return {
+        f"{sel.slot_date.isoformat()}|{sel.slot_time}": {
+            "id": sel.pk,
+            "name": sel.name,
+            "status": sel.status,
+            "opponent": sel.opponent,
+            "event_invite_url": sel.event_invite_url,
+            "course_url": sel.course_url,
+            "thread_link": sel.thread_link,
+            "laps": sel.laps,
+            "custom_finish_km": str(sel.custom_finish_km) if sel.custom_finish_km is not None else "",
+            "powerups": sel.powerups or [],
+            "selected_user_ids": [u.pk for u in sel.selected_users.all()],
+            "substitute_ids": [u.pk for u in sel.substitutes.all()],
+        }
+        for sel in slot_selections
+    }
+
+
+def _results_row_in_lanes(time_slot: str, cells: list[dict], lane_order: dict[int, int]) -> dict:
+    """Lay one time slot of the results heatmap out in rider lanes.
+
+    A lane is a line given to one rider who is free at this time on any day shown. Every
+    open cell in the row repeats the same lanes in the same order -- the rider where they
+    are free, ``None`` (a blank line) where they are not -- so a rider sits on the same
+    line in every day column and can be read straight across the row. Stacking only each
+    cell's own riders put the same rider on a different line from one day to the next,
+    because the riders above them changed.
+
+    A blocked cell gets no lanes and opens none. ``has_race`` is set when an open cell
+    carries a scheduled race: its badge takes a line of its own, so every open cell in the
+    row reserves that line, or the day with the badge would sit a line lower than the rest.
+
+    Args:
+        time_slot: The row's local time ("HH:MM").
+        cells: The row's cells in day order, each with ``is_blocked``, ``users`` (the
+            enriched riders free in it) and ``selection_name``.
+        lane_order: Each rider's place in the lane order, by user pk. Every rider in
+            ``users`` must be in it.
+
+    Returns:
+        The row: ``time_slot``, ``cells`` (each given ``lanes``) and ``has_race``.
+
+    """
+    open_cells = [cell for cell in cells if not cell["is_blocked"]]
+    lane_user_ids = sorted(
+        {entry["user"].pk for cell in open_cells for entry in cell["users"]},
+        key=lane_order.__getitem__,
+    )
+    for cell in cells:
+        free = {entry["user"].pk: entry for entry in cell["users"]}
+        cell["lanes"] = [] if cell["is_blocked"] else [free.get(user_id) for user_id in lane_user_ids]
+    return {
+        "time_slot": time_slot,
+        "cells": cells,
+        "has_race": any(cell["selection_name"] for cell in open_cells),
+    }
+
+
+@require_GET
+@login_required
+@team_member_required()
+def availability_results_view(request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str) -> HttpResponse:
+    """Display aggregated availability results as a heatmap.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        Rendered results heatmap page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if grid.status not in (AvailabilityGrid.Status.PUBLISHED, AvailabilityGrid.Status.CLOSED):
+        messages.error(request, "Results are not available for this grid.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    if grid.is_series:
+        from apps.events.series_views import series_results  # local import: series_views imports this module
+
+        return series_results(request, event, squad, grid)
+
+    # Current members only. This one query feeds the responders list, the heatmap and the
+    # race-slot picker, so filtering it here is what keeps a rider who has left from being
+    # offered as available for a race.
+    responses = list(grid.active_responses().select_related("user"))
+    total_responders = len(responses)
+
+    responder_users = [r.user for r in responses]
+    responder_user_ids = {u.pk for u in responder_users}
+
+    squad_member_users = list(
+        User.objects
+        .filter(squad_memberships__squad=squad, squad_memberships__status=SquadMember.Status.MEMBER)
+        .order_by("first_name", "last_name")
+    )
+    non_responder_users = [u for u in squad_member_users if u.pk not in responder_user_ids]
+
+    # Enrich responders + non-responders with ZP/ZR data (shared lookup)
+    zwids = list({u.zwid for u in responder_users + non_responder_users if u.zwid})
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+
+    enriched_responders = []
+    user_by_id: dict[int, dict] = {}
+    response_by_user: dict[int, AvailabilityResponse] = {r.user.pk: r for r in responses}
+    for user in responder_users:
+        zp = zp_by_zwid.get(user.zwid)
+        zr = rider_stats.zr_fields(profiles.get(user.zwid) if user.zwid else None, gender=user.gender)
+        display_name = user.get_full_name() or user.discord_username
+        zp_cat = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else ""
+        zp_cat_w = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else ""
+        zr_cat = zr["zr_category"]
+        zr_rating = zr["zr_rating"]
+        zr_phenotype = zr["zr_phenotype"]
+        zr_age = zr["zr_age"]
+        resp = response_by_user.get(user.pk)
+        entry = {
+            "user": user,
+            "display_name": display_name,
+            "zwid": user.zwid,
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "in_zwiftpower": zp is not None,
+            "zp_category": zp_cat,
+            "zp_category_w": zp_cat_w,
+            "in_zwiftracing": zr["in_zwiftracing"],
+            "zr_category": zr_cat,
+            "zr_v2_category": zr["zr_v2_category"],
+            "zr_rating": zr_rating,
+            "zr_phenotype": zr_phenotype,
+            "zr_age": zr_age,
+            "max_races": resp.max_races if resp else None,
+            "rest_days": resp.rest_days if resp else None,
+        }
+        enriched_responders.append(entry)
+        user_by_id[user.pk] = entry
+
+    enriched_non_responders = []
+    for user in non_responder_users:
+        zp = zp_by_zwid.get(user.zwid)
+        zr = rider_stats.zr_fields(profiles.get(user.zwid) if user.zwid else None, gender=user.gender)
+        enriched_non_responders.append({
+            "user": user,
+            "display_name": user.get_full_name() or user.discord_username,
+            "zwid": user.zwid,
+            "is_race_ready": user.is_race_ready,
+            "is_extra_verified": user.is_extra_verified,
+            "in_zwiftpower": zp is not None,
+            "zp_category": ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else "",
+            "zp_category_w": ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else "",
+            **{key: zr[key] for key in rider_stats.TOOLTIP_FIELDS},
+        })
+
+    # Aggregate user IDs keyed by UTC cell
+    utc_cell_user_ids: dict[str, list[int]] = {}
+    for response in responses:
+        for cell in response.available_cells:
+            key = f"{cell['date']}|{cell['time']}"
+            utc_cell_user_ids.setdefault(key, []).append(response.user.pk)
+
+    # Determine display timezone
+    user_tz = getattr(request.user, "timezone", "") or ""
+    display_tz = user_tz or grid.grid_timezone or "UTC"
+    tz_is_default = not user_tz
+
+    grid_data = convert_grid_to_local(
+        grid.dates, grid.start_time, grid.end_time, grid.slot_duration, grid.blocked_cells, display_tz
+    )
+
+    if grid.hide_empty_days:
+        grid_data = drop_fully_blocked_days(grid_data)
+
+    # Re-key user IDs from UTC → local
+    cell_user_ids: dict[str, list[int]] = {}
+    for utc_key, local_key in grid_data["reverse_map"].items():
+        if utc_key in utc_cell_user_ids:
+            cell_user_ids[local_key] = utc_cell_user_ids[utc_key]
+
+    # Build display_dates with day names for header
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    display_dates = []
+    for d_str in grid_data["display_dates"]:
+        d = date.fromisoformat(d_str)
+        display_dates.append({
+            "date_str": d.strftime("%b %-d"),
+            "day_name": day_names[d.weekday()],
+            "full_date": d_str,
+        })
+
+    # Build local→UTC mapping for each cell (so JS can send UTC back)
+    cell_map = grid_data["cell_map"]  # local_key → {"date": utc_date, "time": utc_time}
+
+    # Load existing slot selections
+    slot_selections = list(grid.slot_selections.prefetch_related("selected_users", "substitutes"))
+    slot_selection_by_utc_key = {}
+    scheduled_count_by_user_id: dict[int, int] = {}
+    # Riders picked to race (substitutes are not), by the day the race falls on in the
+    # display timezone -- the column its badge sits in, not its UTC date. The heatmap flags
+    # a picked rider in every slot of that day, as a rider seldom races twice in one day.
+    display_zone = ZoneInfo(display_tz)
+    racing_by_date: dict[str, dict[int, list[str]]] = {}
+    for sel in slot_selections:
+        utc_key = f"{sel.slot_date.isoformat()}|{sel.slot_time}"
+        slot_selection_by_utc_key[utc_key] = sel
+        race_starts = datetime.combine(sel.slot_date, time.fromisoformat(sel.slot_time), tzinfo=ZoneInfo("UTC"))
+        racing_that_day = racing_by_date.setdefault(race_starts.astimezone(display_zone).date().isoformat(), {})
+        for selected_user in sel.selected_users.all():
+            scheduled_count_by_user_id[selected_user.pk] = (
+                scheduled_count_by_user_id.get(selected_user.pk, 0) + 1
+            )
+            racing_that_day.setdefault(selected_user.pk, []).append(sel.name)
+
+    # Annotate the responders table with each rider's scheduled-race count.
+    for entry in enriched_responders:
+        entry["scheduled_count"] = scheduled_count_by_user_id.get(entry["user"].pk, 0)
+
+    is_event_admin = _can_manage_squad_availability(request.user, squad)
+
+    # Build grid_rows for server-side rendering
+    blocked_set = grid_data["display_blocked"]
+    # Lanes list riders in the responses' order (first name, last name), the order the
+    # cells stacked them in before lanes.
+    lane_order = {user.pk: position for position, user in enumerate(responder_users)}
+    grid_rows = []
+    for time_slot in grid_data["display_time_slots"]:
+        cells = []
+        for d_info in display_dates:
+            key = f"{d_info['full_date']}|{time_slot}"
+            racing_today = racing_by_date.get(d_info["full_date"], {})
+            is_blocked = key in blocked_set
+            uids = cell_user_ids.get(key, [])
+            count = len(uids)
+            if total_responders > 0 and count > 0:
+                ratio = count / total_responders
+                opacity = f"{0.3 + ratio * 0.7:.2f}"
+                dark_text = ratio > 0.6
+            else:
+                ratio = 0
+                opacity = "0"
+                dark_text = False
+            # Look up UTC coordinates for this local cell
+            utc_info = cell_map.get(key, {})
+            utc_date = utc_info.get("date", "")
+            utc_time = utc_info.get("time", "")
+            utc_key = f"{utc_date}|{utc_time}" if utc_date else ""
+            selection = slot_selection_by_utc_key.get(utc_key)
+            cells.append({
+                "is_blocked": is_blocked,
+                "count": count,
+                "opacity": opacity,
+                "dark_text": dark_text,
+                # A copy of each rider's entry per cell: whether they race is per day.
+                "users": [
+                    {**user_by_id[uid], "racing": ", ".join(racing_today.get(uid, []))}
+                    for uid in uids
+                    if uid in user_by_id
+                ],
+                "utc_date": utc_date,
+                "utc_time": utc_time,
+                "selection_name": selection.name if selection else "",
+                "selection_id": selection.pk if selection else None,
+            })
+        grid_rows.append(_results_row_in_lanes(time_slot, cells, lane_order))
+    has_racing_flags = any(
+        entry and entry["racing"] for row in grid_rows for cell in row["cells"] for entry in cell["lanes"]
+    )
+
+    # Build JSON data for JS modal (keyed by UTC coords)
+    utc_cell_users_json = dict(utc_cell_user_ids)
+    user_data_json = {}
+    for uid, entry in user_by_id.items():
+        user_data_json[uid] = {
+            "display_name": entry["display_name"],
+            "zr_category": entry["zr_category"],
+            "zr_rating": float(entry["zr_rating"]) if entry["zr_rating"] is not None else None,
+            "is_race_ready": entry["is_race_ready"],
+        }
+    # Full squad roster for the modal's "others" picker, so a race can include
+    # someone who never marked availability or is not free at that slot. Uses the
+    # canonical roster helper (MEMBER rows plus captains and vice-captains) rather
+    # than the MEMBER-only list the non-responder table above is built from —
+    # captains race too. Any roster user not already in user_data_json needs their
+    # display data adding, which is one extra ZR lookup at most.
+    roster_users = squad_roster_users(squad)
+    squad_roster_ids_json = [u.pk for u in roster_users]
+    missing_roster = [u for u in roster_users if u.pk not in user_data_json]
+    if missing_roster:
+        extra_zwids = [u.zwid for u in missing_roster if u.zwid]
+        extra_profiles = rider_stats.profiles_by_zwid(extra_zwids)
+        for user in missing_roster:
+            zr = rider_stats.zr_fields(extra_profiles.get(user.zwid) if user.zwid else None, gender=user.gender)
+            rating = zr["zr_rating"]
+            user_data_json[user.pk] = {
+                "display_name": user.get_full_name() or user.discord_username,
+                "zr_category": zr["zr_category"],
+                "zr_rating": float(rating) if rating is not None else None,
+                "is_race_ready": user.is_race_ready,
+            }
+
+    # Slot selections with selected user IDs for pre-filling the modal
+    selections_json = _slot_modal_selections(slot_selections)
+
+    # Build enriched slot selections for initial render
+    enriched_selections = []
+    for sel in slot_selections:
+        enriched_sel_users = []
+        for user in sel.selected_users.all():
+            zp = zp_by_zwid.get(user.zwid)
+            zr = rider_stats.zr_fields(profiles.get(user.zwid) if user.zwid else None, gender=user.gender)
+            zp_cat = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else ""
+            zp_cat_w = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else ""
+            enriched_sel_users.append({
+                "user": user,
+                "display_name": user.get_full_name() or user.discord_username,
+                "zwid": user.zwid,
+                "is_race_ready": user.is_race_ready,
+                "is_extra_verified": user.is_extra_verified,
+                "in_zwiftpower": zp is not None,
+                "zp_category": zp_cat,
+                "zp_category_w": zp_cat_w,
+                **{key: zr[key] for key in rider_stats.TOOLTIP_FIELDS},
+            })
+        utc_dt = datetime.combine(
+            sel.slot_date,
+            datetime.strptime(sel.slot_time, "%H:%M").time(),  # noqa: DTZ007  # clock-only parse, no date used
+            tzinfo=ZoneInfo("UTC"),
+        )
+        local_dt = utc_dt.astimezone(display_zone)
+        enriched_selections.append({
+            "selection": sel,
+            "enriched_users": enriched_sel_users,
+            "local_date": local_dt.strftime("%Y-%m-%d"),
+            "local_time": local_dt.strftime("%H:%M"),
+            "local_day": local_dt.strftime("%a"),
+        })
+
+    logfire.debug(
+        "Availability results viewed",
+        grid_id=str(grid.id),
+        user_id=request.user.id,
+        event_id=event_pk,
+        squad_id=squad_pk,
+        total_responders=total_responders,
+        display_tz=display_tz,
+    )
+    return render(
+        request,
+        "events/availability_results.html",
+        {
+            "event": event,
+            "squad": squad,
+            "grid": grid,
+            "display_dates": display_dates,
+            "grid_rows": grid_rows,
+            "has_racing_flags": has_racing_flags,
+            "total_responders": total_responders,
+            "enriched_responders": enriched_responders,
+            "enriched_non_responders": enriched_non_responders,
+            "display_timezone": display_tz,
+            "tz_is_default": tz_is_default,
+            "is_event_admin": is_event_admin,
+            "slot_selections_enriched": enriched_selections,
+            # Rendered with |json_script, not json.dumps + |safe: `user_data_json` carries
+            # rider display names and `selections_json` captain-entered race names and URLs.
+            # json.dumps does not escape "<", and an HTML parser ends a <script> at the first
+            # "</script" whatever the JS quoting, so a rider named "</script><img onerror=...>"
+            # got script execution in their captain's session.
+            "utc_cell_users_json": utc_cell_users_json,
+            "user_data_json": user_data_json,
+            "squad_roster_ids_json": squad_roster_ids_json,
+            "selections_json": selections_json,
+            "powerup_choices": _powerup_choices(),
+        },
+    )
+
+
+#: Appended to the sync result so an admin knows what just happened. The button reads
+#: like it might hand out roles; it only refreshes what the app has recorded.
+SYNC_ROLES_EXPLAINER = (
+    "This refreshes the app's cached copy of each rider's Discord roles. "
+    "It is read-only \u2014 nothing was changed in Discord."
+)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def sync_event_roles_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Sync Discord roles from Discord for all riders signed up to an event.
+
+    Read-only with respect to Discord: it fetches each registered rider's current guild
+    roles and overwrites the app's ``User.discord_roles`` cache, which is what the role
+    grids render from. It never grants or removes a role.
+
+    "Sync" reads as two-directional, so both buttons that reach this view are labelled
+    "Get Roles" and the result message appends ``SYNC_ROLES_EXPLAINER`` to say outright
+    that nothing changed in Discord. The view, its URL name and that constant kept the
+    older wording -- only the user-facing labels moved.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Redirect to the referring page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+
+    # Require event admin or assign_roles/head captain permission
+    if not (request.user.is_event_admin or request.user.is_superuser or _can_manage_event_roles(request.user, event)):
+        messages.error(request, "You don't have permission to sync roles.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    users = User.objects.filter(
+        pk__in=event.signups.filter(status=EventSignup.Status.REGISTERED).values_list("user_id", flat=True),
+        discord_id__isnull=False,
+    ).exclude(discord_id="")
+
+    synced = 0
+    failed = 0
+    for user in users:
+        if sync_user_discord_roles(user):
+            synced += 1
+        else:
+            failed += 1
+
+    logfire.info(
+        "Event roles synced from Discord",
+        event_id=event_pk,
+        synced=synced,
+        failed=failed,
+        admin_user_id=request.user.id,
+    )
+    if failed:
+        messages.warning(request, f"Synced roles for {synced} riders, {failed} failed. {SYNC_ROLES_EXPLAINER}")
+    else:
+        messages.success(request, f"Synced Discord roles for {synced} riders. {SYNC_ROLES_EXPLAINER}")
+
+    # Redirect back to referring page
+    referer = request.META.get("HTTP_REFERER", "")
+    if "assign-riders" in referer:
+        return redirect("events:squad_assign_page", event_pk=event_pk)
+    if "discord-roles" in referer:
+        return redirect("events:discord_roles", event_pk=event_pk)
+    return redirect("events:event_detail", pk=event_pk)
+
+
+def _flatten_role_choices(choices: list) -> list[tuple[str, str]]:
+    """Flatten ``_get_role_choices`` optgroups into plain ``(value, label)`` pairs.
+
+    With prefixes supplied that helper groups roles under "Prefix: $" headings, which a
+    Django ``Select`` widget renders natively but a hand-written ``<select>`` does not.
+    Role names already begin with their prefix, so the grouping carries no extra
+    information here.
+
+    Args:
+        choices: The possibly-grouped choice list.
+
+    Returns:
+        Flat list of (value, label) pairs, in order.
+
+    """
+    flat: list[tuple[str, str]] = []
+    for value, label in choices:
+        if isinstance(label, (list, tuple)):
+            flat.extend((str(v), str(lbl)) for v, lbl in label)
+        else:
+            flat.append((str(value), str(label)))
+    return flat
+
+
+def _timezone_allowed_role_ids(event) -> set[str]:
+    """Role IDs the event's prefixes permit for its timezone/region map.
+
+    Args:
+        event: The event being edited.
+
+    Returns:
+        Set of role ID strings; empty when the event has no prefixes set.
+
+    """
+    from apps.events.forms import _get_role_choices
+
+    prefixes = [p for p in (event.prefixes or []) if isinstance(p, str)]
+    if not prefixes:
+        return set()
+    return {v for v, _ in _flatten_role_choices(_get_role_choices(prefixes=prefixes)) if v != "0"}
+
+
+def _timezone_role_rows(event) -> list[dict]:
+    """Build the event-edit rows pairing each saved timezone option with a role select.
+
+    Args:
+        event: The event being edited.
+
+    Returns:
+        One dict per option: ``{"option", "field_name", "selected", "choices"}``.
+
+    """
+    from apps.events.forms import _get_role_choices
+    from apps.events.timezone_roles import mapped_roles
+
+    # Filtered by the EVENT's prefixes, exactly like the squad team/captain role pickers
+    # (not the global Constance list, which is only the set an admin may choose from).
+    prefixes = [p for p in (event.prefixes or []) if isinstance(p, str)]
+    disabled = not prefixes
+    base = (
+        _flatten_role_choices(_get_role_choices(prefixes=prefixes))
+        if prefixes
+        else [("0", "(none \u2014 set event prefixes first)")]
+    )
+    known = {v for v, _ in base}
+
+    saved = mapped_roles(event)
+    rows = []
+    for option in (event.timezone_options or []):
+        if not isinstance(option, str):
+            continue
+        selected = saved.get(option, "0")
+        choices = list(base)
+        # A saved role outside the current prefixes must stay in the list, or the browser
+        # would submit the first option and silently wipe the mapping on save.
+        if selected != "0" and selected not in known:
+            choices = [*choices, (selected, f"Unknown Role ({selected})")]
+        rows.append({
+            "option": option,
+            "field_name": f"tz_role_map__{option}",
+            "selected": selected,
+            "choices": choices,
+            "disabled": disabled,
+        })
+    return rows
+
+
+def _role_holders(role_ids: set[str]) -> dict[str, list]:
+    """Map each Discord role id to the users the app believes hold it.
+
+    Deliberately not limited to the event's signups: the drift this feeds is precisely
+    people who hold a squad's role without belonging to the squad, and some of them never
+    signed up at all. Reads ``User.discord_roles``, which is the app's cached copy of
+    Discord -- so it is only as fresh as the last "Get Roles" sync.
+
+    Args:
+        role_ids: Discord role ids to bucket by, as strings.
+
+    Returns:
+        ``{role_id: [users]}``, containing only ids that somebody holds.
+
+    """
+    holders: dict[str, list] = {}
+    if not role_ids:
+        return holders
+    # One pass over everyone carrying any Discord role, bucketed in memory, rather than a
+    # query per role -- an event can configure three roles per squad across ~30 squads.
+    for user in User.objects.exclude(discord_roles__isnull=True).exclude(discord_roles={}):
+        for role_id in (user.discord_roles or {}):
+            if role_id in role_ids:
+                holders.setdefault(role_id, []).append(user)
+    return holders
+
+
+def _sorted_users(users) -> list:
+    """Order users by the name the rest of the page shows them under.
+
+    Returns:
+        The same users, sorted by display name.
+
+    """
+    return sorted(users, key=lambda u: (u.get_full_name() or u.discord_username or "").lower())
+
+
+def _build_squad_role_audit(event: Event, role_names: dict[str, str]) -> list[dict]:
+    """Compare each squad's Discord roles against who is actually in the squad.
+
+    Two kinds of drift, and they are not the same problem. ``extra`` is someone holding
+    the role without being in the squad -- that is view access to a channel they should
+    not see, which is the reason this exists. ``missing`` is a member without the role,
+    who simply cannot see their own squad's channel.
+
+    ``regional_coordinator_role`` is left out on purpose: coordinating is a job rather
+    than a consequence of squad membership, so measuring it against the roster would
+    report every coordinator as drift. Same reasoning the stragglers block uses.
+
+    Args:
+        event: The event whose squads to audit.
+        role_names: Discord role id -> name, for ids already resolved by the caller.
+
+    Returns:
+        One row per squad, ordered by squad name.
+
+    """
+    from apps.team.models import DiscordRole
+
+    squads = list(event.squads.order_by("name").prefetch_related("captains", "vice_captains"))
+
+    members_by_squad: dict[int, set[int]] = {}
+    for squad_id, user_id in SquadMember.objects.filter(
+        squad__event=event, status=SquadMember.Status.MEMBER
+    ).values_list("squad_id", "user_id"):
+        members_by_squad.setdefault(squad_id, set()).add(user_id)
+
+    wanted: set[str] = set()
+    for squad in squads:
+        for role_id in (squad.team_discord_role, squad.discord_captain_role, squad.region_role):
+            if role_id:
+                wanted.add(str(role_id))
+    holders = _role_holders(wanted)
+    extra_names = dict(
+        DiscordRole.objects.filter(role_id__in=wanted - set(role_names)).values_list("role_id", "name")
+    ) if wanted - set(role_names) else {}
+
+    def _cell(role_id: int, expected_ids: set[int], *, label: str) -> dict:
+        """Build one role column for a squad.
+
+        Returns:
+            The cell's role name, holder count and both drift lists.
+
+        """
+        if not role_id:
+            return {"configured": False, "label": label}
+        key = str(role_id)
+        held_by = holders.get(key, [])
+        return {
+            "configured": True,
+            "label": label,
+            "role_id": role_id,
+            "name": role_names.get(key) or extra_names.get(key, ""),
+            "holder_count": len(held_by),
+            "extra": _sorted_users([u for u in held_by if u.pk not in expected_ids]),
+            "missing_count": len(expected_ids - {u.pk for u in held_by}),
+        }
+
+    rows = []
+    for squad in squads:
+        member_ids = members_by_squad.get(squad.pk, set())
+        leader_ids = {u.pk for u in squad.captains.all()} | {u.pk for u in squad.vice_captains.all()}
+        cells = [
+            _cell(squad.team_discord_role, member_ids, label="Squad role"),
+            _cell(squad.discord_captain_role, leader_ids, label="Captain role"),
+            _cell(squad.region_role, member_ids, label="Region role"),
+        ]
+        rows.append({
+            "squad": squad,
+            "member_count": len(member_ids),
+            "leader_count": len(leader_ids),
+            "cells": cells,
+            "problem_count": sum(len(c.get("extra", [])) + c.get("missing_count", 0) for c in cells),
+        })
+    return rows
+
+
+@login_required
+@team_member_required()
+@require_GET
+def discord_roles_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Display consolidated Discord role management for all event signups.
+
+    Shows a table of all signups with event role and per-squad role toggle buttons.
+    Accessible to users with assign_roles permission or the event's head captain role.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Rendered role management page.
+
+    Raises:
+        PermissionDenied: If user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_manage_event_roles(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied("You need Assign Roles permission or the Head Captain role for this event.")
+    signups = event.signups.select_related("user").filter(status=EventSignup.Status.REGISTERED)
+    enriched_signups = _enrich_signups(signups, event=event)
+
+    # Default order: by squad, which is how the role columns are grouped -- reading down
+    # the page then follows the squad you are granting roles for. Riders in no squad
+    # sort last rather than leading with a block of blanks. Matches what clicking the
+    # "Squads" header gives, since the client-side sorter keys on the same cell text.
+    def _squad_sort_key(entry: dict) -> tuple:
+        squads = entry.get("assigned_squads") or []
+        user = entry["user"]
+        name = (user.get_full_name() or user.discord_username or "").lower()
+        return (0 if squads else 1, ", ".join(s.name for s in squads).lower(), name)
+
+    enriched_signups.sort(key=_squad_sort_key)
+
+    # Squads that have a Discord role configured
+    role_squads = list(event.squads.exclude(team_discord_role=0).exclude(team_discord_role__isnull=True))
+
+    # Squads that have a captain Discord role configured
+    captain_role_squads = list(event.squads.exclude(discord_captain_role=0).exclude(discord_captain_role__isnull=True))
+
+    # Regional/Group Coordinator roles configured for this event (Role Setup page)
+    coordinator_role_id_strs = [str(rid) for rid in (event.coordinator_role_ids or []) if str(rid) not in ("", "0")]
+
+    # Resolve Discord role IDs to names
+    from apps.team.models import DiscordRole
+
+    role_ids = set()
+    if event.event_role:
+        role_ids.add(str(event.event_role))
+    for s in role_squads:
+        role_ids.add(str(s.team_discord_role))
+    for s in captain_role_squads:
+        role_ids.add(str(s.discord_captain_role))
+    role_ids.update(coordinator_role_id_strs)
+    tz_role_id_strs = list(dict.fromkeys(mapped_roles(event).values()))
+    role_ids.update(tz_role_id_strs)
+    role_names = (
+        dict(DiscordRole.objects.filter(role_id__in=role_ids).values_list("role_id", "name")) if role_ids else {}
+    )
+
+    # Coordinator role column defs (one interactive toggle column each), in configured order
+    coordinator_roles = [
+        {"role_id": int(rid), "name": role_names.get(rid, "")} for rid in coordinator_role_id_strs
+    ]
+
+    # Timezone/region role column defs, in timezone_options order.
+    timezone_roles = role_columns(event, role_names)
+
+    # Build role info list for display
+    role_info = []
+    if event.event_role:
+        role_info.append({
+            "label": "Event Role",
+            "name": role_names.get(str(event.event_role), ""),
+            "role_id": event.event_role,
+        })
+    for s in role_squads:
+        s.role_name = role_names.get(str(s.team_discord_role), "")
+        role_info.append({
+            "label": s.name,
+            "name": s.role_name,
+            "role_id": s.team_discord_role,
+        })
+    for s in captain_role_squads:
+        s.captain_role_name = role_names.get(str(s.discord_captain_role), "")
+        role_info.append({
+            "label": f"{s.name} Captain",
+            "name": s.captain_role_name,
+            "role_id": s.discord_captain_role,
+        })
+    role_info.extend(
+        {"label": "Coordinator", "name": cr["name"], "role_id": cr["role_id"]} for cr in coordinator_roles
+    )
+    role_info.extend(
+        {"label": f"Region: {tz['option']}", "name": tz["name"], "role_id": tz["role_id"]}
+        for tz in timezone_roles
+    )
+
+    # Build squad membership lookup: {user_id: set(squad_ids)}
+    squad_member_map: dict[int, set[int]] = {}
+    for sm in SquadMember.objects.filter(squad__event=event, status=SquadMember.Status.MEMBER):
+        squad_member_map.setdefault(sm.user_id, set()).add(sm.squad_id)
+
+    # Enrich each signup with per-squad role status
+    for entry in enriched_signups:
+        user = entry["user"]
+        user_squads = squad_member_map.get(user.pk, set())
+        # has_role is looked up for non-members too. Hardcoding it False for them made
+        # the page structurally unable to show the opposite kind of drift -- a rider
+        # holding a squad's role while not in the squad rendered the same inert dash as
+        # someone with nothing.
+        entry["squad_role_status"] = [
+            {
+                "squad": squad,
+                "is_member": squad.pk in user_squads,
+                "has_role": user.has_discord_role(squad.team_discord_role),
+            }
+            for squad in role_squads
+        ]
+        entry["captain_role_status"] = [
+            {
+                "squad": squad,
+                "is_member": squad.pk in user_squads,
+                "has_role": user.has_discord_role(squad.discord_captain_role),
+            }
+            for squad in captain_role_squads
+        ]
+        # Coordinator roles are event-level (not squad-scoped): every rider gets a toggle.
+        entry["coordinator_role_status"] = [
+            {
+                "role_id": cr["role_id"],
+                "name": cr["name"],
+                "has_role": user.has_discord_role(cr["role_id"]),
+            }
+            for cr in coordinator_roles
+        ]
+        # Timezone roles are event-level too, but the cell also shows whether the rider
+        # actually picked that region, so an admin can see role vs. stated availability.
+        picked = {tz for tz in (entry["signup"].signup_timezone or []) if isinstance(tz, str)}
+        entry["timezone_role_status"] = [
+            {
+                "option": tz["option"],
+                "role_id": int(tz["role_id"]),
+                "name": tz["name"],
+                "selected": tz["option"] in picked,
+                "has_role": user.has_discord_role(tz["role_id"]),
+            }
+            for tz in timezone_roles
+        ]
+
+    # Riders who are no longer registered but still hold the event's roles. They are
+    # absent from the table above (it filters to REGISTERED), and withdrawing does not
+    # strip roles the way leaving a squad does -- so without this they are invisible.
+    # Coordinator roles are deliberately excluded: that is a job, not a consequence of
+    # racing, so a coordinator who did not sign up is not drift.
+    registered_ids = {e["user"].pk for e in enriched_signups}
+    candidates: dict[int, User] = {
+        sg.user.pk: sg.user
+        for sg in event.signups.exclude(status=EventSignup.Status.REGISTERED).select_related("user")
+    }
+    for sm in (
+        SquadMember.objects.filter(squad__event=event, status=SquadMember.Status.MEMBER)
+        .exclude(user_id__in=registered_ids)
+        .select_related("user")
+    ):
+        candidates.setdefault(sm.user_id, sm.user)
+
+    stragglers = []
+    for candidate in candidates.values():
+        if candidate.pk in registered_ids:
+            continue
+        held = []
+        if event.event_role and candidate.has_discord_role(event.event_role):
+            held.append({"kind": "event", "label": "Event"})
+        held.extend(
+            {"kind": "squad", "label": squad.name, "squad": squad}
+            for squad in role_squads
+            if candidate.has_discord_role(squad.team_discord_role)
+        )
+        held.extend(
+            {"kind": "captain", "label": f"{squad.name} Cpt", "squad": squad}
+            for squad in captain_role_squads
+            if candidate.has_discord_role(squad.discord_captain_role)
+        )
+        held.extend(
+            {
+                "kind": "role_id", "label": tz["option"],
+                "role_id": tz["role_id"], "role_name": tz["name"],
+            }
+            for tz in timezone_roles
+            if candidate.has_discord_role(tz["role_id"])
+        )
+        if held:
+            stragglers.append({"user": candidate, "held": held})
+    stragglers.sort(key=lambda r: (r["user"].get_full_name() or r["user"].discord_username or "").lower())
+
+    # ---- "By Squad" audit -------------------------------------------------------
+    # The rider table above can show a rider holding a squad's role while not being in
+    # that squad, but only if you scan a wide matrix cell by cell. This flips the axes so
+    # each squad is one row, and states the drift directly. Read-only by design: it is a
+    # place to find channel-access mistakes, not to fix them.
+    squad_audit = _build_squad_role_audit(event, role_names)
+
+    logfire.info(
+        "Discord Roles page viewed",
+        event_id=event_pk,
+        user_id=request.user.id,
+        signup_count=len(enriched_signups),
+        squad_role_problems=sum(s["problem_count"] for s in squad_audit),
+    )
+    return render(
+        request,
+        "events/discord_roles.html",
+        {
+            "event": event,
+            "enriched_signups": enriched_signups,
+            "stragglers": stragglers,
+            "role_squads": role_squads,
+            "captain_role_squads": captain_role_squads,
+            "coordinator_roles": coordinator_roles,
+            "timezone_roles": timezone_roles,
+            "role_info": role_info,
+            "squad_audit": squad_audit,
+            "squad_problem_total": sum(s["problem_count"] for s in squad_audit),
+            "active_tab": "squads" if request.GET.get("tab") == "squads" else "riders",
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_toggle_role_view(request: HttpRequest, event_pk: int, user_id: int) -> HttpResponse:
+    """Toggle an event's Discord role for a signup user.
+
+    Adds the role if the user doesn't have it, removes it if they do.
+    Accessible to users with assign_roles permission or the event's head captain role.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        user_id: The target user primary key.
+
+    Returns:
+        HTMX partial or redirect to manage roles page.
+
+    Raises:
+        PermissionDenied: If user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_manage_event_roles(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied("You need Assign Roles permission or the Head Captain role for this event.")
+    role_id = event.event_role
+    if not role_id:
+        messages.error(request, "This event has no Discord role configured.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    target_user = get_object_or_404(User, pk=user_id)
+    if not target_user.discord_id:
+        messages.error(request, f"{target_user} has no linked Discord account.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    role_id_str = str(role_id)
+    if target_user.has_discord_role(role_id):
+        success = remove_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles.pop(role_id_str, None)
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Event Discord role removed",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Removed event role from {target_user}.")
+        else:
+            logfire.error(
+                "Failed to remove event Discord role",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to remove Discord role. Check bot token configuration.")
+    else:
+        success = add_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles[role_id_str] = event.title
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Event Discord role added",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Added event role to {target_user}.")
+        else:
+            logfire.error(
+                "Failed to add event Discord role",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to add Discord role. Check bot token configuration.")
+
+    if request.headers.get("HX-Request"):
+        has_role = target_user.has_discord_role(role_id)
+        response = render(
+            request,
+            "events/_event_role_cell.html",
+            {
+                "event_pk": event_pk,
+                "member_user_pk": user_id,
+                "has_role": has_role,
+            },
+        )
+        stored = messages.get_messages(request)
+        msg_list = [{"message": str(m), "tags": m.tags} for m in stored]
+        if msg_list:
+            response["HX-Trigger"] = json.dumps({"showToast": msg_list})
+        return response
+
+    return redirect("events:discord_roles", event_pk=event_pk)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def event_toggle_coordinator_role_view(
+    request: HttpRequest, event_pk: int, user_id: int, role_id: int
+) -> HttpResponse:
+    """Toggle one of the event's own Discord roles for a signup user.
+
+    Covers the Regional/Group Coordinator roles and the roles an event's timezone map
+    grants — both are event-level (not squad-scoped) and share this one toggle cell.
+    Adds the role if the user doesn't have it, removes it if they do. ``role_id`` is
+    re-validated server-side against those two sets so a crafted POST cannot toggle an
+    arbitrary role.
+    Accessible to users with assign_roles permission or the event's head captain role.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        user_id: The target user primary key.
+        role_id: The coordinator Discord role ID to toggle.
+
+    Returns:
+        HTMX partial or redirect to manage roles page.
+
+    Raises:
+        PermissionDenied: If user lacks permission.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_manage_event_roles(request.user, event):
+        from django.core.exceptions import PermissionDenied
+
+        raise PermissionDenied("You need Assign Roles permission or the Head Captain role for this event.")
+
+    role_id_str = str(role_id)
+    # Event-level roles this event legitimately manages: its coordinator roles plus any
+    # role its timezone map grants. Re-validated so a crafted POST can't toggle anything else.
+    allowed_ids = {str(rid) for rid in (event.coordinator_role_ids or [])} | set(mapped_roles(event).values())
+    if role_id_str not in allowed_ids:
+        logfire.warning(
+            "Rejected event role toggle for a role this event does not manage",
+            event_id=event_pk,
+            role_id=role_id_str,
+            admin_user_id=request.user.id,
+        )
+        messages.error(request, "That role is not managed by this event.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    target_user = get_object_or_404(User, pk=user_id)
+    if not target_user.discord_id:
+        messages.error(request, f"{target_user} has no linked Discord account.")
+        return redirect("events:discord_roles", event_pk=event_pk)
+
+    from apps.team.models import DiscordRole
+
+    role_name = DiscordRole.objects.filter(role_id=role_id_str).values_list("name", flat=True).first() or ""
+
+    if target_user.has_discord_role(role_id):
+        success = remove_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles.pop(role_id_str, None)
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Coordinator Discord role removed",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Removed coordinator role from {target_user}.")
+        else:
+            logfire.error(
+                "Failed to remove coordinator Discord role",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to remove Discord role. Check bot token configuration.")
+    else:
+        success = add_discord_role(target_user.discord_id, role_id_str)
+        if success:
+            roles = dict(target_user.discord_roles or {})
+            roles[role_id_str] = role_name or "Coordinator role"
+            target_user.discord_roles = roles
+            target_user.save(update_fields=["discord_roles"])
+            logfire.info(
+                "Coordinator Discord role added",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+                admin_user_id=request.user.id,
+            )
+            messages.success(request, f"Added coordinator role to {target_user}.")
+        else:
+            logfire.error(
+                "Failed to add coordinator Discord role",
+                event_id=event_pk,
+                target_user_id=user_id,
+                role_id=role_id_str,
+            )
+            messages.error(request, "Failed to add Discord role. Check bot token configuration.")
+
+    if request.headers.get("HX-Request"):
+        response = render(
+            request,
+            "events/_coordinator_role_cell.html",
+            {
+                "event_pk": event_pk,
+                "member_user_pk": user_id,
+                "role_id": role_id,
+                "role_name": role_name,
+                "has_role": target_user.has_discord_role(role_id),
+            },
+        )
+        stored = messages.get_messages(request)
+        msg_list = [{"message": str(m), "tags": m.tags} for m in stored]
+        if msg_list:
+            response["HX-Trigger"] = json.dumps({"showToast": msg_list})
+        return response
+
+    return redirect("events:discord_roles", event_pk=event_pk)
+
+
+@team_member_required(raise_exception=True)
+@require_http_methods(["GET", "POST"])
+def squad_invite_view(request: HttpRequest, token: str) -> HttpResponse:
+    """Show squad invite confirmation page (GET) or accept the invite (POST).
+
+    Looks up squad by invite_token. On GET, shows event/squad info and current members.
+    On POST, creates event signup if needed and adds user as a full squad member.
+
+    Args:
+        request: The HTTP request.
+        token: The squad invite UUID token.
+
+    Returns:
+        Rendered confirmation page (GET) or redirect to my events (POST).
+
+    """
+    squad = get_object_or_404(Squad, invite_token=token)
+    event = squad.event
+
+    if not event.visible:
+        logfire.warning(
+            "Squad invite rejected: event not visible",
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "This event is not currently available.")
+        return redirect("events:event_list")
+
+    # Check if user is already a member
+    already_member = SquadMember.objects.filter(
+        squad=squad, user=request.user, status=SquadMember.Status.MEMBER
+    ).exists()
+
+    # Joining signs the rider up for the event (or re-activates a withdrawn signup), so the
+    # event's signup requirements apply -- the invite link must not be the way round them. A
+    # rider already signed up has joined the event already and is not re-checked.
+    already_signed_up = EventSignup.objects.filter(
+        event=event, user=request.user, status=EventSignup.Status.REGISTERED
+    ).exists()
+    blockers = [] if already_signed_up else signup_blockers(event, request.user)
+
+    # Build list of roles the user will receive
+    from apps.team.models import DiscordRole
+
+    pending_roles = []
+    role_ids_to_resolve = set()
+    if event.event_role:
+        role_ids_to_resolve.add(str(event.event_role))
+    if squad.team_discord_role:
+        role_ids_to_resolve.add(str(squad.team_discord_role))
+    role_name_map = (
+        dict(DiscordRole.objects.filter(role_id__in=role_ids_to_resolve).values_list("role_id", "name"))
+        if role_ids_to_resolve
+        else {}
+    )
+    if event.event_role:
+        pending_roles.append({
+            "label": "Event Role",
+            "name": role_name_map.get(str(event.event_role), f"Role {event.event_role}"),
+        })
+    if squad.team_discord_role:
+        pending_roles.append({
+            "label": "Squad Role",
+            "name": role_name_map.get(str(squad.team_discord_role), f"Role {squad.team_discord_role}"),
+        })
+
+    if request.method == "GET":
+        members = (
+            squad.squad_members
+            .filter(status=SquadMember.Status.MEMBER)
+            .select_related("user")
+            .order_by("user__first_name", "user__last_name")
+        )
+        return render(
+            request,
+            "events/squad_invite.html",
+            {
+                "squad": squad,
+                "event": event,
+                "members": members,
+                "already_member": already_member,
+                "token": token,
+                "pending_roles": pending_roles,
+                "signup_blockers": blocker_details(blockers),
+            },
+        )
+
+    # POST — accept the invite
+    if already_member:
+        messages.info(request, f"You're already a member of squad {squad.name}.")
+        return redirect("events:my_events")
+
+    if blockers:
+        logfire.info(
+            "Squad invite join blocked by event signup requirements",
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+            blockers=blockers,
+        )
+        messages.error(request, f"You can't join {squad.name} yet: this event requires {requirement_phrase(blockers)}.")
+        return redirect("events:squad_invite", token=token)
+
+    # Enforce the squad's gender and category requirements before joining
+    rider_zr = ""
+    rider_zwift_cat = ""
+    rider_womens_cat = ""
+    if request.user.zwid:
+        zr = ZRRider.objects.filter(zwid=request.user.zwid).first()
+        rider_zr = getattr(zr, "race_current_category", "") or "" if zr else ""
+        zp = ZPTeamRiders.objects.filter(zwid=request.user.zwid).first()
+        if zp:
+            rider_zwift_cat = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp.div else ""
+            rider_womens_cat = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp.divw else ""
+    for ok, reason in (
+        squad.check_gender_eligibility(request.user.gender),
+        squad.check_zwift_eligibility(rider_zwift_cat),
+        squad.check_womens_zwift_eligibility(rider_womens_cat),
+        squad.check_zr_eligibility(rider_zr),
+        squad.check_zauth_eligibility(request.user.is_zauth_verified),
+        squad.check_zftp_eligibility(request.user.z_ftp, request.user.z_ftp_wkg),
+        squad.check_zmap_eligibility(request.user.z_map, request.user.z_map_wkg),
+    ):
+        if ok:
+            continue
+        logfire.info(
+            "Squad invite join blocked by squad requirements",
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+            rider_zr_category=rider_zr,
+            rider_gender=request.user.gender,
+            reason=reason,
+        )
+        messages.error(request, f"You can't join {squad.name}: {reason}.")
+        return redirect("events:squad_invite", token=token)
+
+    # Ensure event signup exists and is active
+    signup, created = EventSignup.objects.get_or_create(
+        event=event,
+        user=request.user,
+        defaults={"status": EventSignup.Status.REGISTERED},
+    )
+    if not created and signup.status == EventSignup.Status.WITHDRAWN:
+        signup.status = EventSignup.Status.REGISTERED
+        signup.save(update_fields=["status"])
+
+    # Add or upgrade squad membership
+    _sm, sm_created = SquadMember.objects.update_or_create(
+        squad=squad,
+        user=request.user,
+        defaults={"status": SquadMember.Status.MEMBER},
+    )
+    signup_status.clear_waiting(event, request.user)
+
+    if sm_created:
+        logfire.info(
+            "User joined squad via invite link",
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+        )
+        messages.success(request, f"You've been added to squad {squad.name}!")
+    else:
+        logfire.info(
+            "User used invite link but already in squad",
+            squad_id=squad.pk,
+            event_id=event.pk,
+            user_id=request.user.id,
+        )
+        messages.info(request, f"You're already a member of squad {squad.name}.")
+
+    # Auto-assign Discord roles if the user has a linked Discord account
+    if request.user.discord_id:
+        roles_updated = dict(request.user.discord_roles or {})
+        roles_to_assign = []
+        if event.event_role and not request.user.has_discord_role(event.event_role):
+            roles_to_assign.append((str(event.event_role), "Event Role"))
+        if squad.team_discord_role and not request.user.has_discord_role(squad.team_discord_role):
+            roles_to_assign.append((str(squad.team_discord_role), squad.name))
+        if squad.region_role and not request.user.has_discord_role(squad.region_role):
+            from apps.team.models import DiscordRole
+
+            region_role_name = (
+                DiscordRole.objects.filter(role_id=str(squad.region_role)).values_list("name", flat=True).first()
+                or f"Region role {squad.region_role}"
+            )
+            roles_to_assign.append((str(squad.region_role), region_role_name))
+
+        for role_id_str, role_label in roles_to_assign:
+            success = add_discord_role(request.user.discord_id, role_id_str)
+            if success:
+                roles_updated[role_id_str] = role_label
+                logfire.info(
+                    "Discord role auto-assigned via squad invite",
+                    event_id=event.pk,
+                    squad_id=squad.pk,
+                    user_id=request.user.id,
+                    role_id=role_id_str,
+                    role_label=role_label,
+                )
+            else:
+                logfire.error(
+                    "Failed to auto-assign Discord role via squad invite",
+                    event_id=event.pk,
+                    squad_id=squad.pk,
+                    user_id=request.user.id,
+                    role_id=role_id_str,
+                )
+                messages.warning(request, f"Could not assign Discord role: {role_label}. Contact an admin.")
+
+        if roles_to_assign:
+            request.user.discord_roles = roles_updated
+            request.user.save(update_fields=["discord_roles"])
+
+    return redirect("events:my_events")
+
+
+@login_required
+@require_POST
+def squad_regenerate_token_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Generate or regenerate an invite token for a squad.
+
+    Allowed for the squad's captain / vice-captain (and full squad managers),
+    matching the squad-availability permission.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+        squad_pk: The squad primary key.
+
+    Returns:
+        Redirect to squad manage page.
+
+    """
+    squad = get_object_or_404(Squad, pk=squad_pk, event_id=event_pk)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized squad invite generation",
+            squad_id=squad_pk,
+            event_id=event_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage this squad.")
+        return redirect("events:squad_manage", event_pk=event_pk)
+
+    squad.regenerate_invite_token()
+    logfire.info(
+        "Squad invite token regenerated",
+        squad_id=squad.pk,
+        event_id=event_pk,
+        admin_user_id=request.user.id,
+    )
+    messages.success(request, f"Invite link for {squad.name} has been generated.")
+    return redirect("events:squad_manage", event_pk=event_pk)
+
+
+@require_GET
+@login_required
+@team_member_required()
+def squad_add_riders_view(request: HttpRequest, event_pk: int, squad_pk: int) -> HttpResponse:
+    """Full-page rider picker for one squad, with the same filters as the assign page.
+
+    The dropdown on the manage page is fine for "add the rider I already have in mind",
+    but it cannot express "answered Tuesday and sits in this power band". This page can,
+    and is scoped to a single squad so a captain can use it: the gate is
+    ``_can_manage_squad_availability``, the same one that governs the rest of managing
+    their own squad. It deliberately does not reuse the admin assign page, which is
+    ``event_admin``-only and shows every squad at once.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad being filled.
+
+    Returns:
+        The rendered page, or a redirect when the user may not manage this squad.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        logfire.warning(
+            "Unauthorized squad add-riders access",
+            event_id=event_pk,
+            squad_id=squad_pk,
+            user_id=request.user.id,
+        )
+        messages.error(request, "You don't have permission to manage this squad.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    member_ids = set(
+        SquadMember.objects.filter(squad=squad, status=SquadMember.Status.MEMBER).values_list(
+            "user_id", flat=True
+        )
+    )
+    registered = [
+        s
+        for s in EventSignup.objects.filter(
+            event=event, status=EventSignup.Status.REGISTERED
+        ).select_related("user")
+        if s.user_id not in member_ids
+    ]
+    # Riders who have left the team's Discord server cannot be added (squad_assign_view
+    # refuses them), so they are left out of the list and counted under it instead.
+    departed = signup_status.departed_user_ids(s.user for s in registered)
+    signups = [s for s in registered if s.user_id not in departed]
+    _mark_eligibility(squad, signups, _rider_categories(signups))
+    enriched = _enrich_signups(signups, event=event)
+    status_counts = signup_status.bucket_counts(enriched)
+    # The riders waiting for a squad in this squad's timezone: the reason a new squad is
+    # often made, so the page names them above the list.
+    waiting_here = (
+        [
+            e
+            for e in enriched
+            if e["bucket"] == signup_status.WAITING and squad.squad_timezone in (e["signup"].signup_timezone or [])
+        ]
+        if squad.squad_timezone
+        else []
+    )
+    for entry in waiting_here:
+        entry["waiting_here"] = True
+
+    # Facets are gated on managing this squad, same as the page: the payload carries
+    # every listed rider's answers, so it must not outrun the permission to see them.
+    signup_questions = list(event.signup_questions.order_by("order", "pk"))
+
+    # Per-rider answers for the checklist popover. Resolved server-side with the same
+    # helper the event page uses, so a question type is formatted one way in the app
+    # rather than two, and admin-authored labels keep their markdown.
+    if signup_questions:
+        by_signup = {s.pk: s for s in signups}
+        for entry in enriched:
+            signup = by_signup.get(entry["signup"].pk)
+            entry["custom_answers"] = resolve_signup_answers(signup, signup_questions) if signup else []
+    answer_facets = build_facets(signup_questions, signups) if signup_questions else []
+    answer_payload = answers_payload(signups, signup_questions) if signup_questions else {}
+
+    logfire.info(
+        "Squad add-riders page viewed",
+        event_id=event_pk,
+        squad_id=squad_pk,
+        user_id=request.user.id,
+        candidates=len(enriched),
+    )
+    return render(
+        request,
+        "events/squad_add_riders.html",
+        {
+            "event": event,
+            "squad": squad,
+            "enriched_signups": enriched,
+            "signup_timezones": sorted(
+                {tz for e in enriched for tz in (e["signup"].signup_timezone or [])}
+            ),
+            "signup_questions": signup_questions,
+            # Driven from the canonical order rather than hardcoded in the template:
+            # these are vELO tiers (Diamond..Copper), and both rider pickers previously
+            # offered A-E, which matches no stored value at all.
+            "zr_categories": ZR_CATEGORY_ORDER,
+            "answer_facets": answer_facets,
+            "answer_payload": answer_payload,
+            "answer_panel_open": panel_starts_open(signup_questions) if signup_questions else False,
+            "answer_facets_table": "add-riders",
+            "status_counts": status_counts,
+            "taking_part_count": sum(c["count"] for c in status_counts if c["key"] in signup_status.TAKING_PART),
+            "waiting_here": waiting_here,
+            "left_count": len(departed),
+            "withdrawn_count": EventSignup.objects.filter(event=event, status=EventSignup.Status.WITHDRAWN).count(),
+        },
+    )
+
+
+@require_GET
+@login_required
+@discord_permission_required("event_admin", raise_exception=True)
+def squad_assign_page_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Dedicated two-column page for assigning signups to squads.
+
+    Left column shows enriched signups with inline assignment controls.
+    Right column shows squad panels with current member lists.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The event primary key.
+
+    Returns:
+        Rendered squad assignment page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    signups = event.signups.select_related("user").all()
+    enriched_signups = _enrich_signups(signups, event=event)
+    squads = list(
+        event.squads.prefetch_related("captains", "vice_captains")
+        .annotate(member_count=Count("squad_members"))
+        .order_by("name")
+    )
+    squad_members_data = _enrich_squad_members(event) if squads else {}
+
+    # Map user_id -> signup pk so squad panels can build remove forms
+    signup_by_user = {s.user_id: s.pk for s in signups}
+    for members in squad_members_data.values():
+        for member in members:
+            member["signup_id"] = signup_by_user.get(member["user"].pk)
+
+    # Resolve Discord role names for event and squads
+    event.event_role_name = _annotate_squad_role_names(squads, event=event)
+    for squad in squads:
+        squad.enriched_members = squad_members_data.get(squad.pk, [])
+
+    # Distinct filter option values (derived from already-loaded data, no extra queries).
+    # signup_timezone is a JSON list (riders may pick several), so flatten the union.
+    signup_timezones = sorted(
+        {tz for e in enriched_signups for tz in (e["signup"].signup_timezone or [])}
+    )
+    squad_timezones = sorted({s.squad_timezone for s in squads if s.squad_timezone})
+    squad_genders = sorted({s.gender for s in squads if s.gender})
+
+    # Freshest zFTP/zMAP mirror behind this page. Shown so a stopped db_worker reads as
+    # a stale timestamp rather than as riders quietly failing the power bounds.
+    metrics_updated_at = max(
+        (e["user"].z_metrics_updated_at for e in enriched_signups if e["user"].z_metrics_updated_at),
+        default=None,
+    )
+
+    is_event_admin = request.user.is_event_admin or request.user.is_superuser
+    # The status filter starts on the riders squads are still filled from; the rest are
+    # counted in a line under it, so nobody wonders where they went.
+    status_counts = signup_status.bucket_counts(enriched_signups)
+    logfire.debug("Squad assign page viewed", user_id=request.user.id, event_id=event_pk)
+    return render(
+        request,
+        "events/squad_assign.html",
+        {
+            "event": event,
+            "enriched_signups": enriched_signups,
+            "squads": squads,
+            "is_event_admin": is_event_admin,
+            "signup_timezones": signup_timezones,
+            "squad_timezones": squad_timezones,
+            "squad_genders": squad_genders,
+            "zr_categories": ZR_CATEGORY_ORDER,
+            "metrics_updated_at": metrics_updated_at,
+            "status_counts": status_counts,
+            "taking_part_count": sum(c["count"] for c in status_counts if c["key"] in signup_status.TAKING_PART),
+            "status_hidden": [c for c in status_counts if c["key"] not in signup_status.TAKING_PART],
+            "can_set_status": _can_manage_event_squads(request.user, event),
+            "status_next": reverse("events:squad_assign_page", args=[event.pk]),
+        },
+    )
+
+
+def _extract_thread_id(thread_link: str) -> str | None:
+    """Pull the thread (channel) id from a Discord thread URL.
+
+    Discord stores thread/channel URLs as ``https://discord.com/channels/{guild_id}/{thread_id}``.
+    The Discord messages API treats the thread id the same as a channel id.
+
+    Args:
+        thread_link: A Discord thread URL.
+
+    Returns:
+        The thread id as a string of digits, or None if the link can't be parsed.
+
+    """
+    if not thread_link:
+        return None
+    candidate = thread_link.rstrip("/").rsplit("/", 1)[-1]
+    return candidate if candidate.isdigit() else None
+
+
+def _set_slot_substitutes(selection: AvailabilitySlotSelection, request: HttpRequest) -> None:
+    """Set a slot selection's substitutes M2M from the posted ``substitutes`` checkboxes.
+
+    Args:
+        selection: The slot selection to update.
+        request: The request whose POST holds the selected substitute user PKs.
+
+    """
+    sub_ids = request.POST.getlist("substitutes")
+    selection.substitutes.set(User.objects.filter(pk__in=sub_ids))
+
+
+def _powerup_choices() -> list[tuple[str, str]]:
+    """Return ``(slug, label)`` choices for the scheduled-race power-up picker.
+
+    Sourced from the active ``ttt_planner.PowerUp`` records, in display order.
+    Excluded-from-ladder power-ups get an " (excluded)" suffix on their label.
+
+    Returns:
+        A list of ``(slug, label)`` tuples.
+
+    """
+    from apps.ttt_planner.models import PowerUp  # local import avoids a cross-app import cycle
+
+    choices = []
+    for p in PowerUp.objects.filter(is_active=True):
+        label = f"{p.name} (excluded)" if p.excluded_from_ladder else p.name
+        choices.append((p.slug, label))
+    return choices
+
+
+def _parse_slot_race_details(request: HttpRequest) -> dict:
+    """Parse the optional ``laps``, ``custom_finish_km`` and ``powerups`` slot fields.
+
+    All are optional; blank or unparseable scalar values become ``None`` so they
+    clear any previously-stored value. ``powerups`` is filtered against the valid
+    ``PowerUp`` slugs and returned in their configured display order.
+
+    Args:
+        request: The request whose POST holds the slot form payload.
+
+    Returns:
+        Dict with ``laps`` (int or None), ``custom_finish_km`` (Decimal or None),
+        and ``powerups`` (list of valid power-up slugs).
+
+    """
+    from apps.ttt_planner.models import PowerUp  # local import avoids a cross-app import cycle
+
+    laps_raw = request.POST.get("laps", "").strip()
+    finish_raw = request.POST.get("custom_finish_km", "").strip()
+    try:
+        laps = int(laps_raw) if laps_raw else None
+    except ValueError:
+        laps = None
+    if laps is not None and laps < 0:
+        laps = None
+    try:
+        custom_finish_km = Decimal(finish_raw) if finish_raw else None
+    except (InvalidOperation, ValueError):
+        custom_finish_km = None
+    if custom_finish_km is not None and custom_finish_km < 0:
+        custom_finish_km = None
+    posted = set(request.POST.getlist("powerups"))
+    powerups = list(PowerUp.objects.filter(is_active=True, slug__in=posted).values_list("slug", flat=True))
+    return {"laps": laps, "custom_finish_km": custom_finish_km, "powerups": powerups}
+
+
+@require_GET
+def race_calendar_ics_view(request: HttpRequest, token: str) -> HttpResponse:
+    """Serve a scheduled race as a downloadable .ics calendar invite.
+
+    Public on purpose: the ``token`` is an unguessable signed value, so a team
+    member can add the race to their calendar straight from a Discord thread
+    without logging in.
+
+    Args:
+        request: The HTTP request.
+        token: Signed token encoding the race primary key.
+
+    Returns:
+        A ``text/calendar`` response.
+
+    Raises:
+        Http404: If the token is invalid or the race no longer exists.
+
+    """
+    pk = unsign_race_token(token)
+    if pk is None:
+        raise Http404("Invalid calendar link.")
+    selection = get_object_or_404(
+        AvailabilitySlotSelection.objects.select_related("grid", "grid__squad"), pk=pk
+    )
+    response = HttpResponse(build_race_ics(selection), content_type="text/calendar; charset=utf-8")
+    response["Content-Disposition"] = f'attachment; filename="race-{selection.pk}.ics"'
+    return response
+
+
+def _build_slot_thread_message(
+    selection: AvailabilitySlotSelection,
+    *,
+    header: str | None = None,
+    request: HttpRequest | None = None,
+) -> tuple[str, list[str]]:
+    """Build the Discord message body for a scheduled race thread.
+
+    Used for both the starter message when a thread is created and for "updated"
+    messages posted later. The body uses Discord's native timestamp markdown so
+    each viewer sees the date/time in their own client timezone. Selected
+    riders are pinged on one line, followed directly by the substitute (if
+    set); the squad's captain and vice captain are appended below in their own
+    block. All three role mentions are added to the mention list so they are
+    notified even when not in the racing checkboxes.
+
+    Args:
+        selection: The slot selection record.
+        header: Optional first line (e.g. "**🔄 Race details updated**").
+        request: Current request, used to build absolute calendar links. When
+            omitted, the "Add to calendar" line is skipped.
+
+    Returns:
+        Tuple of (message body, deduped list of Discord IDs to mention).
+
+    """
+    utc_dt = datetime.combine(
+        selection.slot_date,
+        datetime.strptime(selection.slot_time, "%H:%M").time(),  # noqa: DTZ007  # clock-only parse, no date used
+        tzinfo=ZoneInfo("UTC"),
+    )
+    unix_ts = int(utc_dt.timestamp())
+    rider_discord_ids = [u.discord_id for u in selection.selected_users.all() if u.discord_id]
+    mentions = " ".join(f"<@{did}>" for did in rider_discord_ids)
+
+    squad = selection.grid.squad
+    captains = list(squad.captains.all())
+    vice_captains = list(squad.vice_captains.all())
+    captain_dids = [c.discord_id for c in captains if c.discord_id]
+    vice_captain_dids = [vc.discord_id for vc in vice_captains if vc.discord_id]
+    substitute_dids = [s.discord_id for s in selection.substitutes.all() if s.discord_id]
+    ds_dids = [d.discord_id for d in selection.directeurs_sportifs.all() if d.discord_id]
+
+    lines: list[str] = []
+    if header:
+        lines.append(header)
+    lines.extend(
+        [
+            f"**{selection.name}**",
+            f"<t:{unix_ts}:F> (<t:{unix_ts}:R>)",
+            f"**Status:** {selection.get_status_display()}",
+        ]
+    )
+    if selection.opponent:
+        lines.append(f"**Opponent:** {selection.opponent}")
+    if selection.event_invite_url:
+        lines.append(f"**Event invite:** {selection.event_invite_url}")
+    if selection.course_url:
+        lines.append(f"**Course:** {selection.course_url}")
+    if selection.laps:
+        lines.append(f"**Laps:** {selection.laps}")
+    if selection.custom_finish_km:
+        lines.append(f"**Custom finish:** {selection.custom_finish_km:g} km")
+    powerup_objects = selection.powerup_objects
+    if powerup_objects:
+        # Prefix each with its Discord custom-emoji code when one is configured.
+        rendered = [f"{p.discord_emoji} {p.name}".strip() for p in powerup_objects]
+        lines.append(f"**Power-ups:** {', '.join(rendered)}")
+    if mentions or substitute_dids:
+        lines.append("")
+        if mentions:
+            lines.append(mentions)
+        if substitute_dids:
+            label = "SUB" if len(substitute_dids) == 1 else "SUBS"
+            lines.append(f"**{label}:** " + " ".join(f"<@{did}>" for did in substitute_dids))
+    if captain_dids or vice_captain_dids:
+        lines.append("")
+        if captain_dids:
+            label = "Captain" if len(captain_dids) == 1 else "Captains"
+            lines.append(f"**{label}:** " + " ".join(f"<@{did}>" for did in captain_dids))
+        if vice_captain_dids:
+            label = "Vice Captain" if len(vice_captain_dids) == 1 else "Vice Captains"
+            lines.append(f"**{label}:** " + " ".join(f"<@{did}>" for did in vice_captain_dids))
+    if ds_dids:
+        lines.append("")
+        label = "DS" if len(ds_dids) == 1 else "DSs"
+        lines.append(f"🎽 **{label}:** " + " ".join(f"<@{did}>" for did in ds_dids))
+
+    if request is not None:
+        cal = race_calendar_urls(selection, request)
+        # Masked markdown links keep the long URLs out of the visible text and
+        # suppress Discord's link previews. Discord renders masked links in
+        # message content for messages sent by bots/apps (as these are).
+        lines.append("")
+        lines.append(f"📅 **Add to calendar:** [Google Calendar]({cal['gcal_url']}) · [iCal]({cal['ics_url']})")
+
+    # Discord IDs to include in allowed_user_ids — dedup while preserving order
+    # so captains/vice-captains/substitutes actually get pinged even if they aren't racing.
+    seen: set[str] = set()
+    discord_ids: list[str] = []
+    for did in (*rider_discord_ids, *substitute_dids, *captain_dids, *vice_captain_dids, *ds_dids):
+        if did and did not in seen:
+            seen.add(did)
+            discord_ids.append(did)
+    return "\n".join(lines), discord_ids
+
+
+def _slot_thread_name(selection: AvailabilitySlotSelection, grid: AvailabilityGrid) -> str:
+    """Build the Discord thread name for a scheduled race.
+
+    Format is ``"{race name} {Mon D}"`` where the date is rendered in the grid's
+    local timezone. Used both when creating a thread and when renaming an
+    existing one so the two stay consistent.
+
+    Args:
+        selection: The slot selection record.
+        grid: The parent availability grid (provides the display timezone).
+
+    Returns:
+        The thread name string (not yet truncated; Discord truncates to 100).
+
+    """
+    utc_dt = datetime.combine(
+        selection.slot_date,
+        datetime.strptime(selection.slot_time, "%H:%M").time(),  # noqa: DTZ007  # clock-only parse, no date used
+        tzinfo=ZoneInfo("UTC"),
+    )
+    try:
+        grid_tz = ZoneInfo(grid.grid_timezone) if grid.grid_timezone else ZoneInfo("UTC")
+    except Exception:
+        grid_tz = ZoneInfo("UTC")
+    grid_local_dt = utc_dt.astimezone(grid_tz)
+    return f"{selection.name} {grid_local_dt.strftime('%b %-d')}"
+
+
+def _create_slot_thread(
+    selection: AvailabilitySlotSelection,
+    squad: Squad,
+    grid: AvailabilityGrid,
+    user: User,
+    request: HttpRequest | None = None,
+) -> str | None:
+    """Create the Discord thread for a confirmed scheduled race.
+
+    Validates the same prerequisites the standalone endpoint enforces (confirmed
+    status, riders selected, squad channel, guild configured, no existing thread),
+    posts the starter message, and persists the resulting thread URL onto the
+    selection.
+
+    Args:
+        selection: The slot selection record (must be persisted).
+        squad: The parent squad.
+        grid: The parent availability grid.
+        user: The acting user (recorded in logs).
+        request: Current request, forwarded so the starter message can include
+            absolute calendar links.
+
+    Returns:
+        None on success, or an error message string suitable for displaying to
+        the admin.
+
+    """
+    if selection.thread_link:
+        return "A thread already exists for this race."
+    if not squad.discord_channel_id:
+        return "Squad has no Discord channel configured."
+    if selection.status != AvailabilitySlotSelection.Status.CONFIRMED:
+        return "Race status must be Confirmed before creating a thread."
+    if not selection.selected_users.exists():
+        return "Select at least one rider before creating a thread."
+
+    guild_id = config.GUILD_ID
+    if not guild_id:
+        return "Discord guild is not configured."
+
+    thread_name = _slot_thread_name(selection, grid)
+
+    message_body, discord_ids = _build_slot_thread_message(selection, request=request)
+
+    thread_id, error = create_discord_thread(squad.discord_channel_id, thread_name)
+    if thread_id is None:
+        logfire.error(
+            "Failed to create Discord thread for scheduled race",
+            selection_id=selection.pk,
+            channel_id=str(squad.discord_channel_id),
+            error=error,
+        )
+        return f"Failed to create thread: {error}"
+
+    posted = send_discord_channel_message(
+        thread_id,
+        message_body,
+        allowed_user_ids=discord_ids or None,
+    )
+    if not posted:
+        logfire.warning(
+            "Discord thread created but starter message failed to post",
+            selection_id=selection.pk,
+            thread_id=str(thread_id),
+        )
+
+    selection.thread_link = f"https://discord.com/channels/{guild_id}/{thread_id}"
+    selection.save(update_fields=["thread_link", "updated_at"])
+
+    logfire.info(
+        "Scheduled race Discord thread created",
+        selection_id=selection.pk,
+        thread_id=str(thread_id),
+        channel_id=str(squad.discord_channel_id),
+        mention_count=len(discord_ids),
+        user_id=user.id,
+    )
+    return None
+
+
+def _post_slot_thread_update(
+    selection: AvailabilitySlotSelection, user: User, request: HttpRequest | None = None
+) -> str | None:
+    """Post an "updated" message to the existing thread for a scheduled race.
+
+    Args:
+        selection: The slot selection record (must already have ``thread_link`` set).
+        user: The acting user (recorded in logs).
+        request: Current request, forwarded so the update message can include
+            absolute calendar links.
+
+    Returns:
+        None on success, or an error message string.
+
+    """
+    thread_id = _extract_thread_id(selection.thread_link or "")
+    if not thread_id:
+        return "Could not determine the Discord thread id from the saved link."
+
+    message_body, discord_ids = _build_slot_thread_message(
+        selection, header="**🔄 Race details updated**", request=request
+    )
+    posted = send_discord_channel_message(
+        thread_id,
+        message_body,
+        allowed_user_ids=discord_ids or None,
+    )
+    if not posted:
+        logfire.error(
+            "Failed to post update message to scheduled race thread",
+            selection_id=selection.pk,
+            thread_id=thread_id,
+        )
+        return "Failed to post update message to the thread."
+
+    logfire.info(
+        "Scheduled race update posted to thread",
+        selection_id=selection.pk,
+        thread_id=thread_id,
+        mention_count=len(discord_ids),
+        user_id=user.id,
+    )
+    return None
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_create_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str
+) -> HttpResponse:
+    """Create or update an availability slot selection for a specific cell.
+
+    When ``create_thread=1`` is included in the POST body, the view also creates
+    the Discord thread immediately after persisting the slot. This powers the
+    "Save & Create Thread" button on new (unsaved) cells.
+
+    Args:
+        request: The HTTP request with name, slot_date, slot_time, selected_users[].
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 when
+        ``create_thread`` is requested but thread creation fails.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    name = request.POST.get("name", "").strip()
+    slot_date = request.POST.get("slot_date", "")
+    slot_time = request.POST.get("slot_time", "")
+    opponent = request.POST.get("opponent", "").strip()
+    event_invite_url = request.POST.get("event_invite_url", "").strip()
+    course_url = request.POST.get("course_url", "").strip()
+    thread_link = request.POST.get("thread_link", "").strip()
+    raw_status = request.POST.get("status", AvailabilitySlotSelection.Status.NONE)
+    valid_statuses = {s.value for s in AvailabilitySlotSelection.Status}
+    status = raw_status if raw_status in valid_statuses else AvailabilitySlotSelection.Status.NONE
+    selected_user_ids = request.POST.getlist("selected_users")
+    also_create_thread = request.POST.get("create_thread") == "1"
+    race_details = _parse_slot_race_details(request)
+
+    if not name or not slot_date or not slot_time:
+        return HttpResponse("Name, date, and time are required.", status=400)
+
+    # Parsed here rather than handed to the ORM as the string it arrives as. Django converts
+    # it on the way INTO the database, but Model.__init__ does not touch the attribute -- so
+    # on update_or_create's CREATE branch the row is right while the instance it returns still
+    # holds a str, and the first thing to do date arithmetic on it raises. That was a live 500:
+    # "Save & Create Thread" on a new cell reached _slot_thread_name with a string slot_date,
+    # while the UPDATE branch, which re-reads the row, was fine. Parsing also closes the hole
+    # the emptiness check above leaves: "2026-02-31" is truthy, and without this it reaches the
+    # database driver and 500s there instead of being refused here.
+    try:
+        slot_date = date.fromisoformat(slot_date)
+    except ValueError:
+        return HttpResponse("Date must be in YYYY-MM-DD format.", status=400)
+
+    selection, created = AvailabilitySlotSelection.objects.update_or_create(
+        grid=grid,
+        slot_date=slot_date,
+        slot_time=slot_time,
+        defaults={
+            "name": name,
+            "status": status,
+            "opponent": opponent,
+            "event_invite_url": event_invite_url,
+            "course_url": course_url,
+            "thread_link": thread_link,
+            "laps": race_details["laps"],
+            "custom_finish_km": race_details["custom_finish_km"],
+            "powerups": race_details["powerups"],
+            "created_by": request.user,
+        },
+    )
+    selection.selected_users.set(User.objects.filter(pk__in=selected_user_ids))
+    _set_slot_substitutes(selection, request)
+
+    logfire.info(
+        "Slot selection created" if created else "Slot selection updated",
+        grid_id=str(grid.id),
+        selection_id=selection.pk,
+        slot_date=slot_date,
+        slot_time=slot_time,
+        user_id=request.user.id,
+        selected_count=len(selected_user_ids),
+    )
+
+    if also_create_thread and not selection.thread_link:
+        error = _create_slot_thread(selection, squad, grid, request.user, request=request)
+        if error:
+            return HttpResponse(error, status=400)
+
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_update_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Update an existing slot selection's name and selected users.
+
+    Args:
+        request: The HTTP request with name, selected_users[].
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    name = request.POST.get("name", "").strip()
+    opponent = request.POST.get("opponent", "").strip()
+    event_invite_url = request.POST.get("event_invite_url", "").strip()
+    course_url = request.POST.get("course_url", "").strip()
+    thread_link = request.POST.get("thread_link", "").strip()
+    raw_status = request.POST.get("status", selection.status)
+    valid_statuses = {s.value for s in AvailabilitySlotSelection.Status}
+    status = raw_status if raw_status in valid_statuses else selection.status
+    selected_user_ids = request.POST.getlist("selected_users")
+
+    if not name:
+        return HttpResponse("Name is required.", status=400)
+
+    race_details = _parse_slot_race_details(request)
+    selection.name = name
+    selection.status = status
+    selection.opponent = opponent
+    selection.event_invite_url = event_invite_url
+    selection.course_url = course_url
+    selection.thread_link = thread_link
+    selection.laps = race_details["laps"]
+    selection.custom_finish_km = race_details["custom_finish_km"]
+    selection.powerups = race_details["powerups"]
+    selection.save(
+        update_fields=[
+            "name",
+            "status",
+            "opponent",
+            "event_invite_url",
+            "course_url",
+            "thread_link",
+            "laps",
+            "custom_finish_km",
+            "powerups",
+            "updated_at",
+        ]
+    )
+    selection.selected_users.set(User.objects.filter(pk__in=selected_user_ids))
+    _set_slot_substitutes(selection, request)
+
+    logfire.info(
+        "Slot selection updated",
+        grid_id=str(grid.id),
+        selection_id=selection.pk,
+        user_id=request.user.id,
+        selected_count=len(selected_user_ids),
+    )
+
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_delete_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Delete a slot selection.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    logfire.info(
+        "Slot selection deleted",
+        grid_id=str(grid.id),
+        selection_id=selection.pk,
+        slot_date=str(selection.slot_date),
+        slot_time=selection.slot_time,
+        user_id=request.user.id,
+    )
+    selection.delete()
+
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_create_thread_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Create a Discord thread in the squad's channel for a confirmed scheduled race.
+
+    Posts a starting message that names the race, lists the date/time, and @-mentions
+    the selected riders. Saves the resulting thread URL onto the slot selection.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 with an error
+        message if validation fails or the Discord API call errors out.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    # Persist any unsaved edits from the modal before reading state below.
+    # The button posts the full form so the user does not have to "Save Race"
+    # before "Create Discord Thread".
+    posted_name = request.POST.get("name", "").strip()
+    if posted_name:
+        valid_statuses = {s.value for s in AvailabilitySlotSelection.Status}
+        raw_status = request.POST.get("status", selection.status)
+        new_status = raw_status if raw_status in valid_statuses else selection.status
+        race_details = _parse_slot_race_details(request)
+        selection.name = posted_name
+        selection.status = new_status
+        selection.opponent = request.POST.get("opponent", "").strip()
+        selection.event_invite_url = request.POST.get("event_invite_url", "").strip()
+        selection.course_url = request.POST.get("course_url", "").strip()
+        selection.laps = race_details["laps"]
+        selection.custom_finish_km = race_details["custom_finish_km"]
+        selection.powerups = race_details["powerups"]
+        # thread_link is intentionally NOT overwritten here — it's set below
+        # once the thread is created. Letting the form's stale value land would
+        # break the idempotence guard on the next click.
+        selection.save(
+            update_fields=[
+                "name",
+                "status",
+                "opponent",
+                "event_invite_url",
+                "course_url",
+                "laps",
+                "custom_finish_km",
+                "powerups",
+                "updated_at",
+            ]
+        )
+        if "selected_users" in request.POST:
+            selected_user_ids = request.POST.getlist("selected_users")
+            selection.selected_users.set(User.objects.filter(pk__in=selected_user_ids))
+        if "substitutes" in request.POST:
+            _set_slot_substitutes(selection, request)
+
+    error = _create_slot_thread(selection, squad, grid, request.user, request=request)
+    if error:
+        return HttpResponse(error, status=400)
+
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_post_update_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Persist edits to a scheduled race and post an update message to its thread.
+
+    Powers the "Save & Post Update" button on existing slots that already have a
+    Discord thread. Saves the form values the same way ``slot_selection_update_view``
+    does, then posts a Discord message into the thread summarizing the latest details.
+
+    Args:
+        request: The HTTP request with the full slot form payload.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 if validation
+        fails or the Discord post errors out.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    if not selection.thread_link:
+        return HttpResponse("This race has no Discord thread yet — create one first.", status=400)
+
+    name = request.POST.get("name", "").strip()
+    if not name:
+        return HttpResponse("Name is required.", status=400)
+
+    valid_statuses = {s.value for s in AvailabilitySlotSelection.Status}
+    raw_status = request.POST.get("status", selection.status)
+    status = raw_status if raw_status in valid_statuses else selection.status
+
+    race_details = _parse_slot_race_details(request)
+    selection.name = name
+    selection.status = status
+    selection.opponent = request.POST.get("opponent", "").strip()
+    selection.event_invite_url = request.POST.get("event_invite_url", "").strip()
+    selection.course_url = request.POST.get("course_url", "").strip()
+    selection.laps = race_details["laps"]
+    selection.custom_finish_km = race_details["custom_finish_km"]
+    selection.powerups = race_details["powerups"]
+    # thread_link is preserved — the form value can be stale, but the saved one
+    # is what we trust for posting back into the thread.
+    selection.save(
+        update_fields=[
+            "name",
+            "status",
+            "opponent",
+            "event_invite_url",
+            "course_url",
+            "laps",
+            "custom_finish_km",
+            "powerups",
+            "updated_at",
+        ]
+    )
+    if "selected_users" in request.POST:
+        selected_user_ids = request.POST.getlist("selected_users")
+        selection.selected_users.set(User.objects.filter(pk__in=selected_user_ids))
+    if "substitutes" in request.POST:
+        _set_slot_substitutes(selection, request)
+
+    error = _post_slot_thread_update(selection, request.user, request=request)
+    if error:
+        return HttpResponse(error, status=400)
+
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_rename_thread_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Rename the Discord thread for a scheduled race to match its current name.
+
+    Persists the posted race name first (so a just-edited name is reflected),
+    then renames the thread to ``"{race name} {Mon D}"``. Skips the Discord call
+    when the name is unchanged to avoid burning Discord's rename rate limit.
+
+    Args:
+        request: The HTTP request with the slot form payload (``name`` is used).
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 on error.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    if not selection.thread_link:
+        return HttpResponse("This race has no Discord thread yet — create one first.", status=400)
+
+    thread_id = _extract_thread_id(selection.thread_link)
+    if not thread_id:
+        return HttpResponse("Could not determine the Discord thread id from the saved link.", status=400)
+
+    name = request.POST.get("name", "").strip()
+    if not name:
+        return HttpResponse("Name is required.", status=400)
+
+    old_name = _slot_thread_name(selection, grid)
+    if name != selection.name:
+        selection.name = name
+        selection.save(update_fields=["name", "updated_at"])
+    new_name = _slot_thread_name(selection, grid)
+
+    if new_name == old_name:
+        # Nothing to rename — avoid spending the Discord rename rate limit.
+        return _render_slot_selections_partial(request, event, squad, grid)
+
+    ok, error = rename_discord_thread(thread_id, new_name)
+    if not ok:
+        logfire.error(
+            "Failed to rename scheduled race Discord thread",
+            selection_id=selection.pk,
+            thread_id=thread_id,
+            error=error,
+        )
+        return HttpResponse(f"Failed to rename thread: {error}", status=400)
+
+    logfire.info(
+        "Scheduled race Discord thread renamed",
+        selection_id=selection.pk,
+        thread_id=thread_id,
+        user_id=request.user.id,
+    )
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_archive_thread_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Archive (close) the Discord thread for a scheduled race.
+
+    Archiving is reversible — the thread and its history are preserved and the
+    saved ``thread_link`` is left intact so it keeps working.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 on error.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    thread_id = _extract_thread_id(selection.thread_link or "")
+    if not thread_id:
+        return HttpResponse("This race has no Discord thread to archive.", status=400)
+
+    ok, error = archive_discord_thread(thread_id)
+    if not ok:
+        logfire.error(
+            "Failed to archive scheduled race Discord thread",
+            selection_id=selection.pk,
+            thread_id=thread_id,
+            error=error,
+        )
+        return HttpResponse(f"Failed to archive thread: {error}", status=400)
+
+    logfire.info(
+        "Scheduled race Discord thread archived",
+        selection_id=selection.pk,
+        thread_id=thread_id,
+        user_id=request.user.id,
+    )
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_selection_delete_thread_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Permanently delete the Discord thread for a scheduled race.
+
+    Deletes the thread and clears the saved ``thread_link`` so the slot no longer
+    points at a dead URL. The slot itself is left in place. Irreversible.
+
+    Args:
+        request: The HTTP request.
+        event_pk: The parent event primary key.
+        squad_pk: The squad primary key.
+        grid_pk: The availability grid UUID.
+        slot_pk: The slot selection primary key.
+
+    Returns:
+        HTMX partial with updated slot selections container, or 400 on error.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    thread_id = _extract_thread_id(selection.thread_link or "")
+    if not thread_id:
+        return HttpResponse("This race has no Discord thread to delete.", status=400)
+
+    ok, error = delete_discord_thread(thread_id)
+    if not ok:
+        logfire.error(
+            "Failed to delete scheduled race Discord thread",
+            selection_id=selection.pk,
+            thread_id=thread_id,
+            error=error,
+        )
+        return HttpResponse(f"Failed to delete thread: {error}", status=400)
+
+    selection.thread_link = ""
+    selection.save(update_fields=["thread_link", "updated_at"])
+
+    logfire.info(
+        "Scheduled race Discord thread deleted",
+        selection_id=selection.pk,
+        thread_id=thread_id,
+        user_id=request.user.id,
+    )
+    return _render_slot_selections_partial(request, event, squad, grid)
+
+
+def _enriched_slot_selections(request: HttpRequest, grid: AvailabilityGrid) -> tuple[list[dict], str]:
+    """Build the scheduled-race cards ``_slot_selections_container.html`` renders.
+
+    Shared by the HTMX partial below and the race-series results page, which renders the
+    same container on first load.
+
+    Args:
+        request: The HTTP request, for the viewer's timezone.
+        grid: The availability grid whose races to list.
+
+    Returns:
+        ``(enriched_selections, display_timezone)``.
+
+    """
+    from apps.zwiftpower.models import ZPTeamRiders
+
+    selections = list(grid.slot_selections.prefetch_related("selected_users", "directeurs_sportifs"))
+
+    # Determine display timezone
+    user_tz = getattr(request.user, "timezone", "") or ""
+    display_tz = user_tz or grid.grid_timezone or "UTC"
+
+    # Enrich selected users with ZP/ZR data
+    all_selected_users = set()
+    for sel in selections:
+        all_selected_users.update(sel.selected_users.all())
+    zwids = [u.zwid for u in all_selected_users if u.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    profiles = rider_stats.profiles_by_zwid(zwids)
+
+    enriched_selections = []
+    for sel in selections:
+        enriched_users = []
+        for user in sel.selected_users.all():
+            zp = zp_by_zwid.get(user.zwid)
+            zr = rider_stats.zr_fields(profiles.get(user.zwid) if user.zwid else None, gender=user.gender)
+            zp_cat = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else ""
+            zp_cat_w = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else ""
+            enriched_users.append({
+                "user": user,
+                "display_name": user.get_full_name() or user.discord_username,
+                "zwid": user.zwid,
+                "is_race_ready": user.is_race_ready,
+                "is_extra_verified": user.is_extra_verified,
+                "in_zwiftpower": zp is not None,
+                "zp_category": zp_cat,
+                "zp_category_w": zp_cat_w,
+                **{key: zr[key] for key in rider_stats.TOOLTIP_FIELDS},
+            })
+        # Convert slot time to display timezone
+        from datetime import datetime as dt
+        from zoneinfo import ZoneInfo
+
+        utc_dt = dt.combine(sel.slot_date, dt.strptime(sel.slot_time, "%H:%M").time(), tzinfo=ZoneInfo("UTC"))  # noqa: DTZ007  # clock-only parse, no date used
+        local_dt = utc_dt.astimezone(ZoneInfo(display_tz))
+        ds_list = [
+            {"user": d, "display_name": d.get_full_name() or d.discord_username}
+            for d in sel.directeurs_sportifs.all()
+        ]
+        enriched_selections.append({
+            "selection": sel,
+            "enriched_users": enriched_users,
+            "ds_list": ds_list,
+            "local_date": local_dt.strftime("%Y-%m-%d"),
+            "local_time": local_dt.strftime("%H:%M"),
+            "local_day": local_dt.strftime("%a"),
+        })
+    return enriched_selections, display_tz
+
+
+def _render_slot_selections_partial(
+    request: HttpRequest, event: Event, squad: Squad, grid: AvailabilityGrid
+) -> HttpResponse:
+    """Render the slot selections partial for HTMX responses.
+
+    Args:
+        request: The HTTP request.
+        event: The parent event.
+        squad: The squad.
+        grid: The availability grid.
+
+    Returns:
+        Rendered HTML partial of all slot selection cards.
+
+    """
+    enriched_selections, display_tz = _enriched_slot_selections(request, grid)
+    html = render_to_string(
+        "events/_slot_selections_container.html",
+        {
+            "enriched_selections": enriched_selections,
+            "event": event,
+            "squad": squad,
+            "grid": grid,
+            "is_event_admin": _can_manage_squad_availability(request.user, squad),
+            "display_timezone": display_tz,
+            "schedule_hint": "Use a stage's Lineup button to schedule its race." if grid.is_series else "",
+        },
+        request=request,
+    )
+    return HttpResponse(html)
+
+
+def _render_ds_list(request: HttpRequest, event: Event, squad: Squad, grid: AvailabilityGrid, selection) -> str:
+    """Render the DS chips list partial (target ``#ds-list-<pk>``) for a slot.
+
+    Returns:
+        The rendered ``_slot_ds_list.html`` HTML string.
+
+    """
+    ds_list = [
+        {"user": d, "display_name": d.get_full_name() or d.discord_username}
+        for d in selection.directeurs_sportifs.all()
+    ]
+    return render_to_string(
+        "events/_slot_ds_list.html",
+        {"selection": selection, "ds_list": ds_list, "event": event, "squad": squad, "grid": grid},
+        request=request,
+    )
+
+
+def _post_ds_added_to_thread(selection, ds_user) -> None:
+    """If the race has a Discord thread, post a short note @-mentioning the newly added DS."""
+    if not selection.thread_link or not ds_user.discord_id:
+        return
+    thread_id = selection.thread_link.rstrip("/").split("/")[-1]
+    if not thread_id.isdigit():
+        return
+    name = ds_user.get_full_name() or ds_user.discord_username or "DS"
+    send_discord_channel_message(
+        int(thread_id),
+        f"🎽 **DS added:** <@{ds_user.discord_id}> ({name})",
+        allowed_user_ids=[ds_user.discord_id],
+    )
+
+
+@login_required
+@team_member_required()
+@require_GET
+def slot_ds_search_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int
+) -> HttpResponse:
+    """Datastar: search team members to add as DS, patching the results list for a slot.
+
+    Returns:
+        A Datastar SSE response patching the slot's ``#ds-results-<pk>`` element.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    q = request.GET.get("q", "").strip()
+    results = []
+    if len(q) >= 2:
+        existing = set(selection.directeurs_sportifs.values_list("pk", flat=True))
+        users = (
+            User.objects.filter(
+                Q(first_name__icontains=q)
+                | Q(last_name__icontains=q)
+                | Q(discord_username__icontains=q)
+                | Q(discord_nickname__icontains=q)
+            )
+            .exclude(pk__in=existing)
+            .filter(discord_id__isnull=False)
+            .exclude(discord_id="")
+            .order_by("first_name", "last_name")[:8]
+        )
+        results = [{"user": u, "display_name": u.get_full_name() or u.discord_username} for u in users]
+
+    html = render_to_string(
+        "events/_slot_ds_results.html",
+        {"selection": selection, "results": results, "event": event, "squad": squad, "grid": grid, "query": q},
+        request=request,
+    )
+    return DatastarResponse(ServerSentEventGenerator.patch_elements(html))
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_ds_add_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int, user_id: int
+) -> HttpResponse:
+    """Datastar: add a DS to a race — assign the squad role, mention in the thread, patch the list.
+
+    Returns:
+        A Datastar SSE response patching the slot's DS list and clearing the search results.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    ds_user = get_object_or_404(User, pk=user_id)
+    ds, created = SlotDS.objects.get_or_create(
+        selection=selection, user=ds_user, defaults={"added_by": request.user}
+    )
+    if created:
+        if ds_service.assign_squad_role(ds_user, squad, actor_id=request.user.id):
+            ds.role_was_assigned = True
+            ds.save(update_fields=["role_was_assigned"])
+        _post_ds_added_to_thread(selection, ds_user)
+        logfire.info(
+            "DS added to race",
+            selection_id=selection.pk,
+            ds_user_id=ds_user.id,
+            squad_id=squad.pk,
+            role_assigned=ds.role_was_assigned,
+            admin_user_id=request.user.id,
+        )
+
+    list_html = _render_ds_list(request, event, squad, grid, selection)
+    cleared_results = f'<div id="ds-results-{selection.pk}"></div>'
+
+    def events_gen():
+        yield ServerSentEventGenerator.patch_elements(list_html)
+        yield ServerSentEventGenerator.patch_elements(cleared_results)
+
+    return DatastarResponse(events_gen())
+
+
+@login_required
+@team_member_required()
+@require_POST
+def slot_ds_remove_view(
+    request: HttpRequest, event_pk: int, squad_pk: int, grid_pk: str, slot_pk: int, user_id: int
+) -> HttpResponse:
+    """Datastar: remove a DS from a race — strip the squad role if safe, patch the list.
+
+    Returns:
+        A Datastar SSE response patching the slot's DS list.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    squad = get_object_or_404(Squad, pk=squad_pk, event=event)
+    grid = get_object_or_404(AvailabilityGrid, pk=grid_pk, squad=squad)
+    selection = get_object_or_404(AvailabilitySlotSelection, pk=slot_pk, grid=grid)
+    if not _can_manage_squad_availability(request.user, squad):
+        return HttpResponse("Permission denied", status=403)
+
+    ds = SlotDS.objects.filter(selection=selection, user_id=user_id).select_related("user").first()
+    if ds:
+        if (
+            ds.role_was_assigned
+            and ds.role_removed_at is None
+            and ds_service.should_remove_squad_role(ds.user, squad, exclude_slot_ds_pk=ds.pk)
+        ):
+            ds_service.remove_squad_role(ds.user, squad, actor_id=request.user.id)
+        logfire.info(
+            "DS removed from race",
+            selection_id=selection.pk,
+            ds_user_id=ds.user_id,
+            squad_id=squad.pk,
+            admin_user_id=request.user.id,
+        )
+        ds.delete()
+
+    list_html = _render_ds_list(request, event, squad, grid, selection)
+    return DatastarResponse(ServerSentEventGenerator.patch_elements(list_html))
+
+
+def _can_add_members(user: User, event: Event) -> bool:
+    """Check if user can add members to an event.
+
+    Allowed for head captains, event admins, app admins, and superusers.
+
+    Args:
+        user: The requesting user.
+        event: The event.
+
+    Returns:
+        True if the user can add members.
+
+    """
+    if user.is_superuser or user.has_permission(Permissions.APP_ADMIN):
+        return True
+    return bool(event.head_captain_role_id and user.has_discord_role(event.head_captain_role_id))
+
+
+@require_GET
+@login_required
+@team_member_required()
+def add_members_search_view(request: HttpRequest, event_pk: int) -> JsonResponse:
+    """Search team members for the Add Members modal.
+
+    Returns JSON list of users matching the query who are not already signed up.
+
+    Args:
+        request: The HTTP request with 'q' query parameter.
+        event_pk: The event primary key.
+
+    Returns:
+        JSON response with matching users.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_add_members(request.user, event):
+        return JsonResponse({"results": []}, status=403)
+
+    q = request.GET.get("q", "").strip()
+    if len(q) < 2:
+        return JsonResponse({"results": []})
+
+    existing_user_ids = set(EventSignup.objects.filter(event=event).values_list("user_id", flat=True))
+
+    users = User.objects.filter(
+        Q(first_name__icontains=q)
+        | Q(last_name__icontains=q)
+        | Q(discord_username__icontains=q)
+        | Q(discord_nickname__icontains=q)
+    ).exclude(pk__in=existing_user_ids).filter(discord_id__isnull=False).exclude(discord_id="")[:20]
+
+    results = []
+    for u in users:
+        display = u.get_full_name() or u.discord_username or u.discord_nickname or str(u.pk)
+        blockers = signup_blockers(event, u)
+        results.append({
+            "id": u.pk,
+            "display_name": display,
+            "discord_username": u.discord_username or "",
+            # Shown against the name and the row disabled; add_members_view refuses them anyway.
+            "blocked": missing_phrase(blockers) if blockers else "",
+        })
+    return JsonResponse({"results": results})
+
+
+@login_required
+@team_member_required()
+@require_POST
+def add_members_view(request: HttpRequest, event_pk: int) -> HttpResponse:
+    """Add selected members to event: create signup and assign event Discord role.
+
+    Only accessible to head captains and event admins.
+
+    Args:
+        request: The HTTP request with 'user_ids' POST data.
+        event_pk: The event primary key.
+
+    Returns:
+        Redirect to event detail page.
+
+    """
+    event = get_object_or_404(Event, pk=event_pk)
+    if not _can_add_members(request.user, event):
+        messages.error(request, "You don't have permission to add members.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    user_ids = request.POST.getlist("user_ids")
+    if not user_ids:
+        messages.warning(request, "No members selected.")
+        return redirect("events:event_detail", pk=event_pk)
+
+    existing_user_ids = set(EventSignup.objects.filter(event=event).values_list("user_id", flat=True))
+    users_to_add = User.objects.filter(pk__in=user_ids).exclude(pk__in=existing_user_ids)
+
+    added_count = 0
+    role_count = 0
+    from apps.team.models import DiscordRole
+
+    event_role_name = ""
+    if event.event_role:
+        dr = DiscordRole.objects.filter(role_id=str(event.event_role)).first()
+        event_role_name = dr.name if dr else "Event Role"
+
+    from apps.events.tasks import enqueue_signup_notification
+
+    # A captain adding a rider is held to the same requirements as the rider signing up.
+    skipped: list[str] = []
+    for user in users_to_add:
+        blockers = signup_blockers(event, user)
+        if blockers:
+            name = user.get_full_name() or user.discord_username or user.discord_nickname or str(user.pk)
+            skipped.append(f"{name} ({missing_phrase(blockers)})")
+            continue
+        signup = EventSignup.objects.create(event=event, user=user)
+        added_count += 1
+        enqueue_signup_notification(signup, request=request)
+
+        if event.event_role:
+            result = _assign_discord_role(
+                user, event.event_role, event_role_name, admin_user_id=request.user.id
+            )
+            if result is True:
+                role_count += 1
+
+    logfire.info(
+        "Members added to event by head captain",
+        event_id=event_pk,
+        event_title=event.title,
+        admin_user_id=request.user.id,
+        added_count=added_count,
+        role_assigned_count=role_count,
+        skipped_count=len(skipped),
+    )
+    if added_count or not skipped:
+        msg = f"Added {added_count} member{'s' if added_count != 1 else ''} to the event."
+        if event.event_role and role_count:
+            msg += f" Assigned event role to {role_count}."
+        messages.success(request, msg)
+    if skipped:
+        messages.warning(request, f"Not added -- the event's signup requirements aren't met: {', '.join(skipped)}.")
+    return redirect("events:event_detail", pk=event_pk)

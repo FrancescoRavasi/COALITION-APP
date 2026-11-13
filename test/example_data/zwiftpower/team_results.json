@@ -1,0 +1,999 @@
+{
+  "events": {
+    "9100001": {
+      "date": 1735689600,
+      "title": "Test Race Series - Stage 1",
+      "zid": "9100001"
+    },
+    "9100002": {
+      "date": 1735776000,
+      "title": "Test Race Series - Stage 2",
+      "zid": "9100002"
+    },
+    "9100003": {
+      "date": 1735862400,
+      "title": "Test Team Time Trial",
+      "zid": "9100003"
+    }
+  },
+  "data": [
+    {
+      "DT_RowId": "",
+      "ftp": "250",
+      "friend": 0,
+      "pt": "",
+      "label": "2",
+      "zid": "9100001",
+      "pos": 1,
+      "position_in_cat": 1,
+      "name": "Test Rider 1",
+      "cp": 0,
+      "zwid": 9000001,
+      "res_id": "910000101",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2412.345,
+        0
+      ],
+      "time_gun": 2412.345,
+      "gap": 0.0,
+      "vtta": "",
+      "vttat": 0,
+      "male": 1,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "B",
+      "height": [
+        178,
+        0
+      ],
+      "flag": "us",
+      "avg_hr": [
+        148,
+        0
+      ],
+      "max_hr": [
+        171,
+        0
+      ],
+      "hrmax": [
+        176,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        "72.5",
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "Vet",
+      "zada": 0,
+      "note": "",
+      "div": 30,
+      "divw": 0,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        220,
+        0
+      ],
+      "hrr": [
+        "1.24",
+        0
+      ],
+      "hreff": [
+        "1.43",
+        0
+      ],
+      "avg_power": [
+        212,
+        0
+      ],
+      "avg_wkg": [
+        "2.9",
+        0
+      ],
+      "wkg_ftp": [
+        "3.4",
+        0
+      ],
+      "wftp": [
+        250,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "3.4",
+        0
+      ],
+      "wkg300": [
+        "3.9",
+        0
+      ],
+      "wkg120": [
+        "4.5",
+        0
+      ],
+      "wkg60": [
+        "5.4",
+        0
+      ],
+      "wkg30": [
+        "6.7",
+        0
+      ],
+      "wkg15": [
+        "8.5",
+        0
+      ],
+      "wkg5": [
+        "10.5",
+        0
+      ],
+      "w1200": [
+        "244",
+        0
+      ],
+      "w300": [
+        "286",
+        0
+      ],
+      "w120": [
+        "329",
+        0
+      ],
+      "w60": [
+        "392",
+        0
+      ],
+      "w30": [
+        "488",
+        0
+      ],
+      "w15": [
+        "615",
+        0
+      ],
+      "w5": [
+        "763",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_RACE ",
+      "ed": 1735689600
+    },
+    {
+      "DT_RowId": "",
+      "ftp": "295",
+      "friend": 0,
+      "pt": "",
+      "label": "1",
+      "zid": "9100001",
+      "pos": 2,
+      "position_in_cat": 1,
+      "name": "Test Rider 2",
+      "cp": 0,
+      "zwid": 9000002,
+      "res_id": "910000102",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2424.69,
+        0
+      ],
+      "time_gun": 2424.69,
+      "gap": 12.345,
+      "vtta": "",
+      "vttat": 0,
+      "male": 1,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "A",
+      "height": [
+        183,
+        0
+      ],
+      "flag": "gb",
+      "avg_hr": [
+        152,
+        0
+      ],
+      "max_hr": [
+        178,
+        0
+      ],
+      "hrmax": [
+        183,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        "80.0",
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "50+",
+      "zada": 0,
+      "note": "",
+      "div": 20,
+      "divw": 0,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        276,
+        0
+      ],
+      "hrr": [
+        "1.51",
+        0
+      ],
+      "hreff": [
+        "1.76",
+        0
+      ],
+      "avg_power": [
+        268,
+        0
+      ],
+      "avg_wkg": [
+        "3.4",
+        0
+      ],
+      "wkg_ftp": [
+        "3.7",
+        0
+      ],
+      "wftp": [
+        295,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "3.9",
+        0
+      ],
+      "wkg300": [
+        "4.5",
+        0
+      ],
+      "wkg120": [
+        "5.2",
+        0
+      ],
+      "wkg60": [
+        "6.2",
+        0
+      ],
+      "wkg30": [
+        "7.7",
+        0
+      ],
+      "wkg15": [
+        "9.7",
+        0
+      ],
+      "wkg5": [
+        "12.1",
+        0
+      ],
+      "w1200": [
+        "308",
+        0
+      ],
+      "w300": [
+        "362",
+        0
+      ],
+      "w120": [
+        "415",
+        0
+      ],
+      "w60": [
+        "496",
+        0
+      ],
+      "w30": [
+        "616",
+        0
+      ],
+      "w15": [
+        "777",
+        0
+      ],
+      "w5": [
+        "965",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_RACE ",
+      "ed": 1735689600
+    },
+    {
+      "DT_RowId": "",
+      "ftp": "250",
+      "friend": 0,
+      "pt": "",
+      "label": "2",
+      "zid": "9100002",
+      "pos": 3,
+      "position_in_cat": 2,
+      "name": "Test Rider 1",
+      "cp": 0,
+      "zwid": 9000001,
+      "res_id": "910000203",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2437.035,
+        0
+      ],
+      "time_gun": 2437.035,
+      "gap": 24.69,
+      "vtta": "",
+      "vttat": 0,
+      "male": 1,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "B",
+      "height": [
+        178,
+        0
+      ],
+      "flag": "us",
+      "avg_hr": [
+        143,
+        0
+      ],
+      "max_hr": [
+        166,
+        0
+      ],
+      "hrmax": [
+        171,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        "72.5",
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "Vet",
+      "zada": 0,
+      "note": "",
+      "div": 30,
+      "divw": 0,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        213,
+        0
+      ],
+      "hrr": [
+        "1.23",
+        0
+      ],
+      "hreff": [
+        "1.43",
+        0
+      ],
+      "avg_power": [
+        205,
+        0
+      ],
+      "avg_wkg": [
+        "2.8",
+        0
+      ],
+      "wkg_ftp": [
+        "3.4",
+        0
+      ],
+      "wftp": [
+        250,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "3.3",
+        0
+      ],
+      "wkg300": [
+        "3.8",
+        0
+      ],
+      "wkg120": [
+        "4.4",
+        0
+      ],
+      "wkg60": [
+        "5.2",
+        0
+      ],
+      "wkg30": [
+        "6.5",
+        0
+      ],
+      "wkg15": [
+        "8.2",
+        0
+      ],
+      "wkg5": [
+        "10.2",
+        0
+      ],
+      "w1200": [
+        "236",
+        0
+      ],
+      "w300": [
+        "277",
+        0
+      ],
+      "w120": [
+        "318",
+        0
+      ],
+      "w60": [
+        "379",
+        0
+      ],
+      "w30": [
+        "471",
+        0
+      ],
+      "w15": [
+        "594",
+        0
+      ],
+      "w5": [
+        "738",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_RACE ",
+      "ed": 1735776000
+    },
+    {
+      "DT_RowId": "",
+      "ftp": "205",
+      "friend": 0,
+      "pt": "",
+      "label": "3",
+      "zid": "9100002",
+      "pos": 1,
+      "position_in_cat": 1,
+      "name": "Test Rider 3",
+      "cp": 0,
+      "zwid": 9000003,
+      "res_id": "910000201",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2412.345,
+        0
+      ],
+      "time_gun": 2412.345,
+      "gap": 0.0,
+      "vtta": "",
+      "vttat": 0,
+      "male": 0,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "C",
+      "height": [
+        168,
+        0
+      ],
+      "flag": "ca",
+      "avg_hr": [
+        155,
+        0
+      ],
+      "max_hr": [
+        174,
+        0
+      ],
+      "hrmax": [
+        179,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        "61.0",
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "Snr",
+      "zada": 0,
+      "note": "",
+      "div": 0,
+      "divw": 40,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        194,
+        0
+      ],
+      "hrr": [
+        "1.07",
+        0
+      ],
+      "hreff": [
+        "1.20",
+        0
+      ],
+      "avg_power": [
+        186,
+        0
+      ],
+      "avg_wkg": [
+        "3.0",
+        0
+      ],
+      "wkg_ftp": [
+        "3.4",
+        0
+      ],
+      "wftp": [
+        205,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "3.5",
+        0
+      ],
+      "wkg300": [
+        "4.1",
+        0
+      ],
+      "wkg120": [
+        "4.7",
+        0
+      ],
+      "wkg60": [
+        "5.6",
+        0
+      ],
+      "wkg30": [
+        "7.0",
+        0
+      ],
+      "wkg15": [
+        "8.8",
+        0
+      ],
+      "wkg5": [
+        "11.0",
+        0
+      ],
+      "w1200": [
+        "214",
+        0
+      ],
+      "w300": [
+        "251",
+        0
+      ],
+      "w120": [
+        "288",
+        0
+      ],
+      "w60": [
+        "344",
+        0
+      ],
+      "w30": [
+        "428",
+        0
+      ],
+      "w15": [
+        "539",
+        0
+      ],
+      "w5": [
+        "670",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_RACE ",
+      "ed": 1735776000
+    },
+    {
+      "DT_RowId": "",
+      "ftp": "180",
+      "friend": 0,
+      "pt": "",
+      "label": "4",
+      "zid": "9100003",
+      "pos": 2,
+      "position_in_cat": 2,
+      "name": "Test Rider 4",
+      "cp": 0,
+      "zwid": 9000004,
+      "res_id": "910000302",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2424.69,
+        0
+      ],
+      "time_gun": 2424.69,
+      "gap": 12.345,
+      "vtta": "",
+      "vttat": 0,
+      "male": 1,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "D",
+      "height": [
+        175,
+        0
+      ],
+      "flag": "de",
+      "avg_hr": [
+        139,
+        0
+      ],
+      "max_hr": [
+        160,
+        0
+      ],
+      "hrmax": [
+        165,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        "68.5",
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "Mas",
+      "zada": 0,
+      "note": "",
+      "div": 40,
+      "divw": 0,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        172,
+        0
+      ],
+      "hrr": [
+        "1.02",
+        0
+      ],
+      "hreff": [
+        "1.18",
+        0
+      ],
+      "avg_power": [
+        164,
+        0
+      ],
+      "avg_wkg": [
+        "2.4",
+        0
+      ],
+      "wkg_ftp": [
+        "2.6",
+        0
+      ],
+      "wftp": [
+        180,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "",
+        0
+      ],
+      "wkg300": [
+        "3.2",
+        0
+      ],
+      "wkg120": [
+        "3.7",
+        0
+      ],
+      "wkg60": [
+        "4.4",
+        0
+      ],
+      "wkg30": [
+        "5.5",
+        0
+      ],
+      "wkg15": [
+        "6.9",
+        0
+      ],
+      "wkg5": [
+        "8.6",
+        0
+      ],
+      "w1200": [
+        "",
+        0
+      ],
+      "w300": [
+        "221",
+        0
+      ],
+      "w120": [
+        "254",
+        0
+      ],
+      "w60": [
+        "303",
+        0
+      ],
+      "w30": [
+        "377",
+        0
+      ],
+      "w15": [
+        "476",
+        0
+      ],
+      "w5": [
+        "590",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_TEAM_TIME_TRIAL ",
+      "ed": 1735862400
+    },
+    {
+      "DT_RowId": "",
+      "ftp": "295",
+      "friend": 0,
+      "pt": "",
+      "label": "1",
+      "zid": "9100003",
+      "pos": 5,
+      "position_in_cat": 3,
+      "name": "Test Rider 2",
+      "cp": 0,
+      "zwid": 9000002,
+      "res_id": "910000305",
+      "lag": 0,
+      "uid": 0,
+      "time": [
+        2461.725,
+        0
+      ],
+      "time_gun": 2461.725,
+      "gap": 49.38,
+      "vtta": "",
+      "vttat": 0,
+      "male": 1,
+      "tid": "99999",
+      "topen": "",
+      "tname": "TEST TEAM",
+      "tc": "ffffff",
+      "tbc": "ff00ff",
+      "tbd": "ff00ff",
+      "zeff": 0,
+      "category": "A",
+      "height": [
+        183,
+        0
+      ],
+      "flag": "gb",
+      "avg_hr": [
+        150,
+        0
+      ],
+      "max_hr": [
+        175,
+        0
+      ],
+      "hrmax": [
+        180,
+        0
+      ],
+      "hrm": 1,
+      "weight": [
+        80.0,
+        0
+      ],
+      "power_type": 3,
+      "display_pos": 1,
+      "src": 1,
+      "age": "50+",
+      "zada": 0,
+      "note": "",
+      "div": 20,
+      "divw": 0,
+      "skill": 150,
+      "skill_b": 0,
+      "skill_gain": 3,
+      "np": [
+        263,
+        0
+      ],
+      "hrr": [
+        "1.46",
+        0
+      ],
+      "hreff": [
+        "1.70",
+        0
+      ],
+      "avg_power": [
+        255,
+        0
+      ],
+      "avg_wkg": [
+        "3.2",
+        0
+      ],
+      "wkg_ftp": [
+        "3.7",
+        0
+      ],
+      "wftp": [
+        295,
+        0
+      ],
+      "wkg_guess": 0,
+      "wkg1200": [
+        "3.7",
+        0
+      ],
+      "wkg300": [
+        "4.3",
+        0
+      ],
+      "wkg120": [
+        "4.9",
+        0
+      ],
+      "wkg60": [
+        "5.9",
+        0
+      ],
+      "wkg30": [
+        "7.3",
+        0
+      ],
+      "wkg15": [
+        "9.2",
+        0
+      ],
+      "wkg5": [
+        "11.5",
+        0
+      ],
+      "w1200": [
+        "293",
+        0
+      ],
+      "w300": [
+        "344",
+        0
+      ],
+      "w120": [
+        "395",
+        0
+      ],
+      "w60": [
+        "472",
+        0
+      ],
+      "w30": [
+        "586",
+        0
+      ],
+      "w15": [
+        "740",
+        0
+      ],
+      "w5": [
+        "918",
+        0
+      ],
+      "is_guess": 0,
+      "upg": 0,
+      "penalty": "",
+      "reg": 1,
+      "fl": "",
+      "pts": "",
+      "pts_pos": "",
+      "info": 0,
+      "info_notes": [],
+      "notes": "",
+      "f_t": "TYPE_TEAM_TIME_TRIAL ",
+      "ed": 1735862400
+    }
+  ]
+}

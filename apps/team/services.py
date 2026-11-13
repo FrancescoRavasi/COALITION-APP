@@ -1,0 +1,2449 @@
+"""Service layer for unified team roster operations."""
+
+import hashlib
+import hmac
+import inspect
+import json
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import ClassVar
+
+import logfire
+from constance import config
+from django.conf import settings
+from django.core.cache import cache
+from django.db.models import Count, F, Max, Min, OuterRef, Q, QuerySet, Subquery
+from django.utils import timezone
+
+from apps.accounts.models import GuildMember, User
+from apps.rider_data.models import velo2_categories_by_zwid
+from apps.team.models import MembershipApplication, RaceReadyRecord, RecordView
+from apps.zwiftpower.models import ZPRiderResults, ZPTeamRiders
+from apps.zwiftracing.models import ZRRider
+
+# Default verification types when no ZwiftPower category is found
+DEFAULT_VERIFICATION_TYPES: list[str] = ["weight_light", "height"]
+
+# The two weight verifications. A category listing BOTH (40/50 by default) is satisfied by
+# EITHER; a category listing one demands that one. The rule lives in requirements_for() and
+# nowhere else, so every surface reads it the way User.calculate_race_ready does.
+WEIGHT_VERIFY_TYPES: frozenset[str] = frozenset({"weight_full", "weight_light"})
+
+# ZwiftPower division to category letter mapping
+ZP_DIV_TO_CATEGORY: dict[int, str] = {
+    5: "A+",
+    10: "A",
+    20: "B",
+    30: "C",
+    40: "D",
+    50: "E",
+}
+
+
+def verification_accepted(user_row: dict) -> bool:
+    """Apply the zauth cutover policy to a ``.values()`` roster row.
+
+    Mirrors ``User.has_accepted_zwid_verification``. That property cannot be reused
+    here because these rosters read ``.values()`` dicts for efficiency rather than
+    model instances, and a Python property is invisible to the ORM.
+
+    Args:
+        user_row: A row carrying ``zwid_verified`` and ``zwid_verification_method``.
+
+    Returns:
+        Whether the row's verification counts under the active policy.
+
+    """
+    if not user_row.get("zwid_verified"):
+        return False
+    if not config.ZAUTH_VERIFICATION_REQUIRED:
+        return True
+    return user_row.get("zwid_verification_method") == "zauth"
+
+
+def required_types_bulk(users) -> dict[int, list[str]]:
+    """Resolve required verification types per user, for many users at a fixed query cost.
+
+    The one implementation of "what does this rider's ZwiftPower category demand".
+    :func:`get_user_required_verification_types` is a single-user wrapper around it, so no
+    surface can grow a second copy of the rule and drift from ``User.calculate_race_ready``.
+
+    Costs at most two queries for the whole batch: one ``ZPTeamRiders`` lookup keyed on the
+    riders' zwids (skipped when nobody has one) and one Constance read of
+    ``CATEGORY_REQUIREMENTS`` (skipped when nobody resolved to a real category, which is what
+    the per-user version did by returning before it read the config). Constance has no cache
+    backend configured here, so every read is a real SELECT -- the reason this exists at all.
+
+    Falls back to :data:`DEFAULT_VERIFICATION_TYPES` for every "we do not know" case, exactly
+    as the per-user version always has: no zwid, no ``ZPTeamRiders`` row, a falsy category
+    (``div``/``divw`` both default to ``0``, so a row with no division is indistinguishable
+    from no row), a category the config does not mention, an empty list, or a config that
+    cannot be read.
+
+    Args:
+        users: The users to resolve. Unsaved users (no ``pk``) are keyed by ``None``.
+
+    Returns:
+        Mapping of ``user.id`` -> a fresh list of required ``verify_type`` values.
+
+    """
+    user_list = list(users)
+    if not user_list:
+        return {}
+
+    # The dict is keyed by the ints values() returns, so the riders' zwids are normalised the
+    # same way. The old per-user lookup filtered in the ORM, which coerced whatever the
+    # attribute held; an in-memory instance carrying a string zwid (assigned from a form or an
+    # API response before save) would otherwise miss the dict and silently fall back to the
+    # default types -- and, since calculate_race_ready runs through here, silently lose its
+    # Race Verified status with it.
+    def _zwid(user: User) -> int | None:
+        try:
+            return int(user.zwid) if user.zwid else None
+        except TypeError, ValueError:
+            return None
+
+    zwids = {z for z in (_zwid(u) for u in user_list) if z is not None}
+    # order_by() drops ZPTeamRiders.Meta.ordering ("name"), which this lookup does not need,
+    # and values() keeps ~29 unused columns out of the round trip.
+    zp_categories: dict[int, tuple[int, int]] = {}
+    if zwids:
+        zp_categories = {
+            row["zwid"]: (row["div"], row["divw"])
+            for row in ZPTeamRiders.objects.filter(zwid__in=zwids).order_by().values("zwid", "div", "divw")
+        }
+
+    def _category(user: User) -> int:
+        zwid = _zwid(user)
+        cats = zp_categories.get(zwid) if zwid is not None else None
+        if not cats:
+            return 0
+        return cats[1] if user.gender == "female" else cats[0]
+
+    categories = {user.id: _category(user) for user in user_list}
+
+    requirements: dict = {}
+    if any(categories.values()):
+        try:
+            parsed = json.loads(config.CATEGORY_REQUIREMENTS)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logfire.error("Failed to parse CATEGORY_REQUIREMENTS config", error=str(exc), users=len(user_list))
+            parsed = None
+        if isinstance(parsed, dict):
+            requirements = parsed
+        elif parsed is not None:
+            # Valid JSON that is not an object (e.g. "[]") used to raise AttributeError on
+            # .get. This runs inside a context processor, so a bad config must degrade to the
+            # default rather than 500 every page.
+            logfire.error("CATEGORY_REQUIREMENTS is not a JSON object", users=len(user_list))
+
+    result: dict[int, list[str]] = {}
+    for user in user_list:
+        category = categories[user.id]
+        types = requirements.get(str(category)) if category else None
+        # A non-list value (a bare string would iterate as characters) is as unusable as a
+        # missing one.
+        if not types or not isinstance(types, list):
+            types = DEFAULT_VERIFICATION_TYPES
+        result[user.id] = [str(t) for t in types]
+    return result
+
+
+def get_user_required_verification_types(user: User) -> list[str]:
+    """Get required verification types for race-ready status based on ZwiftPower category.
+
+    Thin wrapper over :func:`required_types_bulk` -- deliberately, so the batched and
+    per-user answers are the same answer rather than two copies of one rule.
+
+    Args:
+        user: The user to get required types for.
+
+    Returns:
+        List of verify_type values required for race-ready status.
+
+    """
+    return required_types_bulk([user])[user.id]
+
+
+_VERIFICATION_GROUPS = {
+    "weight": {"weight_full", "weight_light"},
+    "height": {"height"},
+    "power": {"power"},
+}
+_ALL_VERIFY_TYPES = ["weight_full", "weight_light", "height", "power"]
+
+
+def verification_days_bulk(users: list[User]) -> dict[int, dict]:
+    """Compute verification day-counts for many users with a fixed number of queries.
+
+    Batched equivalent of computing per-user weight/height/power/race-ready days.
+    Uses a small constant number of queries (verified records, ZwiftPower
+    categories, and the validity settings read once) regardless of user count,
+    instead of several queries per user, then does the date math in memory.
+
+    This helper is deliberately NOT on the coverage rule
+    (:func:`verification_coverage_bulk`), left as it was because its one caller is the events
+    Eligibility table and changing what its columns mean is a separate decision. Three known
+    divergences, for whoever picks that up: ``weight_days`` is the LATEST weight record of
+    either kind, so it can report a ``weight_light`` window for a category that only accepts
+    ``weight_full``; ``_days_and_has`` returns None both for "never expires" and for "already
+    expired", conflating +infinity with lapsed; and ``race_ready_days`` is gated on the CACHED
+    ``User.is_race_ready``, so a stale cache blanks it. The required-types half of the rule IS
+    shared, via :func:`required_types_bulk`.
+
+    Args:
+        users: The users to compute for.
+
+    Returns:
+        Mapping of ``user.id`` -> dict with ``weight_days``, ``height_days``,
+        ``power_days``, ``race_ready_days``, ``has_height`` (same shape as the
+        per-user computation).
+
+    """
+    user_list = list(users)
+    user_ids = [u.id for u in user_list]
+
+    # 1) Latest verified record per (user, group). Ordered newest-first so the
+    # first record seen for each group is the latest.
+    latest: dict[int, dict[str, RaceReadyRecord]] = {}
+    records = (
+        RaceReadyRecord.objects.filter(
+            user_id__in=user_ids,
+            status=RaceReadyRecord.Status.VERIFIED,
+            verify_type__in=_ALL_VERIFY_TYPES,
+        )
+        .order_by("user_id", "-record_date")
+    )
+    for rec in records:
+        groups = latest.setdefault(rec.user_id, {})
+        for group, types in _VERIFICATION_GROUPS.items():
+            if rec.verify_type in types:
+                groups.setdefault(group, rec)
+
+    # 2) Required types, through the shared batched lookup -- same two queries this used to
+    # issue by hand, but one implementation of the fallbacks instead of a second copy that
+    # silently swallowed a bad CATEGORY_REQUIREMENTS into "everyone gets the default".
+    required_by_user = required_types_bulk(user_list)
+
+    # Read the validity settings ONCE (RaceReadyRecord.days_remaining reads all four
+    # from Constance on every call, which is the real per-record query cost).
+    today = timezone.now().date()
+    validity_days = {
+        "weight_full": config.WEIGHT_FULL_DAYS,
+        "weight_light": config.WEIGHT_LIGHT_DAYS,
+        "height": config.HEIGHT_VERIFICATION_DAYS,
+        "power": config.POWER_VERIFICATION_DAYS,
+    }
+
+    def _days_and_has(rec: RaceReadyRecord | None) -> tuple[int | None, bool]:
+        if rec is None:
+            return None, False
+        validity = validity_days.get(rec.verify_type, 0)
+        if not validity or not rec.record_date:
+            return None, True  # never expires, but a record exists
+        days = (rec.record_date + timedelta(days=validity) - today).days
+        if days < 0:
+            return None, True  # expired but a record exists
+        return days, True
+
+    result: dict[int, dict] = {}
+    for user in user_list:
+        groups = latest.get(user.id, {})
+        weight_days, _ = _days_and_has(groups.get("weight"))
+        height_days, has_height = _days_and_has(groups.get("height"))
+        power_days, _ = _days_and_has(groups.get("power"))
+
+        race_ready_days: int | None = None
+        if user.is_race_ready:
+            type_to_days = {
+                "weight_full": weight_days,
+                "weight_light": weight_days,
+                "height": height_days,
+                "power": power_days,
+            }
+            required = required_by_user.get(user.id) or DEFAULT_VERIFICATION_TYPES
+            constraining = [type_to_days[t] for t in required if type_to_days.get(t) is not None]
+            if constraining:
+                race_ready_days = min(constraining)
+
+        result[user.id] = {
+            "weight_days": weight_days,
+            "height_days": height_days,
+            "power_days": power_days,
+            "race_ready_days": race_ready_days,
+            "has_height": has_height,
+        }
+    return result
+
+
+def get_user_verification_types(user: User) -> list[str]:
+    """Get all verification types a user is allowed to submit.
+
+    Starts with the required types from CATEGORY_REQUIREMENTS, then adds:
+    - ``power`` — always available for any rider to submit.
+    - ``weight_light`` — available if the rider has a verified weight_full record.
+
+    Args:
+        user: The user to get submittable types for.
+
+    Returns:
+        List of verify_type values the user may submit.
+
+    """
+    types = list(get_user_required_verification_types(user))
+
+    # Power verification is always available (not required for all categories, but any rider can submit)
+    if "power" not in types:
+        types.append("power")
+
+    # Riders with a verified weight_full can also submit weight_light
+    if "weight_light" not in types:
+        from apps.team.models import RaceReadyRecord
+
+        has_verified_weight = user.race_ready_records.filter(
+            verify_type="weight_full",
+            status=RaceReadyRecord.Status.VERIFIED,
+        ).exists()
+        if has_verified_weight:
+            types.append("weight_light")
+
+    return types
+
+
+# Canonical display order and labels for the four verification types.
+VERIFY_TYPE_LABELS: dict[str, str] = {
+    "weight_full": "Weight (Full)",
+    "weight_light": "Weight (Light)",
+    "height": "Height",
+    "power": "Power",
+}
+
+
+def verify_type_validity_days() -> dict[str, int]:
+    """Map each verify_type to its configured validity window in days.
+
+    Public so every loop over records can read the four windows ONCE and pass them to
+    :func:`record_days_left`: ``RaceReadyRecord.days_remaining`` reads all four on every
+    access and Constance has no cache backend here, so the property costs four SELECTs a call.
+
+    Returns:
+        Dict of verify_type to validity days (0 means never expires).
+
+    """
+    return {
+        "weight_full": config.WEIGHT_FULL_DAYS,
+        "weight_light": config.WEIGHT_LIGHT_DAYS,
+        "height": config.HEIGHT_VERIFICATION_DAYS,
+        "power": config.POWER_VERIFICATION_DAYS,
+    }
+
+
+def _current_verification_status(record: RaceReadyRecord | None) -> dict[str, str]:
+    """Summarize the latest record of a type for the submission picker.
+
+    Args:
+        record: The user's most recent record of a given verify_type, or None.
+
+    Returns:
+        Dict with ``state`` (valid/expired/pending/rejected/none) and human ``text``.
+
+    """
+    if record is None:
+        return {"state": "none", "text": "None on file"}
+    if record.is_verified:
+        if record.is_expired:
+            days = record.days_remaining
+            ago = f"{abs(days)} days ago" if days is not None else ""
+            return {"state": "expired", "text": f"Expired {ago}".strip()}
+        remaining = record.days_remaining
+        if remaining is None:
+            return {"state": "valid", "text": "Verified · no expiry"}
+        return {"state": "valid", "text": f"Verified · {remaining} days left"}
+    if record.is_rejected:
+        return {"state": "rejected", "text": "Last submission rejected"}
+    return {"state": "pending", "text": "Pending review"}
+
+
+def build_verify_type_options(user: User) -> list[dict]:
+    """Build the annotated verification-type list for the submission picker.
+
+    Each option carries the label, whether it is required for this rider's category,
+    the validity window, and the state of the rider's most recent record of that type.
+    Only types the rider may currently submit are included (e.g. weight_light is
+    omitted until they have a verified full weight), and required types are listed first.
+
+    Args:
+        user: The rider submitting a verification.
+
+    Returns:
+        List of option dicts consumed by the race-ready form template.
+
+    """
+    allowed = get_user_verification_types(user)
+    required = set(get_user_required_verification_types(user))
+    validity_days = verify_type_validity_days()
+
+    latest_by_type: dict[str, RaceReadyRecord] = {}
+    for record in user.race_ready_records.all():
+        latest_by_type.setdefault(record.verify_type, record)
+
+    def _option(vtype: str) -> dict:
+        days = validity_days.get(vtype, 0)
+        return {
+            "value": vtype,
+            "label": VERIFY_TYPE_LABELS.get(vtype, vtype),
+            "required": vtype in required,
+            "validity_label": "Never expires" if not days else f"Valid {days} days",
+            "current": _current_verification_status(latest_by_type.get(vtype)),
+        }
+
+    ordered = [t for t in VERIFY_TYPE_LABELS if t in allowed and t in required]
+    ordered += [t for t in VERIFY_TYPE_LABELS if t in allowed and t not in required]
+    return [_option(t) for t in ordered]
+
+
+def _has_media() -> Q:
+    """Match records that still carry evidence.
+
+    ``media_file`` is both ``null=True`` and ``blank=True``, so an empty upload can be
+    stored either way and both have to be ruled out.
+
+    Returns:
+        A ``Q`` matching records with an uploaded file, an evidence URL, or both.
+
+    """
+    return Q(url__gt="") | (Q(media_file__isnull=False) & ~Q(media_file=""))
+
+
+def _strip_media(records: list[RaceReadyRecord], *, reason: str) -> dict[str, int]:
+    """Delete the stored file and clear the evidence URL on each record.
+
+    One unreadable file must not abort the rest of a sweep, so storage failures are
+    counted and skipped rather than raised. ``delete_media_file`` has already logged the
+    error by the time it reaches here.
+
+    Args:
+        records: Records to strip. Callers are expected to have selected them already.
+        reason: Why these records are being stripped, for the log line.
+
+    Returns:
+        Counts of records ``considered``, ``purged`` and ``failed``, plus ``failed_files``
+        naming the storage paths that could not be deleted.
+
+    """
+    purged = 0
+    failed_files = []
+    for record in records:
+        try:
+            file_name = record.media_file.name if record.media_file else ""
+            record.delete_media_file()
+            record.url = ""
+            # delete_media_file() drops the stored file with save=False, so media_file has
+            # to be persisted here as well -- otherwise the column keeps the deleted file's
+            # name and the record still looks like it has evidence. Regression covered by
+            # apps/team/test_media_purge.py.
+            record.save(update_fields=["url", "media_file"])
+            purged += 1
+        except Exception as e:
+            if file_name:
+                failed_files.append(file_name)
+            logfire.error(
+                "Could not strip verification media",
+                record_id=record.id,
+                user_id=record.user_id,
+                reason=reason,
+                error=str(e),
+            )
+
+    return {
+        "considered": len(records),
+        "purged": purged,
+        "failed": len(failed_files),
+        # The paths of anything that could not be deleted. When the caller is about to
+        # drop the rows too (account deletion), this is the only trace of a file that is
+        # now unreachable except by enumerating the storage prefix.
+        "failed_files": failed_files,
+    }
+
+
+def purge_user_verification_media(user: User) -> dict:
+    """Strip evidence from every verification record belonging to ``user``.
+
+    Called just before ``User.delete()``. The cascade cannot do this itself: Django's
+    Collector issues bulk deletes and never calls ``Model.delete()`` per instance, so a
+    model-level override would not fire -- and once the rows are gone the files are
+    unreachable except by enumerating the storage prefix.
+
+    Records are saved as well as stripped even though they are about to be deleted. That
+    is not wasted work: if the delete that follows fails, the rows are left consistent
+    with storage rather than pointing at files that no longer exist.
+
+    Args:
+        user: The user whose account is being deleted.
+
+    Returns:
+        Counts of records ``considered``, ``purged`` and ``failed``, plus ``failed_files``.
+
+    """
+    records = list(user.race_ready_records.filter(_has_media()))
+    result = _strip_media(records, reason="account deleted")
+    logfire.info("Purged verification media for deleted account", user_id=user.pk, **result)
+    return result
+
+
+def delete_verification_records(user: User, record_ids) -> dict:
+    """Delete verification records a rider has chosen to remove from their own history.
+
+    Scoped to ``user``'s own records, so an id belonging to someone else simply does not
+    match. Evidence is stripped from storage before the rows go, for the same reason it is
+    on account deletion: Django never removes FileField storage on delete, and once the row
+    is gone the file is unreachable except by enumerating the storage prefix.
+
+    A file that cannot be deleted does not stop the row being removed -- the rider asked
+    for it gone, and refusing on a storage error would leave them stuck. The path is logged
+    so it can be swept later.
+
+    Race-ready status is recalculated afterwards. Deleting the record that was covering a
+    required verification type does revoke it; that is the honest consequence of removing
+    the evidence, and the caller is expected to have warned the rider.
+
+    Args:
+        user: The rider deleting their own records.
+        record_ids: Candidate primary keys, unfiltered and untrusted.
+
+    Returns:
+        ``deleted`` and ``failed_media`` counts, plus ``was_race_ready`` / ``is_race_ready``
+        so the caller can tell the rider if this cost them their status.
+
+    """
+    # Read the live values, not the cached columns: a verification that expired since the
+    # last refresh_all_race_ready sweep would otherwise make the deletion look like the
+    # cause of a status loss it had nothing to do with.
+    was_race_ready = user.calculate_race_ready()
+    was_extra_verified = user.calculate_extra_verified()
+    records = list(user.race_ready_records.filter(pk__in=record_ids))
+    if not records:
+        return {
+            "deleted": 0,
+            "failed_media": 0,
+            "was_race_ready": was_race_ready,
+            "is_race_ready": was_race_ready,
+            "was_extra_verified": was_extra_verified,
+            "is_extra_verified": was_extra_verified,
+        }
+
+    media = _strip_media([r for r in records if r.media_file or r.url], reason="deleted by rider")
+    RaceReadyRecord.objects.filter(pk__in=[r.pk for r in records]).delete()
+    is_race_ready, is_extra_verified = user.refresh_race_ready()
+
+    if was_race_ready and not is_race_ready:
+        # Drop the Discord race-ready role now rather than leaving the rider wearing it
+        # until the nightly sync_race_ready_roles sweep notices. Deleting records can only
+        # ever cost the status, never grant it, so this is the one direction to handle.
+        from apps.team.tasks import notify_race_ready_change
+
+        notify_race_ready_change.enqueue(
+            user_id=user.pk,
+            is_now_race_ready=False,
+            changed_by_user_id=user.pk,
+        )
+
+    logfire.info(
+        "Rider deleted their own verification records",
+        user_id=user.pk,
+        # The ids, not just the count. A reviewer following a submission DM to a record that
+        # has since gone needs to know WHICH record vanished, and a count cannot answer that.
+        record_ids=sorted(r.pk for r in records),
+        deleted=len(records),
+        verify_types=sorted({r.verify_type for r in records}),
+        failed_media=media["failed"],
+        orphaned_media_files=media["failed_files"],
+        was_race_ready=was_race_ready,
+        is_race_ready=is_race_ready,
+    )
+    return {
+        "deleted": len(records),
+        "failed_media": media["failed"],
+        "was_race_ready": was_race_ready,
+        "is_race_ready": is_race_ready,
+        "was_extra_verified": was_extra_verified,
+        "is_extra_verified": is_extra_verified,
+    }
+
+
+def purge_expired_verification_media() -> dict[str, int]:
+    """Strip evidence from verified records whose verification has expired.
+
+    Note that ``is_expired`` is a property, not a column, so the expiry test happens in
+    Python -- the queryset only narrows to verified records that still hold evidence.
+
+    A verify_type whose ``*_DAYS`` setting is ``0`` never expires (height, by default), so
+    those records are never reached by this sweep. That is the validity setting working as
+    intended -- an adult's height does not change, so the verification stays good.
+
+    It is not a reason to keep the photograph forever, which is what used to happen.
+    ``purge_aged_verification_media`` below is the backstop: how long a verification stays
+    valid and how long we keep the body image that evidenced it are separate questions.
+
+    Returns:
+        Counts of records ``considered``, ``purged`` and ``failed``.
+
+    """
+    candidates = RaceReadyRecord.objects.filter(status=RaceReadyRecord.Status.VERIFIED).filter(_has_media())
+    expired = [record for record in candidates if record.is_expired]
+    result = _strip_media(expired, reason="expired")
+    logfire.info("Purged expired verification media", **result)
+    return result
+
+
+def purge_aged_verification_media() -> dict[str, int]:
+    """Strip evidence we have held longer than ``VERIFICATION_MEDIA_MAX_DAYS``.
+
+    The backstop for verification types that never expire. Height is the case that motivated
+    it: the verification is valid forever and the photograph was therefore kept forever, so a
+    body image uploaded in 2023 was still in storage with nothing scheduled to remove it.
+
+    Measured from ``date_created`` -- when we took possession of the file -- rather than
+    ``record_date``, which the expiry logic uses. ``record_date`` is the date the evidence
+    depicts and a rider may enter one well in the past, so measuring from it would delete a
+    backdated record's media the day it was uploaded. The question here is how long we have
+    held the file, not how old the measurement is.
+
+    Only verified records are swept. A pending record's media is the evidence a reviewer has
+    yet to look at, and rejected media has its own shorter sweep.
+
+    Returns:
+        Counts of records ``considered``, ``purged`` and ``failed``. All zero when the
+        setting is ``0``, which keeps media indefinitely.
+
+    """
+    max_days = config.VERIFICATION_MEDIA_MAX_DAYS
+    if not max_days or max_days <= 0:
+        logfire.info("Verification media retention disabled, skipping aged sweep")
+        return {"considered": 0, "purged": 0, "failed": 0}
+
+    cutoff = timezone.now() - timedelta(days=max_days)
+    aged = list(
+        RaceReadyRecord.objects.filter(
+            status=RaceReadyRecord.Status.VERIFIED,
+            date_created__lt=cutoff,
+        ).filter(_has_media())
+    )
+    result = _strip_media(aged, reason="aged out")
+    logfire.info("Purged aged verification media", max_days=max_days, **result)
+    return result
+
+
+def purge_rejected_verification_media(older_than_days: int = 30) -> dict[str, int]:
+    """Strip evidence from records rejected longer ago than ``older_than_days``.
+
+    Args:
+        older_than_days: How long a rejected record keeps its evidence, so a rider has a
+            window to query the decision before it is thrown away.
+
+    Returns:
+        Counts of records ``considered``, ``purged`` and ``failed``.
+
+    """
+    cutoff = timezone.now() - timedelta(days=older_than_days)
+    stale = list(
+        RaceReadyRecord.objects.filter(
+            status=RaceReadyRecord.Status.REJECTED,
+            reviewed_date__lt=cutoff,
+        ).filter(_has_media())
+    )
+    result = _strip_media(stale, reason="rejected")
+    logfire.info("Purged rejected verification media", older_than_days=older_than_days, **result)
+    return result
+
+
+# Shown to whoever deleted registrations when a Zwift link could not be confirmed dropped.
+# The ids are in the error log, which is where the follow-up starts.
+ZWIFT_LINK_NOT_RELEASED_MESSAGE = (
+    "The Zwift connection of a deleted registration could not be confirmed removed, because the "
+    "Zwift service could not be reached or is not configured here. The registration ids are in the "
+    "error log; the connection needs removing in the Zwift service by hand."
+)
+
+
+def release_application_zwift_links(applications: QuerySet[MembershipApplication]) -> dict[str, int]:
+    """Drop the zauth link each registration may hold, before the rows are deleted.
+
+    The zauth service keys a registration's link by the registration's UUID and knows
+    nothing about this table, so deleting the row alone would leave the link -- a Zwift
+    account tied to somebody who is being forgotten -- behind in the service, unreachable.
+
+    Which registrations hold a link is asked of the service once, from its connections
+    list, and only those are disconnected. The local flags are not enough on their own: a
+    registration can hold a link while showing none (consent finished but the page was
+    never reloaded to record it, or the service reported an unusable zwid). And asking row
+    by row would turn a bulk delete of hundreds of never-connected registrations into
+    hundreds of calls that remove nothing.
+
+    When the service cannot be asked -- unreachable, or not configured here -- nothing can
+    be confirmed, so every registration showing a sign of a link (verified, or carrying a
+    zwid) is counted as failed and its id logged, so the link can still be found in the
+    service later. No per-row calls are made then; they would only repeat the failure, a
+    timeout each. A registration with no sign of a link is assumed clean in that case: the
+    one gap left, and it needs the service to be down as well.
+
+    Never raises. A failure is counted, logged and left for the caller to report; blocking
+    an erasure on another service being down is the worse outcome.
+
+    Args:
+        applications: The registrations about to be deleted.
+
+    Returns:
+        ``{"attempted", "removed", "failed"}`` counts. ``attempted`` is the disconnect calls
+        made, ``removed`` the links the service confirmed removing, and ``failed`` the links
+        that may still be there.
+
+    """
+    from apps.zwift import client as zwift_client
+
+    rows = list(applications.values_list("pk", "zwift_verified", "zwift_id"))
+    if not rows:
+        return {"attempted": 0, "removed": 0, "failed": 0}
+    ids = {str(pk) for pk, _verified, _zwift_id in rows}
+
+    try:
+        connections = zwift_client.list_connections()
+    except Exception as exc:
+        logfire.error("Zwift connections list raised", error=type(exc).__name__)
+        connections = None
+    if connections is None:
+        unconfirmed = sorted(str(pk) for pk, verified, zwift_id in rows if verified or zwift_id)
+        if unconfirmed:
+            logfire.error(
+                "Could not check registrations' Zwift links before deleting them",
+                application_ids=unconfirmed,
+                configured=zwift_client.is_configured(),
+            )
+        return {"attempted": 0, "removed": 0, "failed": len(unconfirmed)}
+
+    linked = sorted(ids & {str(row.get("user_id")) for row in connections if isinstance(row, dict)})
+    removed = 0
+    failed_ids = []
+    for application_id in linked:
+        try:
+            outcome = zwift_client.disconnect_link(application_id)
+        except Exception as exc:
+            logfire.error("Zwift disconnect raised", application_id=application_id, error=type(exc).__name__)
+            outcome = zwift_client.DisconnectOutcome.FAILED
+        if outcome is zwift_client.DisconnectOutcome.REMOVED:
+            removed += 1
+        elif outcome is not zwift_client.DisconnectOutcome.NO_LINK:
+            # NO_LINK here means it went between the list and the call, which is fine.
+            failed_ids.append(application_id)
+
+    counts = {"attempted": len(linked), "removed": removed, "failed": len(failed_ids)}
+    if failed_ids:
+        logfire.error(
+            "Could not drop a registration's Zwift link before deleting it",
+            application_ids=failed_ids,
+            **counts,
+        )
+    elif linked:
+        logfire.info("Registration Zwift links released before deletion", **counts)
+    return counts
+
+
+# How long a minted verification-media URL stays valid. Deliberately short: the URL is a
+# bearer token, so this is the window in which a leaked one is still worth something. It is
+# not measured from page render but from the moment the reviewer asks for the file, so it
+# only has to outlive a single fetch -- plus enough slack for a browser to seek within a
+# video, which re-requests the resolved URL rather than coming back through the view.
+VERIFICATION_MEDIA_URL_TTL_SECONDS = 300
+
+# Video needs a longer window than a photo, and not for convenience. A browser resolves a
+# <source> once and then issues range requests against the *resolved* URL for the rest of
+# playback -- it does not come back through the view. So the link has to outlive the viewing
+# session, not just the first fetch. At 300s a reviewer who paused to read the notes and then
+# scrubbed backwards would hit a silent stall with no error to explain it.
+VERIFICATION_VIDEO_URL_TTL_SECONDS = 1800
+
+
+# Grace period before a rejected record's evidence is purged. Mirrors
+# REJECTED_MEDIA_GRACE_DAYS in apps/team/views.py, which is what the admin button uses.
+REJECTED_MEDIA_GRACE_DAYS = 30
+
+
+@dataclass(frozen=True)
+class MediaRetentionRule:
+    """One rule that will eventually remove a record's evidence.
+
+    Attributes:
+        label: Short name for the rule, as a rider should read it.
+        due: The date the rule bites, or None when it cannot be dated.
+        automatic: Whether anything actually enforces it on a schedule. A rule that only
+            runs when an admin presses a button is not a promise, and saying so is the
+            difference between a retention notice and a retention aspiration.
+        detail: Why this rule applies to this record.
+
+    """
+
+    label: str
+    due: date | None
+    automatic: bool
+    detail: str
+
+
+def media_retention_rules(record: RaceReadyRecord) -> list[MediaRetentionRule]:
+    """Every rule that will remove ``record``'s evidence, with the date each one bites.
+
+    Derived from the sweeps themselves rather than restated, because a retention notice that
+    disagrees with the code is worse than none -- it is a claim about someone's data that
+    cannot be honoured. Three sweeps exist and they do not cover the same records:
+
+    * ``purge_expired_verification_media`` -- VERIFIED only, once the verification lapses.
+      A type whose ``*_DAYS`` is 0 never expires, so this never reaches it.
+    * ``purge_aged_verification_media`` -- VERIFIED only, ``VERIFICATION_MEDIA_MAX_DAYS``
+      after we took possession. This is the backstop for the case above.
+    * ``purge_rejected_verification_media`` -- REJECTED only, and **not scheduled**: it runs
+      from an admin button. Reported with ``automatic=False`` rather than dressed up as a date.
+
+    A pending record is covered by none of them, which is worth saying plainly instead of
+    leaving a blank space where a date should be.
+
+    Args:
+        record: The verification record.
+
+    Returns:
+        The applicable rules, soonest dated first, undated last.
+
+    """
+    rules: list[MediaRetentionRule] = []
+
+    if record.status == RaceReadyRecord.Status.VERIFIED:
+        expires = record.expires_date
+        if expires is not None:
+            rules.append(
+                MediaRetentionRule(
+                    label="When this verification expires",
+                    due=expires,
+                    automatic=True,
+                    detail=(
+                        f"{record.get_verify_type_display()} verifications stay valid for "
+                        f"{record.validity_days} days."
+                    ),
+                )
+            )
+        max_days = config.VERIFICATION_MEDIA_MAX_DAYS
+        if max_days and max_days > 0:
+            rules.append(
+                MediaRetentionRule(
+                    label="Retention limit",
+                    due=(record.date_created + timedelta(days=max_days)).date(),
+                    automatic=True,
+                    detail=(
+                        f"We do not keep evidence longer than {max_days} days, even while the "
+                        "verification is still valid."
+                    ),
+                )
+            )
+    elif record.status == RaceReadyRecord.Status.REJECTED and record.reviewed_date:
+        rules.append(
+            MediaRetentionRule(
+                label="After rejection",
+                due=(record.reviewed_date + timedelta(days=REJECTED_MEDIA_GRACE_DAYS)).date(),
+                automatic=False,
+                detail=(
+                    f"Rejected evidence is removed {REJECTED_MEDIA_GRACE_DAYS} days after review, "
+                    "but this runs when an administrator triggers it rather than on a schedule."
+                ),
+            )
+        )
+    elif record.is_pending:
+        rules.append(
+            MediaRetentionRule(
+                label="While awaiting review",
+                due=None,
+                automatic=False,
+                detail="Evidence is kept until the record is reviewed. No removal is scheduled before then.",
+            )
+        )
+
+    return sorted(rules, key=lambda rule: (rule.due is None, rule.due))
+
+
+# --- who may review a verification record ---------------------------------------------------
+#
+# The single definition. Before this, the same-gender rule was hand-copied into the list, the
+# review page, the media gate and the sidebar badge, and the Power rule lived in the review page
+# alone -- so the list offered "View" on Power records the page then refused to let anyone
+# decide. Every one of those now asks the functions below.
+
+
+@dataclass(frozen=True)
+class ReviewRequirement:
+    """One condition a reviewer must meet before acting on a verification record.
+
+    Attributes:
+        key: Stable identifier, for templates and tests.
+        label: The chip on the list -- what the requirement is.
+        only_label: What the list says to someone who does not meet it, in place of "View".
+        explanation: The review page's sentence about it.
+        blocks_opening: True when a reviewer who does not meet it may not even open the
+            record. Same-gender (the rider asked who may SEE their evidence) and Admin review
+            (evidence submitted as Other is for admins alone, by the team's decision). Power
+            restricts only the decision and leaves the evidence open to reviewers, so one can
+            still look, flag a problem, or leave a note.
+
+    """
+
+    key: str
+    label: str
+    only_label: str
+    explanation: str
+    blocks_opening: bool
+
+
+SAME_GENDER_REVIEW = ReviewRequirement(
+    key="same_gender",
+    label="Same gender",
+    only_label="Same gender only",
+    explanation="The rider asked for a reviewer of the same gender.",
+    blocks_opening=True,
+)
+ADMIN_REVIEW = ReviewRequirement(
+    key="admin",
+    label="Admin review",
+    only_label="Admins only",
+    explanation="Submitted as Other, so only an Admin or Super Admin can open it and approve or reject it.",
+    blocks_opening=True,
+)
+PERFORMANCE_TEAM_REVIEW = ReviewRequirement(
+    key="performance_team",
+    label="Performance team",
+    only_label="Performance team only",
+    explanation="Power records are decided by the performance verification team.",
+    blocks_opening=False,
+)
+
+
+def review_requirements(record: RaceReadyRecord) -> list[ReviewRequirement]:
+    """List every reviewer requirement this record carries, in display order.
+
+    Args:
+        record: The verification record.
+
+    Returns:
+        The requirements; empty when any reviewer may decide it.
+
+    """
+    requirements = []
+    if record.same_gender:
+        requirements.append(SAME_GENDER_REVIEW)
+    # Evidence that is none of the named kinds is the one the team wants senior eyes on.
+    if record.media_type == "other":
+        requirements.append(ADMIN_REVIEW)
+    if record.verify_type == "power" and config.POWER_REQUIRES_PER_VER:
+        requirements.append(PERFORMANCE_TEAM_REVIEW)
+    return requirements
+
+
+def _meets_requirement(user: User, record: RaceReadyRecord, requirement: ReviewRequirement) -> bool:
+    """Report whether ``user`` satisfies one requirement on ``record``.
+
+    Superusers satisfy all of them, as they always have for same-gender.
+
+    Admin review is ``app_admin``, which comes from the Discord roles in PERM_APP_ADMIN_ROLES --
+    so the Discord Admin role is configured there, not here. It gates opening the record as well
+    as deciding it, and always on top of ``approve_verification`` (:func:`is_verification_reviewer`).
+    The Performance Verification Team does NOT satisfy it: that is the point of the requirement.
+
+    The Power requirement also counts ``app_admin``. The review page's status-change path
+    already let admins decide Power records whatever the setting said; counting them here keeps
+    that exactly as it was rather than quietly taking it away.
+
+    Args:
+        user: The reviewer.
+        record: The record.
+        requirement: The requirement to test.
+
+    Returns:
+        True if the requirement is met.
+
+    """
+    from apps.accounts.models import Permissions
+
+    if user.is_superuser:
+        return True
+    if requirement is SAME_GENDER_REVIEW:
+        return record.user.gender == user.gender
+    if requirement is ADMIN_REVIEW:
+        return user.is_app_admin
+    if requirement is PERFORMANCE_TEAM_REVIEW:
+        return user.is_app_admin or user.has_permission(Permissions.PERFORMANCE_VERIFICATION_TEAM)
+    return False
+
+
+def unmet_review_requirements(user: User, record: RaceReadyRecord) -> list[ReviewRequirement]:
+    """List the requirements on ``record`` that ``user`` does not meet.
+
+    Args:
+        user: The reviewer.
+        record: The record.
+
+    Returns:
+        The unmet requirements, in display order.
+
+    """
+    return [req for req in review_requirements(record) if not _meets_requirement(user, record, req)]
+
+
+def is_verification_reviewer(user: User) -> bool:
+    """Report whether ``user`` reviews verifications at all.
+
+    Being an Admin is not enough on its own: the queue needs ``approve_verification``. Widening
+    it to every admin would widen who sees body photographs, which is not this rule's call.
+
+    Args:
+        user: The person asking.
+
+    Returns:
+        True for superusers and holders of ``approve_verification``.
+
+    """
+    return user.is_superuser or user.can_approve_verification
+
+
+def can_open_verification_record(user: User, record: RaceReadyRecord) -> bool:
+    """Report whether ``user`` may open ``record``'s review page.
+
+    Args:
+        user: The reviewer.
+        record: The record.
+
+    Returns:
+        True unless they are not a reviewer, or a requirement that blocks opening is unmet.
+
+    """
+    if not is_verification_reviewer(user):
+        return False
+    return not any(req.blocks_opening for req in unmet_review_requirements(user, record))
+
+
+def can_decide_verification_record(user: User, record: RaceReadyRecord) -> bool:
+    """Report whether ``user`` may approve or reject ``record``.
+
+    This is the gate on the review page's decision POST -- every path that can mark a record
+    verified or rejected -- not only on the buttons.
+
+    Args:
+        user: The reviewer.
+        record: The record.
+
+    Returns:
+        True only for a reviewer who meets every requirement on the record.
+
+    """
+    return is_verification_reviewer(user) and not unmet_review_requirements(user, record)
+
+
+def records_decidable_by(user: User, records: QuerySet) -> QuerySet:
+    """Narrow ``records`` to those ``user`` may decide, in the database.
+
+    The queryset twin of :func:`can_decide_verification_record`, for counting without loading
+    rows. A test holds the two to the same answer for every combination, since this one cannot
+    call the other.
+
+    Args:
+        user: The reviewer, already known to be one.
+        records: A ``RaceReadyRecord`` queryset.
+
+    Returns:
+        The narrowed queryset.
+
+    """
+    from apps.accounts.models import Permissions
+
+    if user.is_superuser:
+        return records
+    records = records.filter(Q(same_gender=False) | Q(same_gender=True, user__gender=user.gender))
+    if not user.is_app_admin:
+        records = records.exclude(media_type="other")
+        if config.POWER_REQUIRES_PER_VER and not user.has_permission(Permissions.PERFORMANCE_VERIFICATION_TEAM):
+            records = records.exclude(verify_type="power")
+    return records
+
+
+def can_view_verification_media(user: User, record: RaceReadyRecord) -> bool:
+    """Report whether ``user`` may see ``record``'s uploaded evidence.
+
+    This is the single definition of that rule. The review page uses it to decide whether to
+    render the media block, and the media view uses it to decide whether to hand out a URL --
+    they must not be able to disagree, or the second becomes a way around the first.
+
+    Three conditions, all required:
+
+    1. The viewer reviews verifications at all (or is a superuser).
+    2. Every requirement that blocks opening the record is met: same-gender, when the rider
+       asked for it, and Admin review, for evidence submitted as Other. Superusers bypass
+       both, matching the review page.
+    3. The record is still pending, or the viewer is on the performance verification team.
+       Once a record is decided, the evidence stops being visible to ordinary reviewers --
+       it was uploaded to support a decision that has now been made.
+
+    Args:
+        user: The person asking to see the media.
+        record: The verification record holding it.
+
+    Returns:
+        True if the media may be shown to this user.
+
+    """
+    from apps.accounts.models import Permissions
+
+    # Conditions 1 and 2 -- a reviewer, past any requirement that blocks opening the record.
+    if not can_open_verification_record(user, record):
+        return False
+
+    return record.is_pending or user.has_permission(Permissions.PERFORMANCE_VERIFICATION_TEAM)
+
+
+_REVIEWER_POOL_CACHE_KEY = "verification:reviewer_pool_ids"
+_REVIEWER_POOL_TTL_SECONDS = 300
+
+
+def _reviewer_pool_ids() -> list[int]:
+    """Primary keys of everyone who can approve verifications at all.
+
+    Permissions resolve through Discord roles and per-user overrides in Python, so this
+    cannot be a queryset filter. The candidate set is narrowed to users who could plausibly
+    hold a permission before the real check runs, and the result is cached briefly -- the
+    membership changes when Discord roles change, which is not a per-request event.
+
+    Only ids are cached. The gate itself is re-run against live User objects by
+    :func:`media_access_summary`, so the rule has exactly one definition.
+
+    Returns:
+        User primary keys, unordered.
+
+    """
+    cached = cache.get(_REVIEWER_POOL_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    candidates = User.objects.filter(
+        Q(is_superuser=True) | ~Q(discord_roles={}) | ~Q(permission_overrides={})
+    ).only("id", "is_superuser", "discord_roles", "permission_overrides", "roles")
+    ids = [user.pk for user in candidates if user.is_superuser or user.can_approve_verification]
+    cache.set(_REVIEWER_POOL_CACHE_KEY, ids, _REVIEWER_POOL_TTL_SECONDS)
+    return ids
+
+
+def media_access_summary(record: RaceReadyRecord) -> dict:
+    """How many people can currently open ``record``'s evidence, and under what restriction.
+
+    Counted by running :func:`can_view_verification_media` against the live reviewer pool, so
+    this cannot drift from what the endpoint actually permits.
+
+    Deliberately a count and a category rather than names. Article 15 asks for "the recipients
+    or categories of recipient", and naming the individuals who reviewed a body photograph
+    exposes them to whoever disputes the outcome. The count is the part that tells a rider
+    something they can act on.
+
+    Args:
+        record: The verification record.
+
+    Returns:
+        ``count`` of people who can see it now, ``same_gender_only`` reflecting the rider's
+        own request, and ``restricted_to_team`` when the record is decided and only the
+        performance verification team retains access.
+
+    """
+    reviewers = User.objects.filter(pk__in=_reviewer_pool_ids())
+    eligible = [user for user in reviewers if can_view_verification_media(user, record)]
+    return {
+        "count": len(eligible),
+        "same_gender_only": bool(record.same_gender),
+        "restricted_to_team": not record.is_pending,
+    }
+
+
+def viewer_pseudonym(owner_id: int, viewer_id: int) -> str:
+    """Build a stable, non-reversible tag for a viewer, shown to the record's owner.
+
+    The same reviewer reads the same across all of one rider's records, so a rider can see
+    that one person opened three submissions rather than three people opening one each. The
+    owner is part of the key, so two riders comparing notes cannot line their tags up and
+    rebuild the reviewer roster between them.
+
+    Not a privacy control on its own -- with a handful of reviewers the set is small enough to
+    guess from -- which is why the access summary gives a count rather than names.
+
+    Args:
+        owner_id: The rider whose record it is.
+        viewer_id: The person who viewed it.
+
+    Returns:
+        Six hex characters.
+
+    """
+    digest = hmac.new(
+        settings.SECRET_KEY.encode(),
+        f"verification-viewer:{owner_id}:{viewer_id}".encode(),
+        hashlib.sha256,
+    )
+    return digest.hexdigest()[:6]
+
+
+def record_view_trail(record: RaceReadyRecord) -> list[dict]:
+    """Return the access trail for ``record``, as its owner should see it.
+
+    ``RecordView`` has existed for a while but was shown only to reviewers, which left the
+    data subject as the one person unable to see who had looked at their own photographs.
+
+    Only views that actually displayed the evidence are listed. Opening the page without
+    passing the media gate is a different event, and reporting it as "viewed" would overstate
+    what the person saw.
+
+    Args:
+        record: The verification record.
+
+    Returns:
+        One entry per viewer, most recent first, each with a pseudonym and counts.
+
+    """
+    views = RecordView.objects.filter(record=record, media_view_count__gt=0).order_by("-last_viewed_at")
+    return [
+        {
+            "tag": viewer_pseudonym(record.user_id, view.user_id),
+            "first_viewed_at": view.first_viewed_at,
+            "last_viewed_at": view.last_viewed_at,
+            "media_view_count": view.media_view_count,
+        }
+        for view in views
+    ]
+
+
+def verification_media_url(record: RaceReadyRecord) -> str:
+    """Mint a short-lived URL for ``record``'s media file.
+
+    Callers must have already cleared :func:`can_view_verification_media`.
+
+    Args:
+        record: The record whose ``media_file`` should be addressed.
+
+    Returns:
+        A URL valid for :data:`VERIFICATION_MEDIA_URL_TTL_SECONDS`, or
+        :data:`VERIFICATION_VIDEO_URL_TTL_SECONDS` for video, on backends that sign URLs.
+        Local filesystem storage takes no expiry and returns its plain path.
+
+    """
+    media = record.media_file
+    url = media.storage.url
+    ttl = VERIFICATION_VIDEO_URL_TTL_SECONDS if record.media_type == "video" else VERIFICATION_MEDIA_URL_TTL_SECONDS
+
+    # Ask the backend whether it takes an expiry rather than calling and catching TypeError.
+    # A blanket except would also swallow a TypeError raised *inside* a signing backend, and
+    # the fallback below returns a URL on the much longer storage-wide clock -- turning a bug
+    # into a silent downgrade of this control. Better to let such an error surface.
+    if "expire" in inspect.signature(url).parameters:
+        return url(media.name, expire=ttl)
+
+    # FileSystemStorage.url() takes no expiry; local dev serves straight off disk.
+    return media.url
+
+
+def log_record_view(record: RaceReadyRecord, user: User, *, media_shown: bool) -> None:
+    """Record that ``user`` opened ``record``'s detail page.
+
+    Keeps one row per (record, user) pair and bumps its counters, so opening a record
+    repeatedly updates the same row instead of appending history. Counter updates run as
+    an atomic UPDATE so concurrent views can't lose increments. Failures are logged and
+    swallowed — an audit write must never break the review page.
+
+    Args:
+        record: The verification record being viewed.
+        user: The viewer.
+        media_shown: Whether the page actually displayed the record's media to this user.
+
+    """
+    try:
+        view, _created = RecordView.objects.get_or_create(record=record, user=user)
+        RecordView.objects.filter(pk=view.pk).update(
+            view_count=F("view_count") + 1,
+            media_view_count=F("media_view_count") + (1 if media_shown else 0),
+            last_viewed_at=timezone.now(),
+        )
+        logfire.info(
+            "Verification record viewed",
+            record_id=record.pk,
+            record_owner_id=record.user_id,
+            viewer_id=user.pk,
+            media_shown=media_shown,
+        )
+    except Exception as e:  # never let the audit write break the review page
+        logfire.error(
+            "Failed to log verification record view",
+            record_id=record.pk,
+            viewer_id=user.pk,
+            error=str(e),
+        )
+
+
+def _covers_longer(candidate: RaceReadyRecord, current: RaceReadyRecord) -> bool:
+    """Whether ``candidate`` provides coverage further into the future than ``current``.
+
+    A never-expiring record (``days_remaining is None``) outranks any finite one;
+    between two finite records the greater ``days_remaining`` wins.
+
+    Args:
+        candidate: The record being considered.
+        current: The current best record for the same type.
+
+    Returns:
+        True if ``candidate`` should replace ``current`` as the covering record.
+
+    """
+    current_days = current.days_remaining
+    if current_days is None:
+        return False  # current never expires — nothing beats it
+    candidate_days = candidate.days_remaining
+    if candidate_days is None:
+        return True  # candidate never expires
+    return candidate_days > current_days
+
+
+def expiry_warning_thresholds() -> list[int]:
+    """Return the configured EXPIRE_WARNING_DAYS values, parsed once for every consumer.
+
+    The banner and the DM task each parsed this Constance JSON string themselves, with their
+    own fallbacks, while both docstrings claimed the two were "in lockstep". They were not,
+    and duplicated parsing is how they would drift again.
+
+    Returns:
+        Thresholds in descending order, e.g. ``[15, 7, 3, 1, 0]``. Falls back to ``[15]`` if
+        the setting cannot be parsed, and drops negatives -- a record past expiry is expired,
+        not expiring, which is a different notification.
+
+    """
+    from constance import config
+
+    try:
+        parsed = json.loads(config.EXPIRE_WARNING_DAYS)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logfire.error("Failed to parse EXPIRE_WARNING_DAYS config", error=str(exc))
+        parsed = [15]
+
+    values = {
+        int(d) for d in parsed if isinstance(d, int) or str(d).strip().lstrip("-").isdigit()
+    }
+    usable = sorted((v for v in values if v >= 0), reverse=True)
+    return usable or [15]
+
+
+def is_expiring_soon(days_remaining: int | None) -> bool:
+    """Whether a record counts as "expiring soon" for both the banner and the DM.
+
+    The one definition both surfaces use, so they cannot disagree about the boundary.
+
+    A record expiring TODAY (0 days) still counts -- the rider can act on it. One that has
+    already lapsed does not: that is a lost-Race-Verified state needing different wording, not
+    an "expires in -4 days" warning.
+
+    Args:
+        days_remaining: Days until expiry, or None for a record that never expires.
+
+    Returns:
+        True if the record is inside the warning window.
+
+    """
+    if days_remaining is None:
+        return False
+    return 0 <= days_remaining <= max(expiry_warning_thresholds())
+
+
+# Worst first on a captain's list: a rider missing a REQUIRED verification cannot race and has
+# nothing to renew (whether or not they hold others -- "missing_all" tells those apart), a
+# lapsed rider cannot race, and an expiring one still can.
+_ROW_ORDER = {"none": 0, "lapsed": 1, "expiring": 2}
+
+
+def needs_captain_attention(days_remaining: int | None, *, warn_within: int | None = None) -> bool:
+    """Whether a record should appear on a captain's squad-mates list.
+
+    Wider than :func:`is_expiring_soon` by exactly one thing: a record that has ALREADY
+    lapsed still counts, and sorts to the top.
+
+    For the rider the two states need different words -- "renew this" versus "you have lost
+    Race Verified" -- which is why their own banner keeps them apart. For a captain the
+    question collapses: this rider cannot race, or soon will not be able to. Leaving the
+    lapsed rider out hid the worse half of it.
+
+    ``is_expiring_soon`` is deliberately left as it was. It is the shared definition behind
+    the rider's banner and the DM task, and widening it there would start sending riders
+    reminders to renew things that have already gone.
+
+    Args:
+        days_remaining: Days until expiry (negative once lapsed), or None for a record that
+            never expires.
+        warn_within: The window, when the caller has already read it. Callers in a loop MUST
+            pass this: ``expiry_warning_thresholds()`` reads Constance, and Constance has no
+            cache backend configured here, so every default-path call is its own SELECT.
+
+    Returns:
+        True if the captain should be shown this record.
+
+    """
+    if days_remaining is None:
+        return False
+    limit = max(expiry_warning_thresholds()) if warn_within is None else warn_within
+    return days_remaining <= limit
+
+
+def covering_records_by_type(records) -> dict[str, RaceReadyRecord]:
+    """Collapse verified records to the single coverage-defining record per verify_type.
+
+    ``User.calculate_race_ready`` treats a verification type as satisfied when *any*
+    non-expired verified record of that type exists, so a type's real coverage is set
+    by its longest-lived record, not by each record individually. Reducing to that one
+    record per type is what lets a freshly-renewed verification supersede the record it
+    replaces: the expiring old record must not drive "expiring soon" warnings (DM banner
+    or web banner) while a newer record of the same type still covers it.
+
+    Args:
+        records: Iterable of **verified** RaceReadyRecord instances (mixed types allowed).
+
+    Returns:
+        Mapping of ``verify_type`` -> the longest-lived record of that type. A type whose
+        covering record never expires has ``days_remaining is None``; a type whose every
+        record has already expired keeps its (negative-``days_remaining``) record.
+
+    """
+    covering: dict[str, RaceReadyRecord] = {}
+    for record in records:
+        current = covering.get(record.verify_type)
+        if current is None or _covers_longer(record, current):
+            covering[record.verify_type] = record
+    return covering
+
+
+@dataclass(frozen=True)
+class Requirement:
+    """One thing a rider must hold, satisfiable by ANY of its ``types``.
+
+    Most requirements are a single verify_type. The exception is weight in a category that
+    lists both weight verifications, where either one satisfies it -- which is why a
+    requirement is a SET rather than a type, and why warning about a type in isolation is
+    what made a covered rider read as expired.
+
+    Attributes:
+        types: The verify_types that satisfy this requirement.
+        label: What to call it in the UI ("Weight" for the either-weight requirement, so a
+            rider is not told to renew the record their better one has already superseded).
+
+    """
+
+    types: frozenset[str]
+    label: str
+
+
+@dataclass(frozen=True)
+class VerificationCoverage:
+    """Whether a rider's REQUIRED verifications cover them, and for how much longer.
+
+    ``covered_now`` is exactly ``User.calculate_race_ready()`` recomputed from batched data:
+    a type counts as valid when its longest-lived verified record has not expired, and a
+    requirement counts as met when any of its types is valid.
+
+    Attributes:
+        covered_now: Whether every requirement is met today (i.e. race ready).
+        state: ``"none"`` (a requirement has no record at all), ``"lapsed"`` (a requirement's
+            best record is past expiry), ``"expiring"`` (met, and the soonest requirement is
+            inside the warning window) or ``"ok"``.
+        days: Signed days until the soonest-lapsing requirement, or None when every met
+            requirement never expires. A never-expiring requirement never bounds this.
+        requirement: Label of the binding requirement, or None when nothing binds.
+        holds_any: Whether the rider holds any verified record at all. Lets a caller tell
+            "has never started" from "missing one required type".
+
+    """
+
+    covered_now: bool
+    state: str
+    days: int | None
+    requirement: str | None
+    holds_any: bool
+
+
+def requirements_for(required_types) -> list[Requirement]:
+    """Turn a list of required verify_types into the requirements a rider must satisfy.
+
+    This is where the weight OR rule lives, mirroring ``User.calculate_race_ready``: when the
+    category lists BOTH weight types they collapse into one requirement satisfied by either,
+    and when it lists one (or neither) every listed type stands on its own.
+
+    Args:
+        required_types: The verify_types the rider's category demands.
+
+    Returns:
+        Requirements in display order, weight first. Each is satisfied by ANY of its types.
+
+    """
+    weight_required = WEIGHT_VERIFY_TYPES.intersection(required_types)
+    either_weight = len(weight_required) > 1
+    requirements = [Requirement(frozenset(weight_required), "Weight")] if either_weight else []
+    requirements += [
+        Requirement(frozenset({t}), VERIFY_TYPE_LABELS.get(t, t))
+        for t in dict.fromkeys(required_types)
+        if not (either_weight and t in weight_required)
+    ]
+    return requirements
+
+
+def record_days_left(record: RaceReadyRecord, validity_by_type: dict[str, int], today: date) -> int | None:
+    """Days until a verified record expires, without re-reading Constance per record.
+
+    ``RaceReadyRecord.days_remaining`` reads all four expiry windows on every access, and
+    Constance has no cache backend here, so the property costs four SELECTs per call.
+
+    Args:
+        record: A verified record.
+        validity_by_type: The four windows, read once by the caller.
+        today: The local date, taken once by the caller.
+
+    Returns:
+        Signed days remaining, or None when this record never expires -- either because its
+        type's window is 0 or because it carries no ``record_date`` to count from. None means
+        "+infinity", never "unknown" and never "expired".
+
+    """
+    validity = validity_by_type.get(record.verify_type, 0)
+    if not validity or not record.record_date:
+        return None
+    return (record.record_date + timedelta(days=validity) - today).days
+
+
+def _cover_days_by_type(records, validity_by_type: dict[str, int], today: date) -> dict[str, int | None]:
+    """Collapse verified records to the days the coverage-defining record of each type leaves.
+
+    Same rule as :func:`covering_records_by_type` / :func:`_covers_longer` -- a never-expiring
+    record outranks any finite one, otherwise more days wins -- but on days computed once per
+    record rather than re-derived on every comparison. Only the days survive: nothing
+    downstream needs the record itself, and the same shape is what
+    :func:`superseded_weight_types` already takes.
+
+    Args:
+        records: The rider's verified records, any mix of types.
+        validity_by_type: The four expiry windows, read once.
+        today: The local date, taken once.
+
+    Returns:
+        Mapping of verify_type -> signed days, or None where the type never expires. A type
+        the rider holds nothing for is ABSENT, which is deliberately different from a
+        negative entry.
+
+    """
+    best: dict[str, int | None] = {}
+    for record in records:
+        days = record_days_left(record, validity_by_type, today)
+        if record.verify_type not in best:
+            best[record.verify_type] = days
+            continue
+        current = best[record.verify_type]
+        if current is None:
+            continue  # current never expires -- nothing beats it
+        if days is None or days > current:
+            best[record.verify_type] = days
+    return best
+
+
+def _coverage_from(
+    requirements: list[Requirement],
+    cover: dict[str, int | None],
+    *,
+    warn_within: int,
+) -> VerificationCoverage:
+    """Judge one rider's requirements against the coverage they actually hold.
+
+    Args:
+        requirements: What this rider's category demands, from :func:`requirements_for`.
+        cover: Per-type days remaining from :func:`_cover_days_by_type`.
+        warn_within: The expiry warning window, read once by the caller.
+
+    Returns:
+        The rider's coverage, worst finding first: a missing requirement outranks a lapsed
+        one, which outranks an expiring one.
+
+    """
+    missing: Requirement | None = None
+    lapsed: tuple[int, Requirement] | None = None
+    soonest: tuple[int, Requirement] | None = None
+
+    for requirement in requirements:
+        held = [cover[t] for t in requirement.types if t in cover]
+        if not held:
+            if missing is None:
+                missing = requirement
+            continue
+        if any(days is None for days in held):
+            # This requirement never lapses, so it must not bound the minimum.
+            continue
+        days = max(held)
+        if days < 0:
+            if lapsed is None or days < lapsed[0]:
+                lapsed = (days, requirement)
+        elif soonest is None or days < soonest[0]:
+            soonest = (days, requirement)
+
+    holds_any = bool(cover)
+    if missing is not None:
+        return VerificationCoverage(False, "none", None, missing.label, holds_any)
+    if lapsed is not None:
+        days, requirement = lapsed
+        return VerificationCoverage(False, "lapsed", days, requirement.label, holds_any)
+    if soonest is None:
+        return VerificationCoverage(True, "ok", None, None, holds_any)
+    days, requirement = soonest
+    # needs_captain_attention is the captain window's definition; the window is passed in so
+    # this stays free of a Constance read per rider.
+    state = "expiring" if needs_captain_attention(days, warn_within=warn_within) else "ok"
+    return VerificationCoverage(True, state, days, requirement.label, holds_any)
+
+
+def verification_coverage_bulk(users, *, warn_within: int | None = None) -> dict[int, VerificationCoverage]:
+    """Answer "is this rider covered, when does it lapse, and what binds" for many riders.
+
+    The one place the race-ready rule is applied to an expiry question. Every warning surface
+    must go through it: judging each verify_type on its own is what listed riders as expired
+    who were covered -- a category-40 rider's lapsed ``weight_full`` beside a valid
+    ``weight_light``, or a lapsed ``power`` record their category never asked for -- while
+    hiding the riders who genuinely could not race because a REQUIRED type was missing.
+
+    Costs a constant number of queries for the whole batch: one verified-records query, at
+    most one ``ZPTeamRiders`` query, and the Constance reads (category requirements, the four
+    expiry windows, the warning window) hoisted above every loop. It is called from a context
+    processor on each authenticated render, so per-rider queries are the one thing it exists
+    to prevent.
+
+    Args:
+        users: The riders to judge. Rows are read; nothing is written.
+        warn_within: The warning window, when the caller has already read it. Omit to read
+            ``EXPIRE_WARNING_DAYS`` once here.
+
+    Returns:
+        Mapping of ``user.id`` -> :class:`VerificationCoverage`.
+
+    """
+    user_list = list(users)
+    if not user_list:
+        return {}
+
+    # only() because the answer needs four columns and the row carries other riders'
+    # measurements (weight, height, ftp), the evidence path and the reviewer's notes. This
+    # runs on a captain's every render for every member of every squad they lead, so pulling
+    # the rest into the web worker is personal data leaving the database for nothing.
+    records_by_user: dict[int, list[RaceReadyRecord]] = {}
+    for record in RaceReadyRecord.objects.filter(
+        user_id__in=[u.id for u in user_list], status=RaceReadyRecord.Status.VERIFIED
+    ).only("id", "user_id", "verify_type", "record_date", "status"):
+        records_by_user.setdefault(record.user_id, []).append(record)
+
+    required_by_user = required_types_bulk(user_list)
+    validity_by_type = verify_type_validity_days()
+    window = max(expiry_warning_thresholds()) if warn_within is None else warn_within
+    today = timezone.localdate()
+
+    return {
+        user.id: _coverage_from(
+            requirements_for(required_by_user.get(user.id) or DEFAULT_VERIFICATION_TYPES),
+            _cover_days_by_type(records_by_user.get(user.id, ()), validity_by_type, today),
+            warn_within=window,
+        )
+        for user in user_list
+    }
+
+
+def superseded_weight_types(required_types, days_by_type: dict[str, int | None]) -> set[str]:
+    """Weight types whose requirement a better record of the OTHER weight type already covers.
+
+    The rider-facing half of the same fix. A rider's own banner and the expiry DM warn per
+    verify_type, and :func:`covering_records_by_type` already stops a renewed record from
+    nagging about the one it replaced -- but only WITHIN a type. In a category that accepts
+    either weight the two types are one requirement, so a ``weight_full`` expiring in 5 days
+    is not worth a warning while a ``weight_light`` covers the same requirement for 30 more.
+
+    Only weight can be superseded across types, because weight is the only either-or
+    requirement. Equal days supersede nothing: both records are then holding the requirement
+    up, and silencing one arbitrarily would lose the warning.
+
+    Args:
+        required_types: The rider's required verify_types.
+        days_by_type: Signed days remaining per covering verify_type (None = never expires).
+
+    Returns:
+        The verify_types to leave out of the rider's warnings. Empty for every category that
+        does not accept either weight.
+
+    """
+    accepted = WEIGHT_VERIFY_TYPES.intersection(required_types)
+    if len(accepted) < 2:
+        return set()
+    held = {t: days_by_type[t] for t in accepted if t in days_by_type}
+    if len(held) < 2:
+        return set()
+    if any(days is None for days in held.values()):
+        # One of them never expires, so it covers the requirement forever.
+        return {t for t, days in held.items() if days is not None}
+    best = max(held.values())
+    return {t for t, days in held.items() if days < best}
+
+
+def squad_expiring_summary(user) -> dict:
+    """Squad-mates who cannot race, or soon will not be able to, for the squads this user leads.
+
+    Drives both the captain banner and the modal behind it, deliberately from one place:
+    the banner is a count of what the modal lists, and two implementations of that would
+    eventually disagree and read as a bug.
+
+    Scope, in the order it narrows:
+
+    * squads that opted in (``notify_captain_expiring_verification``) -- off by default, so
+      most captains never reach a query past this one;
+    * squads whose EVENT HAS NOT ENDED. A finished event cannot be raced, so nagging a
+      captain to chase verifications for it is pure noise;
+    * riders with a ``MEMBER`` row on that squad -- a pending or rejected applicant is not
+      yet a squad-mate to remind;
+    * of those, riders whose REQUIRED coverage is in one of three states, worst first:
+
+      - ``none`` -- a required verification is missing entirely: either the rider holds
+        nothing at all, or they hold some records but not one that satisfies a requirement
+        their category demands.
+      - ``lapsed`` -- a required requirement's best record has gone past its expiry.
+      - ``expiring`` -- inside the warning window (``needs_captain_attention``).
+
+      The rider's own banner still separates expiring from lapsed, because "renew this" and
+      "you have lost Race Verified" are different things to tell the person themselves; to a
+      captain chasing a roster all three are one list.
+
+      The judgement is ``verification_coverage_bulk``, i.e. the race-ready rule itself, so
+      this list agrees with ``User.calculate_race_ready()``, the rule behind the badge. The
+      badge itself renders the CACHED ``User.is_race_ready``, so the two can still differ for
+      up to ``SCHEDULER_REFRESH_ALL_RACE_READY_HOURS`` after a record lapses on its own --
+      closing that needs the cache refreshed on expiry, not on a sweep. Judging each
+      verify_type on its own -- what this did before -- listed a category-40 rider as
+      "expired 145 days ago" for a ``weight_full`` their valid ``weight_light`` already
+      covered, flagged records of types the category never asked for, and stayed silent about
+      riders who held one record and were missing a required one.
+
+    Args:
+        user: The signed-in user, treated as a potential captain or vice-captain.
+
+    Returns:
+        ``{"squads": [{"squad", "rows": [...]}], "rider_count"}``. Each row carries ``user``,
+        ``state`` (``"none"``, ``"lapsed"`` or ``"expiring"``), ``days`` (signed, None for
+        ``none``), ``days_abs``, ``verify_type`` (the BINDING REQUIREMENT's label -- "Weight"
+        where either weight satisfies it) and ``missing_all`` (True only when the rider holds
+        no verified record whatsoever, so the modal can say "nothing verified" rather than
+        naming one requirement).
+        ``rider_count`` counts DISTINCT riders: a rider in two of this captain's squads is
+        still one person to remind, so the banner speaks of people while the modal shows
+        them under each squad they belong to.
+
+    """
+    # Local import: apps.events imports this module, so a module-level import here would
+    # close the loop. Same pattern as apps/team/tasks.py.
+    from apps.events.models import Squad, SquadMember
+
+    squads = list(
+        Squad.objects.filter(
+            Q(captains=user) | Q(vice_captains=user),
+            notify_captain_expiring_verification=True,
+            event__end_date__gte=timezone.localdate(),
+            # Matches _active_squads() and the captain-notification query in tasks.py. An
+            # event hidden from riders should not be pushing a banner at its captains.
+            event__visible=True,
+        )
+        .select_related("event")
+        .distinct()
+        .order_by("event__title", "name")
+    )
+    if not squads:
+        return {"squads": [], "rider_count": 0}
+
+    members_by_squad: dict[int, list] = {}
+    members_by_id: dict[int, User] = {}
+    for membership in SquadMember.objects.filter(squad__in=squads, status=SquadMember.Status.MEMBER).select_related(
+        "user"
+    ):
+        members_by_squad.setdefault(membership.squad_id, []).append(membership.user)
+        members_by_id[membership.user_id] = membership.user
+    if not members_by_id:
+        return {"squads": [], "rider_count": 0}
+
+    # One batched judgement for every member, using the race-ready rule. Constance and the
+    # ZwiftPower categories are read once inside it, for the same reason this used to hoist
+    # the expiry windows by hand: RaceReadyRecord.days_remaining reads all four windows on
+    # every access, CONSTANCE_DATABASE_CACHE_BACKEND is unset here, and this runs in a context
+    # processor on every authenticated render -- per-rider reads cost hundreds of queries a
+    # pageview for a captain of a full squad.
+    coverage = verification_coverage_bulk(members_by_id.values())
+
+    groups = []
+    riders: set[int] = set()
+    for squad in squads:
+        rows = []
+        for member in members_by_squad.get(squad.pk, []):
+            # A playing captain has their own banner for their own verification; listing
+            # them among the squad-mates to chase double-counts one person's problem.
+            if member.pk == user.pk:
+                continue
+            cover = coverage.get(member.pk)
+            # "ok" is everything outside the warning window. The window itself is the one
+            # needs_captain_attention() uses -- verification_coverage_bulk reads it once and
+            # applies it to the binding REQUIREMENT, so re-testing per rider here would only
+            # buy a Constance SELECT each.
+            if cover is None or cover.state == "ok":
+                continue
+            rows.append({
+                "user": member,
+                "state": cover.state,
+                "days": cover.days,
+                "days_abs": abs(cover.days) if cover.days is not None else None,
+                "verify_type": cover.requirement,
+                "missing_all": cover.state == "none" and not cover.holds_any,
+            })
+            riders.add(member.pk)
+        if rows:
+            # Worst first -- a missing requirement, then lapsed (most overdue first), then the
+            # merely expiring (soonest first). Signed days do the second and third orderings
+            # in one key; _ROW_ORDER separates the states. The point of the list is who to
+            # chase first.
+            rows.sort(
+                key=lambda row: (
+                    _ROW_ORDER[row["state"]],
+                    row["days"] if row["days"] is not None else 0,
+                    # The same string the row displays -- sorting on get_full_name alone
+                    # puts every unnamed rider under one empty key, in arbitrary order.
+                    (row["user"].get_full_name() or row["user"].discord_username or "").lower(),
+                )
+            )
+            groups.append({"squad": squad, "rows": rows})
+
+    return {"squads": groups, "rider_count": len(riders)}
+
+
+# UnifiedRider.gender's letters, as the words a member's own gender is stored in.
+_GENDER_WORDS = {"F": "female", "M": "male"}
+
+
+@dataclass
+class UnifiedRider:
+    """Unified rider data from all sources."""
+
+    zwid: int
+
+    # User data
+    has_account: bool = False
+    user_id: int | None = None
+    username: str = ""
+    discord_id: str = ""
+    discord_username: str = ""
+    discord_avatar_url: str = ""
+    zwid_verified: bool = False
+    user_gender: str = ""
+
+    # ZwiftPower data
+    in_zwiftpower: bool = False
+    zp_name: str = ""
+    zp_div: int = 0
+    zp_divw: int = 0
+    zp_date_left: datetime | None = None
+    zp_rank: Decimal | None = None
+    zp_ftp: int | None = None
+    zp_weight: Decimal | None = None
+
+    # Zwift Racing data
+    in_zwiftracing: bool = False
+    zr_name: str = ""
+    zr_category: str = ""
+    # vELO 2's categories, from the rider's cached RiderProfile: the mixed one, shown beside
+    # zr_category (vELO 1's mixed one), and a woman's women's one, which only filters.
+    zr_v2_category: str = ""
+    zr_v2_women_category: str = ""
+    zr_date_left: datetime | None = None
+    zr_rating: Decimal | None = None
+    zr_phenotype: str = ""
+
+    # ZwiftPower Results (aggregated)
+    has_results: bool = False
+    result_count: int = 0
+
+    # Guild data
+    guild_joined_at: datetime | None = None
+
+    # Race Ready status
+    is_race_ready: bool = False
+    is_extra_verified: bool = False
+    # Class variable for div mapping
+    DIV_TO_CATEGORY: ClassVar[dict[int, str]] = ZP_DIV_TO_CATEGORY
+
+    @property
+    def display_name(self) -> str:
+        """Best available name."""
+        return self.zp_name or self.zr_name or self.username or f"Rider {self.zwid}"
+
+    @property
+    def zp_category(self) -> str:
+        """ZwiftPower category letter from division number."""
+        return ZP_DIV_TO_CATEGORY.get(self.zp_div, "")
+
+    @property
+    def zp_category_w(self) -> str:
+        """ZwiftPower women's category letter from division number."""
+        return ZP_DIV_TO_CATEGORY.get(self.zp_divw, "")
+
+    @property
+    def gender(self) -> str:
+        """Gender with fallback logic.
+
+        Priority: user profile gender > ZP divw (if > 0 = F, else M).
+
+        Returns:
+            'M' for male, 'F' for female, or '' if unknown.
+
+        """
+        # First check user profile gender (normalize from 'male'/'female' to 'M'/'F')
+        if self.user_gender:
+            if self.user_gender == "male":
+                return "M"
+            if self.user_gender == "female":
+                return "F"
+            return ""  # 'other' or unknown
+        # Fall back to ZwiftPower: if divw > 0, they are female
+        if self.in_zwiftpower:
+            return "F" if self.zp_divw > 0 else "M"
+        return ""
+
+    @property
+    def is_active_member(self) -> bool:
+        """Check if rider is active in at least one source."""
+        return (self.in_zwiftpower and not self.zp_date_left) or (self.in_zwiftracing and not self.zr_date_left)
+
+    @property
+    def zp_active(self) -> bool:
+        """Check if rider is active in ZwiftPower."""
+        return self.in_zwiftpower and not self.zp_date_left
+
+    @property
+    def zr_active(self) -> bool:
+        """Check if rider is active in Zwift Racing."""
+        return self.in_zwiftracing and not self.zr_date_left
+
+    @property
+    def membership_status(self) -> str:
+        """Detailed membership status.
+
+        Returns:
+            One of: 'both', 'zp_only', 'zr_only', 'left', 'none'
+
+        """
+        if self.zp_active and self.zr_active:
+            return "both"
+        if self.zp_active:
+            return "zp_only"
+        if self.zr_active:
+            return "zr_only"
+        if self.in_zwiftpower or self.in_zwiftracing:
+            return "left"
+        return "none"
+
+    @property
+    def wkg(self) -> Decimal | None:
+        """Calculate watts per kilogram from FTP and weight.
+
+        Returns:
+            FTP divided by weight, rounded to 2 decimal places, or None if either is missing.
+
+        """
+        if self.zp_ftp is not None and self.zp_weight is not None and self.zp_weight > 0:
+            return round(Decimal(self.zp_ftp) / self.zp_weight, 2)
+        return None
+
+    @property
+    def member_since(self) -> str:
+        """Human-readable duration since guild join.
+
+        Returns:
+            String like '2y 3m' or '--' if no join date.
+
+        """
+        if not self.guild_joined_at:
+            return "--"
+        from django.utils import timezone
+
+        now = timezone.now()
+        delta = now - self.guild_joined_at
+        total_months = delta.days // 30
+        years = total_months // 12
+        months = total_months % 12
+        if years > 0:
+            return f"{years}y {months}m"
+        return f"{months}m"
+
+    @property
+    def member_since_sort_key(self) -> int:
+        """Sortable value for member since (days since join, 0 if unknown)."""
+        if not self.guild_joined_at:
+            return 0
+        from django.utils import timezone
+
+        return (timezone.now() - self.guild_joined_at).days
+
+
+def get_unified_team_roster() -> list[UnifiedRider]:
+    """Get unified team roster from all data sources.
+
+    Returns:
+        List of UnifiedRider objects sorted by display name.
+
+    """
+    # Query each source with .values() for efficiency
+    users = User.objects.filter(zwid__isnull=False).values(
+        "id", "zwid", "username", "discord_username", "discord_id", "discord_avatar", "zwid_verified", "gender",
+        "zwid_verification_method",
+        "is_race_ready", "is_extra_verified",
+    )
+    zp_riders = ZPTeamRiders.objects.all().values(
+        "zwid", "name", "div", "divw", "date_left", "rank", "ftp", "weight"
+    )
+    zr_riders = ZRRider.objects.all().values(
+        "zwid", "name", "race_current_category", "date_left", "race_current_rating", "phenotype_value",
+    )
+
+    # Get result counts per rider
+    result_counts = ZPRiderResults.objects.values("zwid").annotate(count=Count("id"))
+
+    # Get guild member join dates (keyed by user_id)
+    guild_members = GuildMember.objects.filter(user__isnull=False).values("user_id", "joined_at")
+    guild_joined_by_user_id: dict[int, datetime | None] = {gm["user_id"]: gm["joined_at"] for gm in guild_members}
+
+    # Build lookup dicts
+    user_by_zwid: dict[int, dict] = {u["zwid"]: u for u in users}
+    zp_by_zwid: dict[int, dict] = {r["zwid"]: r for r in zp_riders}
+    zr_by_zwid: dict[int, dict] = {r["zwid"]: r for r in zr_riders}
+    results_by_zwid: dict[int, int] = {r["zwid"]: r["count"] for r in result_counts}
+
+    # Collect all unique zwids
+    zwid_set: set[int] = set()
+    zwid_set.update(user_by_zwid.keys())
+    zwid_set.update(zp_by_zwid.keys())
+    zwid_set.update(zr_by_zwid.keys())
+
+    # Build unified list
+    unified: list[UnifiedRider] = []
+
+    for zwid in zwid_set:
+        rider = UnifiedRider(zwid=zwid)
+
+        # User data
+        if zwid in user_by_zwid:
+            u = user_by_zwid[zwid]
+            rider.has_account = True
+            rider.user_id = u["id"]
+            rider.username = u["username"]
+            rider.discord_id = u["discord_id"] or ""
+            rider.discord_username = u["discord_username"] or ""
+            rider.zwid_verified = verification_accepted(u)
+            rider.user_gender = u["gender"] or ""
+            rider.is_race_ready = u["is_race_ready"]
+            rider.is_extra_verified = u["is_extra_verified"]
+
+            if u["discord_id"] and u["discord_avatar"]:
+                rider.discord_avatar_url = (
+                    f"https://cdn.discordapp.com/avatars/{u['discord_id']}/{u['discord_avatar']}.png"
+                )
+
+            rider.guild_joined_at = guild_joined_by_user_id.get(u["id"])
+
+        # ZwiftPower data
+        if zwid in zp_by_zwid:
+            zp = zp_by_zwid[zwid]
+            rider.in_zwiftpower = True
+            rider.zp_name = zp["name"]
+            rider.zp_div = zp["div"]
+            rider.zp_divw = zp["divw"]
+            rider.zp_date_left = zp["date_left"]
+            rider.zp_rank = zp["rank"]
+            rider.zp_ftp = zp["ftp"]
+            rider.zp_weight = zp["weight"]
+
+        # Zwift Racing data
+        if zwid in zr_by_zwid:
+            zr = zr_by_zwid[zwid]
+            rider.in_zwiftracing = True
+            rider.zr_name = zr["name"]
+            rider.zr_category = zr["race_current_category"] or ""
+            rider.zr_date_left = zr["date_left"]
+            rider.zr_rating = zr["race_current_rating"]
+            rider.zr_phenotype = zr["phenotype_value"] or ""
+
+        # Results data
+        if zwid in results_by_zwid:
+            rider.has_results = True
+            rider.result_count = results_by_zwid[zwid]
+
+        unified.append(rider)
+
+    # vELO 2's mixed category for everyone. The women's one comes for every rider too, and is
+    # kept for the riders this roster shows as women -- or, when it cannot say, whose profile does.
+    velo2 = velo2_categories_by_zwid((r.zwid, r.user_gender or _GENDER_WORDS.get(r.gender, "")) for r in unified)
+    for rider in unified:
+        if rider.zwid in velo2:
+            rider.zr_v2_category, rider.zr_v2_women_category = velo2[rider.zwid]
+
+    # Sort by display name
+    sorted_roster = sorted(unified, key=lambda r: r.display_name.lower())
+
+    logfire.debug(
+        "Unified team roster loaded",
+        total_riders=len(sorted_roster),
+        users_with_zwid=len(user_by_zwid),
+        zp_riders=len(zp_by_zwid),
+        zr_riders=len(zr_by_zwid),
+    )
+
+    return sorted_roster
+
+
+def get_unified_rider(zwid: int) -> UnifiedRider | None:
+    """Get unified data for a single rider.
+
+    Args:
+        zwid: The Zwift ID to look up.
+
+    Returns:
+        UnifiedRider or None if not found in any source.
+
+    """
+    roster = get_unified_team_roster()
+    for rider in roster:
+        if rider.zwid == zwid:
+            return rider
+    return None
+
+
+@dataclass
+class PerformanceRider:
+    """Performance review data combining verification records with ZwiftPower results."""
+
+    zwid: int
+    display_name: str = ""
+    zp_div: int = 0
+    zp_divw: int = 0
+    gender: str = ""
+    has_account: bool = False
+    user_id: int | None = None
+    discord_id: str = ""
+    discord_avatar_url: str = ""
+    is_race_ready: bool = False
+    is_extra_verified: bool = False
+    in_zwiftpower: bool = False
+    in_zwiftracing: bool = False
+    zr_category: str = ""
+    zr_v2_category: str = ""
+    zr_rating: Decimal | None = None
+    zr_phenotype: str = ""
+    zr_age: str = ""
+
+    # Verification data - weight light
+    weight_light_date: datetime | None = None
+    weight_light_value: Decimal | None = None
+
+    # Verification data - weight full
+    weight_full_date: datetime | None = None
+    weight_full_value: Decimal | None = None
+
+    # Verification data - height
+    height_date: datetime | None = None
+    height_value: int | None = None
+
+    # ZwiftPower result data
+    zp_result_date: datetime | None = None
+    zp_result_weight: Decimal | None = None
+    zp_height_date: datetime | None = None
+    zp_height_value: int | None = None
+
+    # FTP data (from ZPTeamRiders and history)
+    ftp_current: int | None = None
+    ftp_min: int | None = None
+    ftp_max: int | None = None
+
+    # ZwiftPower current weight (for WKG calculation)
+    zp_weight: Decimal | None = None
+
+    # Class variable for div mapping
+    DIV_TO_CATEGORY: ClassVar[dict[int, str]] = ZP_DIV_TO_CATEGORY
+
+    @property
+    def zp_category(self) -> str:
+        """ZwiftPower category letter from division number."""
+        return ZP_DIV_TO_CATEGORY.get(self.zp_div, "")
+
+    @property
+    def zp_category_w(self) -> str:
+        """ZwiftPower women's category letter from division number."""
+        return ZP_DIV_TO_CATEGORY.get(self.zp_divw, "")
+
+    @property
+    def latest_verification_weight(self) -> Decimal | None:
+        """The most recent verification weight (full or light)."""
+        if self.weight_full_date and self.weight_light_date:
+            if self.weight_full_date >= self.weight_light_date:
+                return self.weight_full_value
+            return self.weight_light_value
+        if self.weight_full_value is not None:
+            return self.weight_full_value
+        return self.weight_light_value
+
+    @property
+    def weight_diff(self) -> Decimal | None:
+        """Difference between latest verification weight and ZP result weight.
+
+        Returns:
+            Positive if ZP weight is higher than verification, negative if lower.
+            None if either value is missing.
+
+        """
+        verification_weight = self.latest_verification_weight
+        if verification_weight is None or self.zp_result_weight is None:
+            return None
+        return verification_weight - self.zp_result_weight
+
+    @property
+    def weight_diff_abs(self) -> Decimal | None:
+        """Absolute value of weight difference for sorting."""
+        diff = self.weight_diff
+        return abs(diff) if diff is not None else None
+
+    @property
+    def has_weight_concern(self) -> bool:
+        """True if weight decreased by more than 2kg (diff < -2)."""
+        diff = self.weight_diff
+        return diff is not None and diff < -2
+
+    @property
+    def has_severe_weight_concern(self) -> bool:
+        """True if weight decreased by more than 5kg (diff < -5)."""
+        diff = self.weight_diff
+        return diff is not None and diff < -5
+
+    @property
+    def height_diff(self) -> int | None:
+        """Difference between verification height and ZP result height in cm.
+
+        Returns:
+            Positive if verification is taller, negative if shorter.
+            None if either value is missing.
+
+        """
+        if self.height_value is None or self.zp_height_value is None:
+            return None
+        return self.height_value - self.zp_height_value
+
+    @property
+    def wkg(self) -> Decimal | None:
+        """Calculate watts per kilogram from FTP and weight.
+
+        Returns:
+            FTP divided by weight, rounded to 2 decimal places, or None if either is missing.
+
+        """
+        if self.ftp_current is not None and self.zp_weight is not None and self.zp_weight > 0:
+            return round(Decimal(self.ftp_current) / self.zp_weight, 2)
+        return None
+
+
+def get_performance_review_data() -> list[PerformanceRider]:
+    """Get performance review data for all riders (outer join of ZP, ZR, Users).
+
+    Includes all riders from ZwiftPower, Zwift Racing, and Users,
+    excluding those who have left (zp_date_left is set).
+
+    Returns:
+        List of PerformanceRider objects sorted by display name.
+
+    """
+    # Get unified roster for basic rider info (outer join of all sources)
+    roster = get_unified_team_roster()
+
+    # Filter out riders who have left ZwiftPower
+    roster = [r for r in roster if not r.zp_date_left]
+
+    # Build lookup of rider info by zwid
+    rider_info: dict[int, dict] = {}
+    for r in roster:
+        rider_info[r.zwid] = {
+            "display_name": r.display_name,
+            "zp_div": r.zp_div,
+            "zp_divw": r.zp_divw,
+            "gender": r.gender,
+            "has_account": r.has_account,
+            "user_id": r.user_id,
+            "discord_id": r.discord_id,
+            "discord_avatar_url": r.discord_avatar_url,
+            "is_race_ready": r.is_race_ready,
+            "is_extra_verified": r.is_extra_verified,
+            "in_zwiftpower": r.in_zwiftpower,
+            "in_zwiftracing": r.in_zwiftracing,
+            "zr_category": r.zr_category,
+            "zr_v2_category": r.zr_v2_category,
+            "zr_rating": r.zr_rating,
+            "zr_phenotype": r.zr_phenotype,
+        }
+
+    if not rider_info:
+        logfire.debug("Performance review data: no active riders found")
+        return []
+
+    # Get most recent verified records per user per type using subquery
+    # First, get the latest verified record ID for each user/type combination
+    latest_verified_subquery = RaceReadyRecord.objects.filter(
+        user__zwid=OuterRef("user__zwid"),
+        verify_type=OuterRef("verify_type"),
+        status=RaceReadyRecord.Status.VERIFIED,
+    ).order_by("-reviewed_date").values("pk")[:1]
+
+    verified_records = RaceReadyRecord.objects.filter(
+        status=RaceReadyRecord.Status.VERIFIED,
+        user__zwid__in=rider_info.keys(),
+        pk__in=Subquery(latest_verified_subquery),
+    ).select_related("user").values(
+        "user__zwid", "verify_type", "weight", "height", "reviewed_date"
+    )
+
+    # Build lookup of verification data by zwid
+    verification_by_zwid: dict[int, dict] = {}
+    for record in verified_records:
+        zwid = record["user__zwid"]
+        if zwid not in verification_by_zwid:
+            verification_by_zwid[zwid] = {}
+
+        verify_type = record["verify_type"]
+        if verify_type == "weight_light":
+            verification_by_zwid[zwid]["weight_light_date"] = record["reviewed_date"]
+            verification_by_zwid[zwid]["weight_light_value"] = record["weight"]
+        elif verify_type == "weight_full":
+            verification_by_zwid[zwid]["weight_full_date"] = record["reviewed_date"]
+            verification_by_zwid[zwid]["weight_full_value"] = record["weight"]
+        elif verify_type == "height":
+            verification_by_zwid[zwid]["height_date"] = record["reviewed_date"]
+            verification_by_zwid[zwid]["height_value"] = record["height"]
+
+    # Get most recent ZP result with weight/height for each rider (batch query)
+    # Fetch all results at once instead of one query per rider
+    zp_data_by_zwid: dict[int, dict] = {}
+    all_results = (
+        ZPRiderResults.objects.filter(zwid__in=rider_info.keys())
+        .exclude(weight__isnull=True, height__isnull=True)
+        .select_related("event")
+        .order_by("zwid", "-event__event_date")
+        .values("zwid", "event__event_date", "weight", "height")
+    )
+
+    # Group results by zwid and find most recent weight/height
+    for result in all_results:
+        zwid = result["zwid"]
+        event_date = result["event__event_date"]
+        weight = result["weight"]
+        height = result["height"]
+
+        if zwid not in zp_data_by_zwid:
+            zp_data_by_zwid[zwid] = {}
+
+        # Store most recent weight (first one we see due to ordering)
+        if weight is not None and "zp_result_date" not in zp_data_by_zwid[zwid]:
+            zp_data_by_zwid[zwid]["zp_result_date"] = event_date
+            zp_data_by_zwid[zwid]["zp_result_weight"] = weight
+
+        # Store most recent height (first one we see due to ordering)
+        if height is not None and "zp_height_date" not in zp_data_by_zwid[zwid]:
+            zp_data_by_zwid[zwid]["zp_height_date"] = event_date
+            zp_data_by_zwid[zwid]["zp_height_value"] = height
+
+    # Get current FTP and weight from ZPTeamRiders
+    zp_riders = ZPTeamRiders.objects.filter(zwid__in=rider_info.keys()).values("zwid", "ftp", "weight")
+    ftp_current_by_zwid: dict[int, int | None] = {r["zwid"]: r["ftp"] for r in zp_riders}
+    weight_by_zwid: dict[int, Decimal | None] = {r["zwid"]: r["weight"] for r in zp_riders}
+
+    # Get FTP history (min/max) for each rider (batch query)
+    # Query historical records directly with aggregation instead of one query per rider
+    ftp_stats_by_zwid: dict[int, dict] = {}
+    ftp_agg = (
+        ZPTeamRiders.history.filter(zwid__in=rider_info.keys())
+        .exclude(ftp__isnull=True)
+        .values("zwid")
+        .annotate(ftp_min=Min("ftp"), ftp_max=Max("ftp"))
+    )
+    for stat in ftp_agg:
+        ftp_stats_by_zwid[stat["zwid"]] = {
+            "ftp_min": stat["ftp_min"],
+            "ftp_max": stat["ftp_max"],
+        }
+
+    # Build PerformanceRider objects
+    performance_riders: list[PerformanceRider] = []
+    for zwid, info in rider_info.items():
+        rider = PerformanceRider(
+            zwid=zwid,
+            display_name=info["display_name"],
+            zp_div=info["zp_div"],
+            zp_divw=info["zp_divw"],
+            gender=info["gender"],
+            has_account=info["has_account"],
+            user_id=info["user_id"],
+            discord_id=info["discord_id"],
+            discord_avatar_url=info["discord_avatar_url"],
+            is_race_ready=info["is_race_ready"],
+            is_extra_verified=info["is_extra_verified"],
+            in_zwiftpower=info["in_zwiftpower"],
+            in_zwiftracing=info["in_zwiftracing"],
+            zr_category=info["zr_category"],
+            zr_v2_category=info["zr_v2_category"],
+            zr_rating=info["zr_rating"],
+            zr_phenotype=info["zr_phenotype"],
+        )
+
+        # Add verification data
+        if zwid in verification_by_zwid:
+            v = verification_by_zwid[zwid]
+            rider.weight_light_date = v.get("weight_light_date")
+            rider.weight_light_value = v.get("weight_light_value")
+            rider.weight_full_date = v.get("weight_full_date")
+            rider.weight_full_value = v.get("weight_full_value")
+            rider.height_date = v.get("height_date")
+            rider.height_value = v.get("height_value")
+
+        # Add ZP data
+        if zwid in zp_data_by_zwid:
+            zp = zp_data_by_zwid[zwid]
+            rider.zp_result_date = zp.get("zp_result_date")
+            rider.zp_result_weight = zp.get("zp_result_weight")
+            rider.zp_height_date = zp.get("zp_height_date")
+            rider.zp_height_value = zp.get("zp_height_value")
+
+        # Add FTP and weight data
+        rider.ftp_current = ftp_current_by_zwid.get(zwid)
+        rider.zp_weight = weight_by_zwid.get(zwid)
+        if zwid in ftp_stats_by_zwid:
+            ftp_stats = ftp_stats_by_zwid[zwid]
+            rider.ftp_min = ftp_stats.get("ftp_min")
+            rider.ftp_max = ftp_stats.get("ftp_max")
+
+        performance_riders.append(rider)
+
+    # Sort by display name
+    sorted_riders = sorted(performance_riders, key=lambda r: r.display_name.lower())
+
+    logfire.debug(
+        "Performance review data loaded",
+        total_riders=len(sorted_riders),
+        riders_with_verifications=len(verification_by_zwid),
+        riders_with_results=len(zp_data_by_zwid),
+    )
+
+    return sorted_riders

@@ -1,0 +1,368 @@
+{% comment %}
+  Team kit management. Kits are rows rather than Constance settings, so this section posts to
+  its own routes (team_kit_add / _edit / _make_current / _toggle_active) and each redirects
+  back here with a message.
+
+  The "current" kit is the one the team is working to get everyone into. A new season's kit is
+  added and made current; the previous one is left as it was -- still active if riders should
+  keep recording it, or retired. Only one kit can be current, and it must be active; the
+  database enforces both, and the controls below say so before it has to.
+
+  Every count on this page, and the member list, uses one population: team members, meaning
+  anyone with a Discord login (apps.team.kits.team_members). That is what makes "haven't
+  answered" an honest number. The filters narrow only the list, never the counts.
+
+  "Verified" here means verified through zauth, the official Zwift OAuth -- the kit goes to the
+  Zwift account zauth vouches for. Legacy (Sauce mod) and admin verifications are shown in the
+  column but do not count: apps.team.kits.zauth_verified_q is the one rule, for the filter,
+  the column and the export alike.
+{% endcomment %}
+{# --- the current kit, where it stands ------------------------------------------------ #}
+{% if current_kit_entry %}
+<div class="card bg-base-300 p-4 mb-6">
+  <p class="text-xs font-semibold uppercase tracking-wide text-base-content/50 mb-1">Current kit</p>
+  <h3 class="text-lg font-semibold mb-3">{{ current_kit_entry.kit.name }}</h3>
+  <div class="flex flex-wrap gap-2">
+    <span class="badge badge-warning">{{ current_kit_entry.counts.need|default:0 }} need it</span>
+    <span class="badge badge-info">{{ current_kit_entry.counts.submitted|default:0 }} submitted to Zwift</span>
+    <span class="badge badge-info">{{ current_kit_entry.counts.completed|default:0 }} completed by Zwift</span>
+    <span class="badge badge-success">{{ current_kit_entry.counts.have|default:0 }} have it</span>
+    <span class="badge badge-ghost">{{ current_kit_entry.counts.unknown|default:0 }} haven&rsquo;t answered</span>
+  </div>
+</div>
+{% elif kit_entries %}
+<div class="alert alert-warning mb-6">
+  <span>No kit is current. Make one current so riders are asked about it first.</span>
+</div>
+{% endif %}
+
+{% if not kit_entries %}
+<div class="alert mb-6">
+  <span>No kits yet. Add the first one and make it current to start asking riders about it.</span>
+  <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('kit-add-dialog').showModal()">Add a kit</button>
+</div>
+{% endif %}
+
+{# --- add a kit: a dialog, opened from "All kits" or the empty state above ------------- #}
+{% comment %}
+  Adding a kit is occasional -- once a season -- so the form waits in a dialog rather than
+  taking the top of the page. "Make this the current kit" starts ticked when no kit is current,
+  since the kit being added is then almost always the one to make current.
+{% endcomment %}
+<dialog id="kit-add-dialog" class="modal" aria-labelledby="kit-add-title">
+  <div class="modal-box max-w-2xl">
+    <h3 id="kit-add-title" class="font-semibold text-lg mb-3">Add a kit</h3>
+    <form method="post" action="{% url 'team_kit_add' %}" class="space-y-3" enctype="multipart/form-data">
+      {% csrf_token %}
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <label class="form-control w-full">
+          <span class="label-text mb-1">Name <span class="text-error">*</span></span>
+          <input type="text" name="name" required maxlength="100" class="input input-bordered w-full"
+                 placeholder="2027 Race Kit">
+        </label>
+        <label class="form-control w-full">
+          <span class="label-text mb-1">Slug</span>
+          <input type="text" name="slug" maxlength="100" pattern="[-a-zA-Z0-9_]+" class="input input-bordered w-full"
+                 placeholder="made from the name if left blank">
+        </label>
+      </div>
+      <label class="form-control w-full">
+        <span class="label-text mb-1">Description</span>
+        <input type="text" name="description" class="input input-bordered w-full"
+               placeholder="Shown to riders under the kit's name (optional)">
+      </label>
+      <label class="form-control w-full">
+        <span class="label-text mb-1">Icon</span>
+        <input type="file" name="icon" accept="image/*" class="file-input file-input-bordered w-full">
+        <span class="label-text-alt mt-1 text-base-content/70">
+          Shown on the roster card of riders who have this kit. Leave empty to use the site-wide icon.
+        </span>
+      </label>
+      <div class="flex flex-wrap items-end gap-4">
+        <label class="form-control w-32">
+          <span class="label-text mb-1">Sort order</span>
+          <input type="number" name="sort_order" value="0" min="0" class="input input-bordered w-full">
+        </label>
+        <label class="label cursor-pointer justify-start gap-2 pb-3">
+          <input type="checkbox" name="make_current" value="1" class="checkbox checkbox-primary"
+                 {% if not current_kit_entry %}checked{% endif %}>
+          <span class="label-text">Make this the current kit</span>
+        </label>
+      </div>
+      <p class="text-xs text-base-content/60">
+        The slug is permanent: it is the key every rider's status for this kit is stored under,
+        so it cannot be changed once the kit exists. Rename the kit freely afterwards.
+      </p>
+      <div class="modal-action">
+        <button type="button" class="btn btn-sm btn-ghost" onclick="this.closest('dialog').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary btn-sm">Add kit</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+{# --- every kit --------------------------------------------------------------------- #}
+{% if kit_entries %}
+<div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+  <h3 class="font-semibold">All kits</h3>
+  <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('kit-add-dialog').showModal()">Add a kit</button>
+</div>
+<div class="space-y-3">
+  {% for entry in kit_entries %}
+  {% with kit=entry.kit %}
+  <div class="card bg-base-300 p-4 {% if kit.is_current %}ring-2 ring-primary{% endif %}">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div class="min-w-0">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="font-semibold">{{ kit.name }}</span>
+          {% if kit.is_current %}<span class="badge badge-primary badge-sm">Current</span>{% endif %}
+          {% if not kit.active %}<span class="badge badge-ghost badge-sm">Retired</span>{% endif %}
+        </div>
+        <p class="text-xs font-mono text-base-content/50 mt-1">{{ kit.slug }}</p>
+        {% if kit.description %}<p class="text-sm text-base-content/70 mt-1">{{ kit.description }}</p>{% endif %}
+        <p class="text-xs text-base-content/60 mt-2">
+          {{ entry.counts.need|default:0 }} need it &middot;
+          {{ entry.counts.submitted|default:0 }} submitted &middot;
+          {{ entry.counts.completed|default:0 }} completed &middot;
+          {{ entry.counts.have|default:0 }} have it &middot;
+          {{ entry.counts.unknown|default:0 }} haven&rsquo;t answered
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2 shrink-0">
+        {% if not kit.is_current %}
+        <form method="post" action="{% url 'team_kit_make_current' kit.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-outline">Make current</button>
+        </form>
+        {% endif %}
+        {% if kit.is_current %}
+        <span class="btn btn-sm btn-disabled" title="Make another kit current before retiring this one">Retire</span>
+        {% else %}
+        <form method="post" action="{% url 'team_kit_toggle_active' kit.pk %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-sm btn-ghost">{% if kit.active %}Retire{% else %}Restore{% endif %}</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
+    <details class="mt-3">
+      <summary class="text-sm link link-hover w-fit">Edit</summary>
+      <form method="post" action="{% url 'team_kit_edit' kit.pk %}" class="space-y-3 mt-3" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <label class="form-control w-full md:col-span-2">
+            <span class="label-text mb-1">Name</span>
+            <input type="text" name="name" value="{{ kit.name }}" required maxlength="100" class="input input-bordered input-sm w-full">
+          </label>
+          <label class="form-control w-full">
+            <span class="label-text mb-1">Sort order</span>
+            <input type="number" name="sort_order" value="{{ kit.sort_order }}" min="0" class="input input-bordered input-sm w-full">
+          </label>
+        </div>
+        <label class="form-control w-full">
+          <span class="label-text mb-1">Description</span>
+          <input type="text" name="description" value="{{ kit.description }}" class="input input-bordered input-sm w-full">
+        </label>
+        {% comment %}
+          "icon-clear" is the name Django's own ClearableFileInput looks for, so removing an
+          icon works through the form rather than needing a route of its own.
+        {% endcomment %}
+        <div class="flex flex-wrap items-end gap-3">
+          {% if kit.icon %}
+            <img src="{{ kit.icon.url }}" alt="Current icon for {{ kit.name }}"
+                 class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+          {% endif %}
+          <label class="form-control flex-1 min-w-48">
+            <span class="label-text mb-1">{% if kit.icon %}Replace icon{% else %}Icon{% endif %}</span>
+            <input type="file" name="icon" accept="image/*" class="file-input file-input-bordered file-input-sm w-full">
+          </label>
+          {% if kit.icon %}
+            <label class="label cursor-pointer justify-start gap-2 pb-2">
+              <input type="checkbox" name="icon-clear" value="1" class="checkbox checkbox-sm">
+              <span class="label-text">Remove icon</span>
+            </label>
+          {% endif %}
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">Save</button>
+      </form>
+    </details>
+  </div>
+  {% endwith %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{# --- team members ---------------------------------------------------------------------- #}
+<div class="divider mt-8"></div>
+<div class="space-y-2 mb-3">
+  <div>
+    <h3 class="font-semibold">Team members</h3>
+    <p class="text-xs text-base-content/60">
+      {% if member_list_filtered %}Showing {{ member_rows|length }} of {{ member_total }} members &mdash; {{ member_filter_summary }}.
+      {% else %}{{ member_total }} member{{ member_total|pluralize }} with a Discord login.{% endif %}
+    </p>
+  </div>
+  {% comment %}
+    A GET form so the filtered view is a URL: bookmarkable, shareable, and survives a refresh.
+    Every box lives in the one form so they submit together and combine; each submits the
+    form on change, so there is no separate button to find. The summary sentence above comes
+    from apps.team.kits.MemberFilters.describe.
+
+    The status boxes are the current kit's statuses. Tick any number: a member shows if their
+    status is any one of them, and ticking none means any status.
+  {% endcomment %}
+  <form method="get" action="{% url 'config_section_page' 'team_kit' %}" class="flex flex-wrap items-center gap-x-4">
+    <label class="label cursor-pointer gap-2"
+           title="Verified through zauth, the official Zwift OAuth. Legacy (Sauce mod) and admin verifications are not counted.">
+      <input type="checkbox" name="verified" value="1" class="checkbox checkbox-sm checkbox-primary"
+             {% if verified_only %}checked{% endif %} onchange="this.form.submit()">
+      <span class="label-text">Verified with zauth only</span>
+    </label>
+    <label class="label cursor-pointer gap-2"
+           title="Race Verified: every verification their category requires is approved and in date -- the status the roster's Race Verified filter and the Discord race-ready role use.">
+      <input type="checkbox" name="race_verified" value="1" class="checkbox checkbox-sm checkbox-primary"
+             {% if race_verified_only %}checked{% endif %} onchange="this.form.submit()">
+      <span class="label-text">Race verified only</span>
+    </label>
+    {% if current_kit_entry %}
+    <div class="basis-full" role="group" aria-labelledby="kit-status-filter-label">
+      <p id="kit-status-filter-label" class="label-text">{{ current_kit_entry.kit.name }} status</p>
+      <div class="flex flex-wrap items-center gap-x-3">
+        {% for option in status_filter_options %}
+        <label class="label cursor-pointer gap-1.5">
+          <input type="checkbox" name="status" value="{{ option.value }}" class="checkbox checkbox-sm checkbox-primary"
+                 {% if option.checked %}checked{% endif %} onchange="this.form.submit()">
+          <span class="badge {{ option.badge }} badge-sm whitespace-nowrap">{{ option.label }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <label class="label gap-2 cursor-not-allowed basis-full" title="Make a kit current first -- there is no kit status to filter by until one is">
+      <input type="checkbox" class="checkbox checkbox-sm" disabled>
+      <span class="label-text text-base-content/50">Kit status</span>
+    </label>
+    {% endif %}
+  </form>
+</div>
+
+{% comment %}
+  Export takes the filters above (export_query), so it downloads the list on screen. Import
+  reads the export's shape back and always stops at a preview before writing anything.
+{% endcomment %}
+<div class="flex flex-wrap items-center gap-2 mb-3">
+  <a href="{% url 'team_kit_export' %}{% if export_query %}?{{ export_query }}{% endif %}" class="btn btn-sm btn-outline">
+    Export CSV{% if member_list_filtered %} ({{ member_rows|length }}){% endif %}
+  </a>
+  {% if kit_entries %}
+  <button type="button" class="btn btn-sm btn-outline" onclick="document.getElementById('kit-import-dialog').showModal()">
+    Import CSV
+  </button>
+  {% else %}
+  <span class="btn btn-sm btn-disabled" title="Add a kit first -- there is nothing to import statuses for">Import CSV</span>
+  {% endif %}
+</div>
+
+{% if kit_entries %}
+<dialog id="kit-import-dialog" class="modal" aria-labelledby="kit-import-title">
+  <div class="modal-box max-w-2xl">
+    <h3 id="kit-import-title" class="font-semibold text-lg mb-3">Import kit statuses</h3>
+    <ol class="list-decimal list-inside text-sm space-y-1 mb-4">
+      <li>Export CSV and open it in a spreadsheet.</li>
+      <li>Change statuses in the kit columns. A blank cell leaves that status as it is.</li>
+      <li>Save as CSV and upload it here. You will see every change before anything is saved.</li>
+    </ol>
+
+    <div class="text-sm space-y-3 mb-4">
+      <div>
+        <p class="font-semibold mb-1">Statuses</p>
+        <ul class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1">
+          {% for value, label in kit_status_choices %}
+          <li><code>{{ value }}</code> <span class="text-base-content/70">&mdash; {{ label }}</span></li>
+          {% endfor %}
+        </ul>
+        <p class="text-xs text-base-content/60 mt-1">The labels work too, as do the riders&rsquo; own (&ldquo;I need the kit&rdquo;).</p>
+      </div>
+      <div>
+        <p class="font-semibold mb-1">Kit columns</p>
+        <p>
+          {% for entry in kit_entries %}<code>{{ kit_column_prefix }}{{ entry.kit.slug }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}
+        </p>
+      </div>
+      <div>
+        <p class="font-semibold mb-1">Matching rows to members</p>
+        <p>
+          By <code>user_id</code>. A sheet without one can use <code>zwid</code> instead. Other columns are
+          only there to help you read the sheet, and are ignored.
+        </p>
+      </div>
+      <div>
+        <p class="font-semibold mb-1">Statuses that change after you export</p>
+        <p>
+          Leave the <code>exported_statuses</code> column as it is. It records what each row said when
+          exported, so a cell you did not edit never undoes a status a rider has changed since. If you
+          edited a status that has also changed since, the preview shows it and does not apply it.
+        </p>
+      </div>
+    </div>
+
+    <form method="post" action="{% url 'team_kit_import' %}" enctype="multipart/form-data">
+      {% csrf_token %}
+      <label class="form-control w-full">
+        <span class="label-text mb-1">CSV file (up to {{ import_max_kb }} KB)</span>
+        <input type="file" name="csv_file" accept=".csv,text/csv" required class="file-input file-input-bordered file-input-sm w-full">
+      </label>
+      <div class="modal-action">
+        <button type="button" class="btn btn-sm btn-ghost" onclick="this.closest('dialog').close()">Cancel</button>
+        <button type="submit" class="btn btn-sm btn-primary">Preview import</button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+{% endif %}
+
+{% if member_rows %}
+<div class="overflow-x-auto">
+  <table class="table table-sm">
+    <thead>
+      <tr>
+        <th>Discord name</th>
+        <th>Zwift name</th>
+        <th>Zwift ID</th>
+        <th>Zwift verified</th>
+        <th>{% if current_kit_entry %}{{ current_kit_entry.kit.name }}{% else %}Kit status{% endif %}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in member_rows %}
+      <tr>
+        <td>
+          <a href="{% url 'accounts:public_profile' row.user.pk %}" class="link link-hover">{{ row.discord_name|default:"—" }}</a>
+          {% if row.discord_username and row.discord_username != row.discord_name %}
+          <span class="block text-xs text-base-content/50">@{{ row.discord_username }}</span>
+          {% endif %}
+        </td>
+        <td>{{ row.zwift_name|default:"—" }}</td>
+        <td class="font-mono">{{ row.zwid|default:"—" }}</td>
+        <td>
+          {% if row.zauth_verified %}<span class="badge badge-success badge-sm" title="Verified through zauth, the official Zwift OAuth">Zauth</span>
+          {% elif row.verification_method %}<span class="badge badge-warning badge-sm whitespace-nowrap" title="Verified, but not through zauth -- not counted as verified here">{{ row.verification_label }}</span>
+          {% else %}<span class="badge badge-ghost badge-sm whitespace-nowrap">Not verified</span>{% endif %}
+        </td>
+        <td>
+          {% if current_kit_entry %}<span class="badge {{ row.badge }} badge-sm whitespace-nowrap">{{ row.label }}</span>
+          {% else %}<span class="text-base-content/50">No current kit</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="text-sm text-base-content/60">
+  {% if member_list_filtered %}No members match these filters.{% else %}No members with a Discord login yet.{% endif %}
+</p>
+{% endif %}

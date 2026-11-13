@@ -1,0 +1,1318 @@
+"""Custom user model for accounts app."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import logfire
+from django.contrib.auth.models import AbstractUser
+from django.db import models, transaction
+from django_countries.fields import CountryField
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from decimal import Decimal
+
+    from django.db.models.manager import RelatedManager
+
+    from apps.team.models import RaceReadyRecord
+
+
+class UserRoles:
+    """Constants for user roles (legacy - use Permissions for new code)."""
+
+    APP_ADMIN = "app_admin"
+    LINK_ADMIN = "link_admin"
+    MEMBERSHIP_ADMIN = "membership_admin"
+    RACING_ADMIN = "racing_admin"
+    TEAM_CAPTAIN = "team_captain"
+    TEAM_VICE_CAPTAIN = "team_vice_captain"
+    TEAM_MEMBER = "team_member"
+
+    CHOICES: ClassVar[list[tuple[str, str]]] = [
+        (APP_ADMIN, "App Admin"),
+        (LINK_ADMIN, "Link Admin"),
+        (MEMBERSHIP_ADMIN, "Membership Admin"),
+        (RACING_ADMIN, "Racing Admin"),
+        (TEAM_CAPTAIN, "Team Captain"),
+        (TEAM_VICE_CAPTAIN, "Team Vice Captain"),
+        (TEAM_MEMBER, "Team Member"),
+    ]
+
+    ALL: ClassVar[list[str]] = [choice[0] for choice in CHOICES]
+
+
+class Permissions:
+    """Constants for permission names and Constance mappings.
+
+    Permissions are checked via Discord roles configured in Constance.
+    Each permission maps to a Constance setting containing a JSON array
+    of Discord role IDs that grant that permission.
+    """
+
+    APP_ADMIN = "app_admin"
+    TEAM_CAPTAIN = "team_captain"
+    VICE_CAPTAIN = "vice_captain"
+    LINK_ADMIN = "link_admin"
+    MEMBERSHIP_ADMIN = "membership_admin"
+    RACING_ADMIN = "racing_admin"
+    TEAM_MEMBER = "team_member"
+    RACE_READY = "race_ready"
+    APPROVE_VERIFICATION = "approve_verification"
+    DATA_CONNECTION = "data_connection"
+    PAGES_ADMIN = "pages_admin"
+    PERFORMANCE_VERIFICATION_TEAM = "performance_verification_team"
+    EVENT_ADMIN = "event_admin"
+    ASSIGN_ROLES = "assign_roles"
+    TICKET_ADMIN = "ticket_admin"
+
+    # Map permission names to Constance config keys
+    CONSTANCE_MAP: ClassVar[dict[str, str]] = {
+        APP_ADMIN: "PERM_APP_ADMIN_ROLES",
+        TEAM_CAPTAIN: "PERM_TEAM_CAPTAIN_ROLES",
+        VICE_CAPTAIN: "PERM_VICE_CAPTAIN_ROLES",
+        LINK_ADMIN: "PERM_LINK_ADMIN_ROLES",
+        MEMBERSHIP_ADMIN: "PERM_MEMBERSHIP_ADMIN_ROLES",
+        RACING_ADMIN: "PERM_RACING_ADMIN_ROLES",
+        TEAM_MEMBER: "PERM_TEAM_MEMBER_ROLES",
+        RACE_READY: "PERM_RACE_READY_ROLES",
+        APPROVE_VERIFICATION: "PERM_APPROVE_VERIFICATION_ROLES",
+        DATA_CONNECTION: "PERM_DATA_CONNECTION_ROLES",
+        PAGES_ADMIN: "PERM_PAGES_ADMIN_ROLES",
+        PERFORMANCE_VERIFICATION_TEAM: "PERM_PERFORMANCE_VERIFICATION_TEAM_ROLES",
+        EVENT_ADMIN: "PERM_EVENT_ADMIN_ROLES",
+        ASSIGN_ROLES: "PERM_ASSIGN_ROLES",
+        TICKET_ADMIN: "PERM_TICKET_ADMIN_ROLES",
+    }
+
+    CHOICES: ClassVar[list[tuple[str, str]]] = [
+        (APP_ADMIN, "App Admin"),
+        (TEAM_CAPTAIN, "Team Captain"),
+        (VICE_CAPTAIN, "Vice Captain"),
+        (LINK_ADMIN, "Link Admin"),
+        (MEMBERSHIP_ADMIN, "Membership Admin"),
+        (RACING_ADMIN, "Racing Admin"),
+        (TEAM_MEMBER, "Team Member"),
+        (RACE_READY, "Race Ready"),
+        (APPROVE_VERIFICATION, "Approve Verification"),
+        (DATA_CONNECTION, "Data Connection"),
+        (PAGES_ADMIN, "Pages Admin"),
+        (PERFORMANCE_VERIFICATION_TEAM, "Performance Verification Team"),
+        (EVENT_ADMIN, "Event Admin"),
+        (ASSIGN_ROLES, "Assign Roles"),
+        (TICKET_ADMIN, "Ticket Admin"),
+    ]
+
+    ALL: ClassVar[list[str]] = list(CONSTANCE_MAP.keys())
+
+
+class User(AbstractUser):
+    """Custom user model with Discord and Zwift integration fields."""
+
+    # Type hints for reverse relations from RaceReadyRecord
+    race_ready_records: RelatedManager[RaceReadyRecord]
+    reviewed_records: RelatedManager[RaceReadyRecord]
+
+    class Gender(models.TextChoices):
+        """Gender choices."""
+
+        MALE = "male", "Male"
+        FEMALE = "female", "Female"
+        OTHER = "other", "Other"
+
+    class UnitPreference(models.TextChoices):
+        """Unit preference choices for weight and height."""
+
+        METRIC = "metric", "Metric (kg, cm)"
+        IMPERIAL = "imperial", "Imperial (lbs, in)"
+
+    class VerificationMethod(models.TextChoices):
+        """How a user's Zwift account verification was obtained.
+
+        ``LEGACY`` is the old Sauce-mod email/password flow (grandfathered);
+        ``ZAUTH`` is the official Zwift OAuth via the zauth service, and the only way a
+        verification is made now; ``ADMIN`` is a manual staff verification, no longer
+        granted but kept for the rows that carry it and the verification report. Blank
+        means never verified.
+        """
+
+        LEGACY = "legacy", "Legacy (Sauce mod)"
+        ZAUTH = "zauth", "Zwift OAuth (zauth)"
+        ADMIN = "admin", "Admin (manual)"
+
+    # Discord integration
+    discord_id = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Discord user ID (snowflake)",
+    )
+    discord_username = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Discord username",
+    )
+    discord_nickname = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Discord server nickname",
+    )
+    discord_avatar = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Discord avatar hash",
+    )
+    discord_roles = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Discord roles as {role_id: role_name}",
+    )
+
+    # Zwift integration
+    zwid = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Zwift user ID",
+    )
+    zwid_verified = models.BooleanField(
+        default=False,
+        help_text="Zwift user ID has been verified",
+    )
+    zwid_verification_method = models.CharField(
+        max_length=10,
+        choices=VerificationMethod.choices,
+        blank=True,
+        default="",
+        help_text="How the current Zwift verification was obtained (legacy / zauth / admin)",
+    )
+    zwid_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the current Zwift verification was recorded",
+    )
+
+    # Zwift racing metrics, mirrored from the zauth service.
+    #
+    # These live upstream and are fetched one HTTP call per user, so anything that
+    # needs them for a *list* of riders -- squad eligibility, the signup table, the
+    # assign-rider filters -- reads this local copy instead. `refresh_zwift_racing_metrics`
+    # keeps it current; only zauth-connected riders ever get values.
+    z_ftp = models.DecimalField(
+        max_digits=6,
+        decimal_places=1,
+        null=True,
+        blank=True,
+        help_text="zFTP in watts, from the official Zwift racing profile",
+    )
+    z_map = models.DecimalField(
+        max_digits=6,
+        decimal_places=1,
+        null=True,
+        blank=True,
+        help_text="zMAP in watts, from the official Zwift racing profile",
+    )
+    z_metrics_weight_grams = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Weight Zwift used when it computed zFTP/zMAP - the denominator for W/kg",
+    )
+    z_metrics_updated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When zFTP/zMAP were last mirrored from the zauth service",
+    )
+
+    # Personal info
+    birth_year = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Year of birth (e.g., 1990)",
+    )
+    city = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="City of residence",
+    )
+    country = CountryField(
+        blank=True,
+        help_text="Country of residence",
+    )
+    gender = models.CharField(
+        max_length=10,
+        choices=Gender.choices,
+        blank=True,
+        help_text="Gender",
+    )
+    discord_dm_opt_out = models.BooleanField(
+        default=False,
+        help_text="If set, the bot sends this member no direct messages",
+    )
+    timezone = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="User's timezone (e.g., America/New_York)",
+    )
+    unit_preference = models.CharField(
+        max_length=10,
+        choices=UnitPreference.choices,
+        default=UnitPreference.METRIC,
+        help_text="Preferred unit system for weight and height",
+    )
+
+    # Social Accounts
+    youtube_channel = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="YouTube channel URL",
+    )
+    youtube_channel_id = models.CharField(
+        max_length=30,
+        blank=True,
+        help_text="YouTube channel ID (auto-extracted from URL)",
+    )
+    twitch_channel = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Twitch channel URL",
+    )
+    instagram_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Instagram profile URL",
+    )
+    facebook_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Facebook profile URL",
+    )
+    twitter_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Twitter/X profile URL",
+    )
+    tiktok_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="TikTok profile URL",
+    )
+    bluesky_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="BlueSky profile URL",
+    )
+    mastodon_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Mastodon profile URL",
+    )
+    strava_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Strava profile URL (e.g., https://www.strava.com/athletes/1234)",
+    )
+    garmin_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Garmin Connect profile URL (e.g., https://connect.garmin.com/modern/profile/username)",
+    )
+    tpv_profile_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="TrainingPeaks Virtual profile URL (e.g., https://tpvirtualhub.com/profile/GGGTTTRRRDDD123)",
+    )
+
+    # Training Equipment
+    trainer = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Indoor trainer model (options from TRAINER_OPTIONS)",
+    )
+    powermeter = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Powermeter on trainer bike, if any (options from POWERMETER_OPTIONS)",
+    )
+    dual_recording = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Do you dual record data?",
+    )
+    # Per-kit status for the team kits Zwift issues, as {kit_slug: status}. A kit with no
+    # entry reads as "unknown" ("What's a kit" to the rider), so adding a kit needs no
+    # backfill. Keyed by TeamKit.slug, which is fixed at creation, so renaming a kit keeps
+    # every rider's status attached. Statuses are KitStatus values, never display wording.
+    # See apps/team/kits.py for the labels and the read/write helpers.
+    team_kit = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Team kit status per kit, as {kit_slug: status}",
+    )
+    heartrate_monitor = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Heart rate monitor brand (options from HEARTRATE_MONITOR_OPTIONS)",
+    )
+    # Emergency Contact
+    emergency_contact_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Emergency contact full name",
+    )
+    emergency_contact_relation = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Relationship to emergency contact (e.g., spouse, parent, friend)",
+    )
+    emergency_contact_email = models.EmailField(
+        blank=True,
+        default="",
+        help_text="Emergency contact email address",
+    )
+    emergency_contact_phone = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="Emergency contact phone number",
+    )
+
+    # Cached race ready status (updated by refresh_race_ready / refresh_all_race_ready task)
+    is_race_ready = models.BooleanField(
+        default=False,
+        help_text="Cached race ready status. Updated when verification records change and by periodic cron task.",
+    )
+    is_extra_verified = models.BooleanField(
+        default=False,
+        help_text="Cached extra verified status (weight_full + height + power all verified and non-expired).",
+    )
+
+    # Roles
+    roles = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of user roles (legacy - use permission_overrides for new grants)",
+    )
+    permission_overrides = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Manual permission overrides: {permission_name: True/False}. True grants, False revokes.",
+    )
+
+    class Meta:
+        """Meta options for User model."""
+
+        verbose_name = "User"
+        verbose_name_plural = "Users"
+
+    def __str__(self) -> str:
+        """Return string representation of user.
+
+        Returns:
+            The username.
+
+        """
+        return f"{self.username}, Discord: {self.discord_username}"
+
+    def _youtube_channel_id_is_stale(self, update_fields: Iterable[str] | None) -> bool:
+        """Check whether the cached YouTube channel ID no longer matches the saved URL.
+
+        Args:
+            update_fields: The ``update_fields`` the caller passed to ``save``, if any.
+
+        Returns:
+            True if the stored channel ID belongs to a channel the user has moved away from.
+
+        """
+        if self.pk is None or not self.youtube_channel_id:
+            return False
+        if update_fields is not None and "youtube_channel" not in update_fields:
+            # The URL is not being written, so whatever it holds in memory is not persisted.
+            return False
+        stored = User.objects.filter(pk=self.pk).values("youtube_channel", "youtube_channel_id").first()
+        if stored is None or stored["youtube_channel"] == self.youtube_channel:
+            return False
+        # An explicit edit of the ID wins: the admin can change URL and ID in one save.
+        return self.youtube_channel_id == stored["youtube_channel_id"]
+
+    def save(self, **kwargs: Any) -> None:
+        """Save the user, discarding cached YouTube data when the channel URL changes.
+
+        ``youtube_channel_id`` is scraped from ``youtube_channel`` once by
+        ``sync_youtube_channel_ids`` and never re-checked, so a rider who switches channels
+        -- or removes their URL -- would otherwise keep feeding the old channel's videos to
+        their profile, the Team Feed and the bot. Clearing it here covers every writer (the
+        profile form, the admin, the shell) instead of asking each to remember, and the next
+        sync resolves the new channel. The already-fetched videos all belong to the old
+        channel and cannot be told apart from newer ones, so they go with it.
+
+        Args:
+            **kwargs: Passed through to ``Model.save`` (keyword-only since Django 6).
+
+        """
+        if not self._youtube_channel_id_is_stale(kwargs.get("update_fields")):
+            super().save(**kwargs)
+            return
+
+        self.youtube_channel_id = ""
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None:
+            kwargs["update_fields"] = {*update_fields, "youtube_channel_id"}
+
+        with transaction.atomic():
+            super().save(**kwargs)
+            deleted, _ = YouTubeVideo.objects.filter(user=self).delete()
+
+        logfire.info(
+            "YouTube channel URL changed, cleared cached channel ID and videos",
+            user_id=self.pk,
+            videos_deleted=deleted,
+        )
+
+    def has_role(self, role: str) -> bool:
+        """Check if user has a specific role.
+
+        Args:
+            role: The role to check for.
+
+        Returns:
+            True if user has the role, False otherwise.
+
+        """
+        return role in (self.roles or [])
+
+    def add_role(self, role: str) -> bool:
+        """Add a role to the user.
+
+        Args:
+            role: The role to add (must be a valid role from UserRoles.ALL).
+
+        Returns:
+            True if role was added, False if already present or invalid.
+
+        """
+        if role not in UserRoles.ALL:
+            logfire.warning(
+                "Invalid role addition attempted",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                role=role,
+                valid_roles=UserRoles.ALL,
+            )
+            return False
+        if self.roles is None:
+            self.roles = []
+        if role not in self.roles:
+            self.roles.append(role)
+            logfire.info(
+                "Role added to user",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                role=role,
+            )
+            return True
+        logfire.debug(
+            "Role already present, not added",
+            user_id=self.id,
+            discord_id=self.discord_id,
+            role=role,
+        )
+        return False
+
+    def remove_role(self, role: str) -> bool:
+        """Remove a role from the user.
+
+        Args:
+            role: The role to remove.
+
+        Returns:
+            True if role was removed, False if not present.
+
+        """
+        if self.roles and role in self.roles:
+            self.roles.remove(role)
+            logfire.info(
+                "Role removed from user",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                role=role,
+            )
+            return True
+        logfire.debug(
+            "Role not present, not removed",
+            user_id=self.id,
+            discord_id=self.discord_id,
+            role=role,
+        )
+        return False
+
+    def _get_permission_role_ids(self, constance_key: str) -> list[int]:
+        """Get Discord role IDs for a permission from Constance config.
+
+        Args:
+            constance_key: The Constance config key (e.g., "PERM_TEAM_CAPTAIN_ROLES").
+
+        Returns:
+            List of Discord role IDs as integers.
+
+        """
+        import json
+
+        from constance import config
+
+        role_ids_json = getattr(config, constance_key, "[]")
+        try:
+            role_ids = json.loads(role_ids_json)
+            return [int(rid) for rid in role_ids]
+        except json.JSONDecodeError, ValueError, TypeError:
+            return []
+
+    def has_permission(self, permission_name: str) -> bool:
+        """Check if user has a specific permission.
+
+        Permission check order:
+        1. Superusers always have all permissions
+        2. Check permission_overrides for explicit grant/revoke
+        3. Check if any Discord role matches permission's configured roles
+        4. Fall back to legacy app roles check
+
+        Args:
+            permission_name: The permission to check (from Permissions class).
+
+        Returns:
+            True if user has the permission, False otherwise.
+
+        """
+        # 1. Superuser bypass
+        if self.is_superuser:
+            logfire.debug(
+                "Permission granted via superuser",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                permission=permission_name,
+                grant_reason="superuser",
+            )
+            return True
+
+        # 2. Check explicit overrides
+        if self.permission_overrides:
+            override = self.permission_overrides.get(permission_name)
+            if override is not None:
+                if override:
+                    logfire.debug(
+                        "Permission granted via override",
+                        user_id=self.id,
+                        discord_id=self.discord_id,
+                        permission=permission_name,
+                        grant_reason="permission_override",
+                    )
+                else:
+                    logfire.debug(
+                        "Permission denied via override",
+                        user_id=self.id,
+                        discord_id=self.discord_id,
+                        permission=permission_name,
+                        denial_reason="permission_override_revoked",
+                    )
+                return bool(override)
+
+        # 3. Check Discord roles against Constance config
+        constance_key = Permissions.CONSTANCE_MAP.get(permission_name)
+        if constance_key:
+            allowed_role_ids = self._get_permission_role_ids(constance_key)
+            if allowed_role_ids:
+                user_role_ids = self.get_discord_role_ids()
+                if any(rid in user_role_ids for rid in allowed_role_ids):
+                    logfire.debug(
+                        "Permission granted via Discord role",
+                        user_id=self.id,
+                        discord_id=self.discord_id,
+                        permission=permission_name,
+                        grant_reason="discord_role",
+                    )
+                    return True
+
+        # 4. Backward compatibility: check legacy app roles
+        has_legacy_role = self.has_role(permission_name)
+        if has_legacy_role:
+            logfire.debug(
+                "Permission granted via legacy role",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                permission=permission_name,
+                grant_reason="legacy_role",
+            )
+        else:
+            logfire.debug(
+                "Permission denied - no matching role",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                permission=permission_name,
+                denial_reason="no_matching_role",
+            )
+        return has_legacy_role
+
+    @property
+    def is_app_admin(self) -> bool:
+        """Check if user has app admin permission."""
+        return self.has_permission(Permissions.APP_ADMIN)
+
+    @property
+    def is_link_admin(self) -> bool:
+        """Check if user has link admin permission."""
+        return self.has_permission(Permissions.LINK_ADMIN)
+
+    @property
+    def is_membership_admin(self) -> bool:
+        """Check if user has membership admin permission."""
+        return self.has_permission(Permissions.MEMBERSHIP_ADMIN)
+
+    @property
+    def is_racing_admin(self) -> bool:
+        """Check if user has racing admin permission."""
+        return self.has_permission(Permissions.RACING_ADMIN)
+
+    @property
+    def is_team_captain(self) -> bool:
+        """Check if user has team captain permission."""
+        return self.has_permission(Permissions.TEAM_CAPTAIN)
+
+    @property
+    def is_team_vice_captain(self) -> bool:
+        """Check if user has vice captain permission."""
+        return self.has_permission(Permissions.VICE_CAPTAIN)
+
+    @property
+    def is_team_member(self) -> bool:
+        """Check if user has team member permission."""
+        return self.has_permission(Permissions.TEAM_MEMBER)
+
+    @property
+    def can_approve_verification(self) -> bool:
+        """Check if user has permission to approve verification records."""
+        return self.has_permission(Permissions.APPROVE_VERIFICATION)
+
+    @property
+    def is_performance_verification_team(self) -> bool:
+        """Check if user is on the performance verification team."""
+        return self.has_permission(Permissions.PERFORMANCE_VERIFICATION_TEAM)
+
+    @property
+    def is_pages_admin(self) -> bool:
+        """Check if user has pages admin permission."""
+        return self.has_permission(Permissions.PAGES_ADMIN)
+
+    @property
+    def is_event_admin(self) -> bool:
+        """Check if user has event admin permission."""
+        return self.has_permission(Permissions.EVENT_ADMIN)
+
+    def calculate_race_ready(self) -> bool:
+        """Calculate if user has all required verifications for their ZwiftPower category.
+
+        Required types are determined by CATEGORY_REQUIREMENTS based on user's
+        ZwiftPower division (category). Defaults to weight_light + height if
+        no category is found.
+
+        When both weight_light and weight_full appear in required types (categories
+        40/50), having either one satisfies the weight requirement (OR logic).
+        When only one weight type is listed (categories 5-30), the original strict
+        AND logic applies.
+
+        Returns:
+            True if user has all required verifications, False otherwise.
+
+        """
+        from apps.team.models import RaceReadyRecord
+        from apps.team.services import get_user_required_verification_types
+
+        # Get required verification types for this user's category
+        required_types = get_user_required_verification_types(self)
+
+        # Get verified records for this user
+        verified_records = self.race_ready_records.filter(status=RaceReadyRecord.Status.VERIFIED)
+
+        # Build set of valid (non-expired) verification types
+        valid_types = set()
+        expired_types = []
+        for record in verified_records:
+            if not record.is_expired:
+                valid_types.add(record.verify_type)
+            else:
+                expired_types.append(record.verify_type)
+
+        # Check weight types: OR logic when both are listed, AND for everything else
+        weight_types = {"weight_light", "weight_full"}
+        weight_required = weight_types.intersection(required_types)
+
+        if len(weight_required) > 1:
+            # Both weight types listed (e.g. categories 40/50) — having either satisfies
+            non_weight_required = [t for t in required_types if t not in weight_types]
+            weight_ok = bool(weight_required.intersection(valid_types))
+            is_ready = all(t in valid_types for t in non_weight_required) and weight_ok
+            missing_types = [t for t in non_weight_required if t not in valid_types]
+            if not weight_ok:
+                missing_types.append("weight_light or weight_full")
+        else:
+            # Original logic: all required types must be present
+            is_ready = all(req_type in valid_types for req_type in required_types)
+            missing_types = [t for t in required_types if t not in valid_types]
+
+        if is_ready:
+            logfire.debug(
+                "User is race ready",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                required_types=list(required_types),
+                valid_types=list(valid_types),
+            )
+        else:
+            logfire.debug(
+                "User is not race ready",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                required_types=list(required_types),
+                valid_types=list(valid_types),
+                missing_types=missing_types,
+                expired_types=expired_types,
+            )
+
+        return is_ready
+
+    def calculate_extra_verified(self) -> bool:
+        """Calculate if user has weight_full + height + power all verified and non-expired.
+
+        This is a higher tier than race ready, regardless of the user's ZP category.
+
+        Returns:
+            True if user has all three verification types valid and non-expired.
+
+        """
+        from apps.team.models import RaceReadyRecord
+
+        required_types = {"weight_full", "height", "power"}
+
+        verified_records = self.race_ready_records.filter(status=RaceReadyRecord.Status.VERIFIED)
+
+        valid_types = set()
+        for record in verified_records:
+            if not record.is_expired:
+                valid_types.add(record.verify_type)
+
+        is_extra = required_types.issubset(valid_types)
+
+        logfire.debug(
+            "Extra verified calculation",
+            user_id=self.id,
+            discord_id=self.discord_id,
+            is_extra_verified=is_extra,
+            valid_types=list(valid_types),
+        )
+
+        return is_extra
+
+    def refresh_race_ready(self) -> tuple[bool, bool]:
+        """Recalculate and save the cached is_race_ready and is_extra_verified fields if changed.
+
+        Returns:
+            Tuple of (new is_race_ready value, new is_extra_verified value).
+
+        """
+        new_race_ready = self.calculate_race_ready()
+        new_extra_verified = self.calculate_extra_verified()
+
+        update_fields = []
+        if self.is_race_ready != new_race_ready:
+            self.is_race_ready = new_race_ready
+            update_fields.append("is_race_ready")
+        if self.is_extra_verified != new_extra_verified:
+            self.is_extra_verified = new_extra_verified
+            update_fields.append("is_extra_verified")
+
+        if update_fields:
+            self.save(update_fields=update_fields)
+            logfire.info(
+                "Verification status updated",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                is_race_ready=new_race_ready,
+                is_extra_verified=new_extra_verified,
+            )
+        return new_race_ready, new_extra_verified
+
+    @property
+    def is_any_admin(self) -> bool:
+        """Check if user has any admin role."""
+        return self.is_app_admin or self.is_link_admin or self.is_membership_admin or self.is_racing_admin
+
+    @property
+    def is_any_captain(self) -> bool:
+        """Check if user is captain or vice captain."""
+        return self.is_team_captain or self.is_team_vice_captain
+
+    @property
+    def discord_avatar_url(self) -> str | None:
+        """The full Discord avatar URL.
+
+        Returns:
+            The Discord CDN URL for the avatar, or None if no avatar.
+
+        """
+        if self.discord_id and self.discord_avatar:
+            return f"https://cdn.discordapp.com/avatars/{self.discord_id}/{self.discord_avatar}.png"
+        return None
+
+    def has_discord_role(self, role_id: int | str) -> bool:
+        """Check if user has a Discord role.
+
+        Args:
+            role_id: The Discord role ID to check.
+
+        Returns:
+            True if user has the role, False otherwise.
+
+        """
+        return str(role_id) in (self.discord_roles or {})
+
+    def get_discord_role_ids(self) -> list[int]:
+        """Get list of Discord role IDs.
+
+        Returns:
+            List of role IDs as integers.
+
+        """
+        return [int(rid) for rid in (self.discord_roles or {})]
+
+    def get_discord_role_names(self) -> list[str]:
+        """Get list of Discord role names.
+
+        Returns:
+            List of role names.
+
+        """
+        return list((self.discord_roles or {}).values())
+
+    @property
+    def is_zauth_verified(self) -> bool:
+        """Whether this account was verified through the official Zwift OAuth flow.
+
+        Reads the stored provenance rather than asking the service, so it costs
+        nothing per request. Legacy and admin verifications return False: they are
+        still accepted today, but they are what the zauth migration is replacing.
+
+        ``zwid_verified`` is checked too, not just the method. Every code path writes
+        the two together (the Django admin shows them read-only), but the pair is still
+        separable by a raw database or shell write, and a half-written row would
+        otherwise pass a squad's ``require_zauth`` gate on provenance alone. The flag is
+        the assertion; the method only says where it came from.
+
+        Returns:
+            True if the account is verified and that verification came from Zwift OAuth.
+
+        """
+        return self.zwid_verified and self.zwid_verification_method == self.VerificationMethod.ZAUTH
+
+    def _metric_wkg(self, watts: Decimal | None) -> float | None:
+        """Divide a stored wattage by the weight Zwift used to compute it.
+
+        The denominator is deliberately ``z_metrics_weight_grams`` and not the rider's
+        self-reported weight: Zwift derives the category thresholds from the weight it
+        held at metrics time, so using anything else would produce a W/kg that disagrees
+        with the rider's own category.
+
+        Args:
+            watts: A stored metric in watts.
+
+        Returns:
+            Watts per kilogram, or None when either side is missing.
+
+        """
+        if watts is None or not self.z_metrics_weight_grams:
+            return None
+        return float(watts) / (self.z_metrics_weight_grams / 1000)
+
+    @property
+    def z_ftp_wkg(self) -> float | None:
+        """Watts per kilogram for zFTP.
+
+        Returns:
+            W/kg, or None if zFTP or the metrics weight is missing.
+
+        """
+        return self._metric_wkg(self.z_ftp)
+
+    @property
+    def z_map_wkg(self) -> float | None:
+        """Watts per kilogram for zMAP.
+
+        Returns:
+            W/kg, or None if zMAP or the metrics weight is missing.
+
+        """
+        return self._metric_wkg(self.z_map)
+
+    @property
+    def has_accepted_zwid_verification(self) -> bool:
+        """Whether this account's Zwift verification counts under the current policy.
+
+        Identical to ``zwid_verified`` until ``ZAUTH_VERIFICATION_REQUIRED`` is turned
+        on, after which only Zwift OAuth counts and legacy/admin verifications read as
+        unverified. The record itself is never touched, so turning the flag back off
+        restores everyone.
+
+        Use this for anything that *decides* or *displays* whether someone is verified.
+        Read ``zwid_verified`` directly only where the raw stored fact is wanted — the
+        Zwift verification report does that deliberately, since it exists to show the
+        legacy verifications this policy stops counting.
+
+        Returns:
+            True if the stored verification is accepted under the active policy.
+
+        """
+        from constance import config
+
+        if not self.zwid_verified:
+            return False
+        return self.is_zauth_verified if config.ZAUTH_VERIFICATION_REQUIRED else True
+
+    @property
+    def is_profile_complete(self) -> bool:
+        """Check if user has completed all required profile fields.
+
+        Required fields:
+        - first_name
+        - last_name
+        - birth_year
+        - gender
+        - timezone
+        - country
+        - trainer
+        - heartrate_monitor
+        - zwid_verified (Zwift account must be verified)
+
+        Returns:
+            True if all required fields are filled and Zwift is verified, False otherwise.
+
+        """
+        # Collect missing fields for logging
+        missing_fields = []
+
+        required_text_fields = [
+            ("first_name", self.first_name),
+            ("last_name", self.last_name),
+            ("gender", self.gender),
+            ("timezone", self.timezone),
+            ("trainer", self.trainer),
+            ("heartrate_monitor", self.heartrate_monitor),
+        ]
+
+        # Check all text fields are non-empty
+        for field_name, field_value in required_text_fields:
+            if not (field_value and field_value.strip()):
+                missing_fields.append(field_name)
+
+        # Check country is set (CountryField returns a Country object, not a string)
+        if not self.country:
+            missing_fields.append("country")
+
+        # Check birth_year is set (it's a nullable integer field)
+        if not self.birth_year:
+            missing_fields.append("birth_year")
+
+        # Check Zwift account is verified under the active policy: once the zauth
+        # cutover flag is on, a legacy verification no longer completes the profile.
+        if not self.has_accepted_zwid_verification:
+            missing_fields.append("zwid_verified")
+
+        is_complete = len(missing_fields) == 0
+
+        if not is_complete:
+            logfire.debug(
+                "Profile is incomplete",
+                user_id=self.id,
+                discord_id=self.discord_id,
+                missing_fields=missing_fields,
+            )
+
+        return is_complete
+
+    @property
+    def profile_completion_status(self) -> dict[str, bool]:
+        """Detailed profile completion status for each required field.
+
+        Returns:
+            Dictionary mapping field names to completion status.
+
+        """
+        return {
+            "first_name": bool(self.first_name and self.first_name.strip()),
+            "last_name": bool(self.last_name and self.last_name.strip()),
+            "birth_year": bool(self.birth_year),
+            "gender": bool(self.gender and self.gender.strip()),
+            "timezone": bool(self.timezone and self.timezone.strip()),
+            "country": bool(self.country),  # CountryField returns a Country object, not a string
+            "trainer": bool(self.trainer and self.trainer.strip()),
+            "heartrate_monitor": bool(self.heartrate_monitor and self.heartrate_monitor.strip()),
+            # Must track is_profile_complete, or the banner would fire with no badge
+            # explaining which field is missing.
+            "zwid_verified": self.has_accepted_zwid_verification,
+        }
+
+    @property
+    def incomplete_profile_count(self) -> int:
+        """Number of required profile fields still incomplete (for the nudge banner)."""
+        return sum(1 for done in self.profile_completion_status.values() if not done)
+
+
+class GuildMember(models.Model):
+    """Discord guild member data synced from bot.
+
+    Tracks all members of the Discord guild, including those who don't have
+    a Django User account. Used to compare guild membership with app users.
+    """
+
+    discord_id = models.CharField(
+        max_length=20,
+        unique=True,
+        db_index=True,
+        help_text="Discord user ID (snowflake)",
+    )
+    username = models.CharField(
+        max_length=100,
+        help_text="Discord username",
+    )
+    display_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Discord global display name",
+    )
+    nickname = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Server-specific nickname",
+    )
+    avatar_hash = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Discord avatar hash for CDN URL",
+    )
+    roles = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="List of Discord role IDs",
+    )
+    joined_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the member joined the guild",
+    )
+    is_bot = models.BooleanField(
+        default=False,
+        help_text="Whether this member is a bot",
+    )
+
+    # Tracking fields
+    date_created = models.DateTimeField(
+        auto_now_add=True,
+        help_text="When this record was created",
+    )
+    date_modified = models.DateTimeField(
+        auto_now=True,
+        help_text="When this record was last updated",
+    )
+    date_left = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the member left the guild (null if still present)",
+    )
+
+    # Link to User if exists
+    user = models.OneToOneField(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="guild_member",
+        help_text="Linked Django User account",
+    )
+
+    class Meta:
+        """Meta options for GuildMember model."""
+
+        verbose_name = "Guild Member"
+        verbose_name_plural = "Guild Members"
+        ordering = ["-date_modified"]  # noqa: RUF012
+
+    def __str__(self) -> str:
+        """Return string representation.
+
+        Returns:
+            Display name or username.
+
+        """
+        name = self.nickname or self.display_name or self.username
+        return f"{name} ({self.discord_id})"
+
+    @property
+    def avatar_url(self) -> str | None:
+        """The full Discord avatar URL.
+
+        Returns:
+            The Discord CDN URL for the avatar, or None if no avatar.
+
+        """
+        if self.avatar_hash:
+            return f"https://cdn.discordapp.com/avatars/{self.discord_id}/{self.avatar_hash}.png"
+        return None
+
+    @property
+    def is_active(self) -> bool:
+        """Check if member is still in the guild.
+
+        Returns:
+            True if date_left is None, False otherwise.
+
+        """
+        return self.date_left is None
+
+    @property
+    def has_user_account(self) -> bool:
+        """Check if member has a linked User account.
+
+        Returns:
+            True if user is linked, False otherwise.
+
+        """
+        return self.user is not None
+
+
+class YouTubeVideo(models.Model):
+    """YouTube video fetched from a user's channel RSS feed.
+
+    Videos are fetched periodically via background task and stored
+    for display on user profiles.
+
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="youtube_videos",
+        help_text="User who owns this video's channel",
+    )
+    video_id = models.CharField(
+        max_length=20,
+        help_text="YouTube video ID",
+    )
+    title = models.CharField(
+        max_length=500,
+        help_text="Video title",
+    )
+    thumbnail_url = models.URLField(
+        max_length=300,
+        blank=True,
+        help_text="Video thumbnail URL",
+    )
+    published_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Video publish date",
+    )
+    date_created = models.DateTimeField(auto_now_add=True)
+    date_modified = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        """Meta options for YouTubeVideo model."""
+
+        verbose_name = "YouTube Video"
+        verbose_name_plural = "YouTube Videos"
+        ordering: ClassVar[list[str]] = ["-published_at"]
+        constraints: ClassVar[list] = [
+            models.UniqueConstraint(fields=["user", "video_id"], name="unique_user_video"),
+        ]
+
+    def __str__(self) -> str:
+        """Return string representation.
+
+        Returns:
+            Video title and user.
+
+        """
+        return f"{self.title} ({self.user})"
+
+    @property
+    def url(self) -> str:
+        """The YouTube video URL.
+
+        Returns:
+            Full YouTube watch URL.
+
+        """
+        return f"https://www.youtube.com/watch?v={self.video_id}"
+
+
+class BlockedDiscordId(models.Model):
+    """A Discord account barred from signing in.
+
+    Checked in ``DiscordSocialAccountAdapter.pre_social_login``, before any account is
+    created or reconnected, so a blocked person is turned away whether or not they have
+    ever had an account here.
+
+    Keyed by Discord id rather than by ``User``: the point is to keep somebody out after
+    their account has been deleted, when there is no User row left to flag. It also means
+    a block survives them deleting and re-creating their account here.
+
+    Attributes:
+        discord_id: The Discord account id to refuse.
+        note: Why, for whoever reads this list months later.
+        blocked_by: Who added it.
+        created_at: When it was added.
+
+    """
+
+    discord_id = models.CharField(max_length=20, unique=True, help_text="Discord user ID to block")
+    note = models.CharField(max_length=200, blank=True, help_text="Why this account is blocked")
+    blocked_by = models.ForeignKey(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="blocked_discord_ids",
+        help_text="Admin who added this block",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, help_text="When the block was added")
+
+    class Meta:
+        """Meta options for BlockedDiscordId."""
+
+        ordering: ClassVar[list[str]] = ["-created_at"]
+        verbose_name = "Blocked Discord ID"
+        verbose_name_plural = "Blocked Discord IDs"
+
+    def __str__(self) -> str:
+        """Return the blocked id.
+
+        Returns:
+            The Discord id.
+
+        """
+        return self.discord_id
+
+    @classmethod
+    def is_blocked(cls, discord_id: str | int | None) -> bool:
+        """Whether this Discord account is barred from signing in.
+
+        Args:
+            discord_id: The Discord account id from the OAuth payload.
+
+        Returns:
+            True if a block exists for it.
+
+        """
+        if not discord_id:
+            return False
+        return cls.objects.filter(discord_id=str(discord_id)).exists()

@@ -1,0 +1,459 @@
+"""Guards on the cached rider profile.
+
+The model is a cache of a remote document, and most of these tests exist to keep it one.
+The failure mode being defended against is the one that produced ZRRider's 81 columns: a
+field gets promoted because somebody needed the value, then another, until the cache is a
+schema nobody can migrate.
+"""
+
+from datetime import timedelta
+
+import pytest
+from constance.test import override_config
+from django.utils import timezone
+
+from apps.rider_data.models import RatingRow, RiderProfile, Velo2Categories, is_woman, velo2_categories_by_zwid
+from apps.rider_data.tasks import purge_rider_profiles
+from gotta_bike_platform.retention import RetentionPolicy, policy_for
+
+
+@pytest.fixture
+def profile_factory(db):
+    def _make(zwid=1001, *, last_race_days_ago=None, fetched_days_ago=0, requested_days_ago=None, **kwargs):
+        return RiderProfile.objects.create(
+            zwid=zwid,
+            name=kwargs.pop("name", "Test Rider"),
+            fetched_at=timezone.now() - timedelta(days=fetched_days_ago),
+            last_requested_at=timezone.now()
+            - timedelta(days=fetched_days_ago if requested_days_ago is None else requested_days_ago),
+            last_race_at=(
+                None if last_race_days_ago is None else timezone.now() - timedelta(days=last_race_days_ago)
+            ),
+            **kwargs,
+        )
+
+    return _make
+
+
+@pytest.mark.django_db
+def test_zwid_is_the_key_not_the_zwift_uuid(profile_factory):
+    """Every consumer joins on User.zwid, and only connected riders have a UUID at all."""
+    profile = profile_factory(zwid=12345)
+    assert profile.pk == 12345
+    assert RiderProfile._meta.pk.name == "zwid"
+
+    # A rider with no zwift_user_id must still be storable.
+    assert profile.zwift_user_id == ""
+
+
+@pytest.mark.django_db
+def test_the_promoted_columns_are_only_the_ones_something_queries():
+    """The promotion rule, asserted rather than left as prose.
+
+    A field earns a column by being filtered, sorted, joined or gated on. If this list grows,
+    the growth should be a deliberate decision with a reason, not a drive-by addition -- which
+    is exactly what did not happen to ZRRider.
+    """
+    columns = {f.name for f in RiderProfile._meta.get_fields()}
+    expected = {
+        "zwid", "zwift_user_id",
+        "name", "gender", "country", "age",
+        "weight_kg", "height_cm", "ftp", "zftp",
+        "category_open", "category_women", "category_racing",
+        "velo", "zwift_racing_score", "zp_skill", "compound_score",
+        "phenotype_value", "club_id", "club_name",
+        # Promoted 2026-10-15 at Vincent's request, to tell riders on the team's ZwiftPower
+        # roster from the rest without reading every payload (filtered in the admin and
+        # counted by the sync).
+        "on_zwiftpower_team",
+        "payload", "fetched_at", "last_requested_at", "sources", "has_account", "last_race_at",
+    }
+    assert columns == expected, (
+        "The column set changed. If a field was promoted out of payload, confirm something "
+        "actually filters, sorts, joins or gates on it -- and update this test deliberately."
+    )
+
+
+@pytest.mark.django_db
+def test_the_rich_blocks_stay_in_payload(profile_factory):
+    """Power curves, handicaps, seed and phenotype scores are read whole, never queried."""
+    profile = profile_factory(
+        payload={
+            "power": {"curve_w": {"5": 900}, "curve_wkg": {"5": 12.1}},
+            "handicaps": {"flat": 1.2, "rolling": 0.9, "hilly": -0.4, "mountainous": -1.1},
+            "seed": {"rating": 1600},
+            "phenotype": {"scores": {"sprinter": 80}, "value": "Sprinter"},
+        }
+    )
+    profile.refresh_from_db()
+    assert profile.payload["handicaps"]["hilly"] == pytest.approx(-0.4)
+    assert profile.payload["power"]["curve_w"]["5"] == 900
+    # None of those are columns.
+    assert not hasattr(profile, "handicap_hilly")
+    assert not hasattr(profile, "curve_w")
+
+
+@pytest.mark.django_db
+def test_the_watts_curve_is_read_by_duration_in_seconds(profile_factory):
+    """The curve is keyed by seconds as strings, with null where Zwift Racing has nothing."""
+    profile = profile_factory(payload={"power": {"curve_w": {"5": 900, "60": 410.5, "300": None, "1200": 0}}})
+
+    assert profile.power_curve_w == {5: 900.0, 60: 410.5}  # the missing and the zero dropped
+    assert profile_factory(zwid=1002, payload={"power": {"curve_w": None}}).power_curve_w is None
+    assert profile_factory(zwid=1003, payload={}).power_curve_w is None
+
+
+@pytest.mark.django_db
+def test_velo2_seed_and_race_counts_are_read_from_the_payload(profile_factory):
+    """The vELO 2 block stays apart: its race rating is another scale and must never be read as vELO 1."""
+    profile = profile_factory(
+        payload={
+            "ratings": {"rating_max30": 1520.0, "category_max30": "Diamond", "category_max90": "Ruby"},
+            "velo2": {
+                "race": 430.0,
+                "race_max30": 450.0,
+                "race_max90": 470,
+                "category": "Amethyst",
+                "category_max30": "Amethyst",
+                "category_max90": "",  # zauth sends None; an empty name is no category either
+                "category_women": "Emerald",
+                "category_women_max30": "Emerald",
+                "category_women_max90": None,
+                "factors": {"sprint": 452, "punch": 440.5, "climb": None, "timeTrial": 415, "endurance": 398},
+            },
+            "seed": {"race": 420.0, "timeTrial": 380.5, "factors": {"sprint": 460, "timeTrial": 401}},
+            "race_counts": {"finishes": 88, "dnfs": 3, "wins": 5, "podiums": None},
+            "power": {"curve_wkg": {"5": 12.4, "60": 6.1, "1200": None}},
+        }
+    )
+
+    assert profile.velo2 == {
+        "race": 430.0,
+        "max30": 450.0,
+        "max90": 470.0,
+        "sprint": 452.0,
+        "punch": 440.5,
+        "climb": None,
+        "time_trial": 415.0,
+        "endurance": 398.0,
+        "pursuit": None,
+        "category": "Amethyst",
+        "category_max30": "Amethyst",
+        "category_max90": None,
+        # Passed on as sent, for any rider: velo2_women decides when they apply.
+        "category_women": "Emerald",
+        "category_women_max30": "Emerald",
+        "category_women_max90": None,
+    }
+    seed = profile.seed_ratings
+    assert (seed["race"], seed["time_trial"]) == pytest.approx((420.0, 380.5))  # the time-trial rating
+    assert seed["time_trial_factor"] == pytest.approx(401.0)  # and the factor beside it
+    assert profile.race_counts == {"finishes": 88, "wins": 5, "podiums": None, "dnfs": 3}
+    assert profile.peak_categories == {"max30": "Diamond", "max90": "Ruby"}
+    assert profile.power_curve_wkg == {5: 12.4, 60: 6.1}
+
+
+@pytest.mark.django_db
+def test_a_profile_without_the_new_blocks_reads_none(profile_factory):
+    """Before zauth sends vELO 2 and race counts, or for a rider with no Zwift Racing record."""
+    profile = profile_factory(payload={"ratings": {"rating_max30": 1520.0}, "velo2": None, "race_counts": {}})
+
+    assert profile.velo2 is None
+    assert profile.seed_ratings is None
+    assert profile.race_counts is None
+    assert profile.peak_categories is None
+    assert profile.power_curve_wkg is None
+
+
+@pytest.mark.django_db
+def test_roster_membership_is_not_stored_here():
+    """Membership belongs to team. A cache row carrying it could never be evicted.
+
+    ``on_zwiftpower_team`` is not membership in this sense: it repeats what zauth saw on the
+    team's latest ZwiftPower roster, every sync overwrites it, and nothing is lost when the
+    row goes. The team's own record -- who joined, who left, who is active, and when -- would
+    be, and stays off the cache.
+    """
+    columns = {f.name for f in RiderProfile._meta.get_fields()}
+    for forbidden in ("date_left", "is_active", "on_team", "first_seen", "joined"):
+        assert forbidden not in columns, (
+            f"{forbidden} is roster state, not profile data — putting it on an evictable cache "
+            f"makes retention unenforceable on exactly the rows that need it"
+        )
+
+
+@pytest.mark.django_db
+def test_staleness_is_computed_not_stored(profile_factory):
+    """A stored flag needs a sweep to stay true and is wrong between sweeps."""
+    columns = {f.name for f in RiderProfile._meta.get_fields()}
+    assert "is_stale" not in columns
+
+    with override_config(RIDER_PROFILE_REFRESH_HOURS=24):
+        assert profile_factory(zwid=1, fetched_days_ago=0).is_stale is False
+        assert profile_factory(zwid=2, fetched_days_ago=3).is_stale is True
+
+
+@pytest.mark.django_db
+@override_config(RIDER_PROFILE_REFRESH_HOURS=0)
+def test_zero_disables_staleness(profile_factory):
+    """Matching the convention the analytics and verification sweeps already use."""
+    assert profile_factory(fetched_days_ago=999).is_stale is False
+
+
+# --- retention -----------------------------------------------------------------------
+
+
+def test_the_model_declares_its_retention():
+    """The ratchet requires it; this states what was decided."""
+    policy = policy_for(RiderProfile)
+    assert policy is not None
+    assert policy.kind == RetentionPolicy.KIND_DELETE
+    assert policy.anchor == "last_requested_at"
+    assert policy.setting == "RIDER_PROFILE_MAX_DAYS"
+
+
+@pytest.mark.django_db
+def test_the_declared_window_is_the_configured_one():
+    """The declaration names a Constance setting; this pins the default it documents."""
+    from constance import config
+
+    assert config.RIDER_PROFILE_MAX_DAYS == 120
+
+
+@pytest.mark.django_db
+@override_config(RIDER_PROFILE_MAX_DAYS=120, RIDER_PROFILE_PURGE_MAX_FRACTION=0.9)
+def test_a_rider_the_sync_has_stopped_asking_for_is_purged(profile_factory, healthy_sync):
+    """Not asked for in the window means the rider left the set we have a reason to hold."""
+    profile_factory(zwid=1, requested_days_ago=200)
+    profile_factory(zwid=2, requested_days_ago=1)
+
+    result = purge_rider_profiles.func()
+
+    assert result["deleted"] == 1
+    assert set(RiderProfile.objects.values_list("zwid", flat=True)) == {2}
+
+
+@pytest.mark.django_db
+@override_config(RIDER_PROFILE_MAX_DAYS=120)
+def test_race_activity_no_longer_decides_anything(profile_factory, healthy_sync):
+    """A rider who has not raced in years stays, as long as the sync still refreshes them.
+
+    This is the whole point of the anchor change: race activity describes the rider, not our
+    reason for holding their data.
+    """
+    profile_factory(zwid=1, last_race_days_ago=2000, fetched_days_ago=0)
+
+    purge_rider_profiles.func()
+
+    assert RiderProfile.objects.filter(zwid=1).exists()
+
+
+@pytest.mark.django_db
+@override_config(RIDER_PROFILE_MAX_DAYS=0)
+def test_zero_disables_the_purge(profile_factory):
+    profile_factory(zwid=1, last_race_days_ago=9999)
+
+    result = purge_rider_profiles.func()
+
+    assert result["deleted"] == 0
+    assert RiderProfile.objects.filter(zwid=1).exists()
+
+
+@pytest.mark.django_db
+def test_the_purge_is_not_scheduled_yet():
+    """Deliberate: nothing has validated last_race_at, so nothing should delete on it."""
+    from gotta_bike_platform.task_registry import TASK_REGISTRY
+
+    entry = TASK_REGISTRY["purge_rider_profiles"]
+    assert not entry.get("scheduled", False), (
+        "Scheduling this means deleting production rows on an anchor no sync has validated"
+    )
+
+
+# --- admin ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_the_cache_is_not_editable_in_admin():
+    """Every field mirrors the service, so an edit would be overwritten by the next sync.
+
+    A form that appears to save but silently reverts is worse than no form.
+    """
+    from django.contrib import admin
+
+    model_admin = admin.site._registry[RiderProfile]
+    readonly = set(model_admin.get_readonly_fields(None))
+    editable = {f.name for f in RiderProfile._meta.fields} - readonly
+
+    assert not editable, f"these would appear editable and silently revert: {sorted(editable)}"
+    assert model_admin.has_add_permission(None) is False
+
+
+@pytest.mark.django_db
+@override_config(RIDER_PROFILE_MAX_DAYS=120)
+def test_admin_shows_which_rows_eviction_would_reach(profile_factory):
+    """The operational view of the policy: what is about to go, before it goes."""
+    from apps.rider_data.admin import EvictionRiskFilter
+
+    profile_factory(zwid=1, fetched_days_ago=1)
+    profile_factory(zwid=2, fetched_days_ago=90)
+    profile_factory(zwid=3, fetched_days_ago=200)
+
+    def _filtered(value):
+        filt = EvictionRiskFilter(None, {"refresh_status": [value]}, RiderProfile, None)
+        return set(filt.queryset(None, RiderProfile.objects.all()).values_list("zwid", flat=True))
+
+    assert _filtered("fresh") == {1}
+    assert _filtered("aging") == {2}
+    assert _filtered("evictable") == {3}
+
+
+# --- the women's vELO 2 categories -----------------------------------------------------------
+
+WOMEN_VELO2 = {
+    "race": 430.0,
+    "category": "Amethyst",
+    "category_women": "Emerald",
+    "category_women_max30": "Emerald",
+    "category_women_max90": "Ruby",
+}
+
+
+@pytest.mark.parametrize(
+    ("genders", "expected"),
+    [
+        (("female",), True),
+        (("F",), True),
+        ((" Women ",), True),
+        (("male",), False),
+        (("other",), False),
+        (("", "F"), True),  # a blank member answer leaves it to zauth's
+        ((None, "female"), True),
+        (("male", "F"), False),  # the member's own answer wins
+        (("", ""), False),
+        ((), False),
+    ],
+)
+def test_is_woman_reads_the_first_gender_that_says_anything(genders, expected):
+    assert is_woman(*genders) is expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("member_gender", "profile_gender", "applies"),
+    [
+        ("female", "male", True),
+        ("", "F", True),
+        ("male", "F", False),
+        ("", "M", False),
+        ("", "", False),
+    ],
+)
+def test_the_womens_velo2_categories_apply_only_to_women(profile_factory, member_gender, profile_gender, applies):
+    """Every rider gets a women's category from zwiftracing beside the open one; only a woman's is shown."""
+    profile = profile_factory(gender=profile_gender, payload={"velo2": WOMEN_VELO2})
+
+    expected = {"category": "Emerald", "max30": "Emerald", "max90": "Ruby"} if applies else None
+    assert profile.velo2_women(member_gender) == expected
+
+
+@pytest.mark.django_db
+def test_a_woman_without_womens_categories_gets_none(profile_factory):
+    """A payload stored before zauth sent them, or a rider zwiftracing has none for."""
+    profile = profile_factory(gender="F", payload={"velo2": {"race": 430.0, "category": "Amethyst"}})
+
+    assert profile.velo2_women() is None
+    assert profile_factory(zwid=1002, gender="F", payload={}).velo2_women() is None
+
+
+@pytest.mark.django_db
+def test_the_bulk_lookup_gives_everyone_the_mixed_tier_and_women_theirs(profile_factory, django_assert_num_queries):
+    """The mixed tier is shown by default for everyone; the women's one only ever filters."""
+    profile_factory(zwid=1, gender="F", payload={"velo2": WOMEN_VELO2})
+    profile_factory(zwid=2, gender="M", payload={"velo2": WOMEN_VELO2})
+    profile_factory(zwid=3, gender="F", payload={"velo2": WOMEN_VELO2})
+    profile_factory(zwid=5, gender="", payload={"velo2": None})
+
+    with django_assert_num_queries(1):
+        found = velo2_categories_by_zwid([(1, ""), (2, "female"), (3, "male"), (None, "female"), (4, ""), (5, "")])
+
+    # 1: no answer given, and zauth says F. 2: the given female overrules zauth's M.
+    # 3: the given male overrules zauth's F. 4: no profile. 5: no vELO 2 at all.
+    assert found == {
+        1: Velo2Categories("Amethyst", "Emerald"),
+        2: Velo2Categories("Amethyst", "Emerald"),
+        3: Velo2Categories("Amethyst", ""),
+        5: Velo2Categories("", ""),
+    }
+
+
+@pytest.mark.django_db
+def test_the_bulk_lookup_asks_nothing_without_a_zwid(django_assert_num_queries):
+    with django_assert_num_queries(0):
+        assert velo2_categories_by_zwid([(None, "female"), (0, "male")]) == {}
+
+
+# --- the women's vELO categories, and both scales as the card's tables -------------------------
+
+# The current one beside category.racing, the peaks' beside the open ones in ratings.
+WOMEN_VELO = {
+    "category": {"racing": "Gold", "racing_women": "Ruby"},
+    "ratings": {"rating_max30": 1520.0, "category_max30": "Platinum", "category_women_max30": "Emerald"},
+}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("member_gender", "profile_gender", "applies"),
+    [
+        ("female", "male", True),
+        ("", "F", True),
+        ("male", "F", False),
+        ("", "M", False),
+        ("", "", False),
+    ],
+)
+def test_the_womens_velo_categories_apply_only_to_women(profile_factory, member_gender, profile_gender, applies):
+    """The same rule as vELO 2's: zwiftracing labels every rider, only a woman's is shown."""
+    profile = profile_factory(gender=profile_gender, payload=WOMEN_VELO)
+
+    expected = {"category": "Ruby", "max30": "Emerald", "max90": None} if applies else None
+    assert profile.velo_women(member_gender) == expected
+
+
+@pytest.mark.django_db
+def test_a_woman_without_womens_velo_categories_gets_none(profile_factory):
+    """A payload stored before zauth sent them, or one of the wrong shape."""
+    odd = {"category": {"racing_women": ""}, "ratings": {"category_women_max30": {"name": "Ruby"}}}
+
+    assert profile_factory(gender="F", payload={"category": {"racing": "Gold"}}).velo_women() is None
+    assert profile_factory(zwid=1002, gender="F", payload=odd).velo_women() is None
+
+
+@pytest.mark.django_db
+def test_each_scale_is_laid_out_now_and_at_its_peaks(profile_factory):
+    """A row with nothing in it is left out; the women's rows are a woman's only."""
+    profile = profile_factory(
+        gender="F", velo=1480.4, category_racing="Gold", payload={**WOMEN_VELO, "velo2": WOMEN_VELO2}
+    )
+
+    assert profile.velo_table() == [
+        RatingRow("Rating", (1480.4, 1520.0, None), numeric=True),
+        RatingRow("Mixed", ("Gold", "Platinum", None), numeric=False),
+        RatingRow("Women's", ("Ruby", "Emerald", None), numeric=False),
+    ]
+    assert profile.velo2_table() == [
+        RatingRow("Rating", (430.0, None, None), numeric=True),
+        RatingRow("Mixed", ("Amethyst", None, None), numeric=False),
+        RatingRow("Women's", ("Emerald", "Emerald", "Ruby"), numeric=False),
+    ]
+    assert [row.label for row in profile.velo_table("male")] == ["Rating", "Mixed"]
+    assert [row.label for row in profile.velo2_table("male")] == ["Rating", "Mixed"]
+
+
+@pytest.mark.django_db
+def test_a_profile_without_ratings_has_empty_tables(profile_factory):
+    profile = profile_factory(gender="F", payload={})
+
+    assert profile.velo_table() == []
+    assert profile.velo2_table() == []

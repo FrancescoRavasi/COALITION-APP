@@ -1,0 +1,132 @@
+# The Coalition Team Platform
+
+![Events View](docs/screenshots/events%20view.png)
+
+A Django web application for The Coalition Zwift racing team. Manages team members, integrates with ZwiftPower and Zwift Racing APIs, and provides Discord bot integration.
+
+## Features
+
+- **Discord OAuth Authentication** - Login with Discord, requires guild membership
+- **Profile Completion** - Warning banner encourages users to complete profile and verify Zwift
+- **Public User Profiles** - Team members can view each other's profiles (privacy-aware)
+- **Zwift Account Verification** - Link and verify Zwift accounts
+- **Race Ready Verification** - Weight/height/power verification for race eligibility
+- **Membership Applications** - Discord-integrated application workflow for new members
+- **Team Management** - Unified roster from ZwiftPower, Zwift Racing, and user data
+- **Guild Member Sync** - Sync Discord members with Django
+- **Data Connections** - Export team data to Google Sheets
+- **Role-Based Permissions** - Discord role-based access control
+- **Events & Squads** - Event management with signups, squads, and squad member assignment
+- **Squad Availability & Scheduled Races** - Squad captains build availability heatmaps, schedule races (named slots) directly from the heatmap, attach Zwift event/course links, and create Discord threads with @-mentioned riders in one click
+- **Strava Integration** - Sync and display Strava club activities
+- **Analytics** - Server-side page visit tracking with dashboard
+- **Help Page** - Admin-editable help page with markdown support
+- **Discord Bot API** - REST API for Discord bot integration
+- **CMS Pages** - Dynamic content pages with markdown support, accordion sections, configurable nav location (sidebar or user menu)
+
+## Quick Start
+
+```bash
+# Install dependencies
+uv sync
+
+# Create environment file
+cp .env.example .env
+
+# Run migrations
+uv run python manage.py migrate
+
+# Install Tailwind
+uv run python manage.py tailwind install
+
+# Start dev server (Terminal 1)
+uv run python manage.py runserver
+
+# Start Tailwind watcher (Terminal 2)
+uv run python manage.py tailwind start
+```
+
+## Documentation
+
+Full documentation is available in the [docs/](docs/) folder:
+
+- [Getting Started](docs/getting-started.md) - Setup, installation, environment variables, and commands
+- [Authentication](docs/authentication.md) - Discord OAuth and guild membership
+- [Profile Completion](docs/profile-completion.md) - User profile fields and warning banner
+- [Permissions](docs/permissions.md) - Role-based access control via Discord roles
+- [Race Ready Verification](docs/race-ready.md) - Weight/height/power verification system
+- [Membership Applications](docs/membership-applications.md) - New member application workflow
+- [Guild Member Sync](docs/guild-sync.md) - Discord member synchronization
+- [Discord Bot](docs/discord-bot.md) - Slash commands and cogs
+- [API Reference](docs/api.md) - Discord Bot API and Cron API
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Backend | Django 6.0, Python 3.14 |
+| Frontend | Tailwind CSS 4.x, DaisyUI 5.x, HTMX |
+| Database | PostgreSQL (prod), SQLite (dev) |
+| Server | Granian WSGI |
+| Package Manager | uv |
+| Authentication | django-allauth with Discord OAuth |
+| API | Django Ninja |
+| Observability | Logfire |
+
+## Project Structure
+
+```
+GOTTA_BIKE_virtual_team_platform/
+├── apps/                   # Django applications
+│   ├── accounts/           # User model, auth, permissions
+│   ├── analytics/          # Page visit tracking & dashboard
+│   ├── club_strava/        # Strava club activities
+│   ├── cms/                # Dynamic CMS pages
+│   ├── data_connection/    # Google Sheets export
+│   ├── dbot_api/           # Discord bot REST API
+│   ├── events/             # Events, squads, signups
+│   ├── team/               # Team management, verification
+│   ├── zwiftpower/         # ZwiftPower API integration
+│   └── zwiftracing/        # Zwift Racing API integration
+├── templates/              # Django templates
+├── theme/                  # Tailwind CSS app
+├── docs/                   # Documentation
+├── gotta_bike_platform/    # Django project settings
+└── manage.py
+```
+
+## Common Commands
+
+```bash
+uv run python manage.py runserver     # Dev server
+uv run python manage.py migrate       # Apply migrations
+uv run python manage.py db_worker     # Run background task worker
+uv run pytest                         # Run tests
+uv run pytest apps/accounts/tests.py  # Run a single test file
+uv run pytest -k permission           # Run tests matching keyword
+uv run ruff check .                   # Lint
+```
+
+## Testing
+
+Tests use **pytest + pytest-django**. Configuration lives in `[tool.pytest.ini_options]` in `pyproject.toml`; shared fixtures live in the top-level `conftest.py`.
+
+- Test discovery: any `tests.py`, `test_*.py`, or `*_tests.py` under `apps/` or `gotta_bike_platform/`.
+- The test DB is built from current model state via `--no-migrations` (Django migrations are not replayed for tests). `--reuse-db` keeps the test DB between runs — pass `--create-db` after a model change to force regeneration.
+- Available fixtures: `user`, `team_member`, `app_admin`, `event_admin`, `superuser`, `auth_client`, `admin_authed_client`. Permission fixtures grant via `User.permission_overrides`, so tests don't depend on Constance or Discord roles.
+
+Example:
+
+```python
+import pytest
+
+
+@pytest.mark.django_db
+def test_team_member_can_see_roster(auth_client):
+    response = auth_client.get("/team/roster/")
+    assert response.status_code == 200
+```
+
+## License
+
+Private - The Coalition Zwift Racing Team

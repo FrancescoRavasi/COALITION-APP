@@ -1,0 +1,1186 @@
+"""Tests for the TTT planner: physics, computation, roster merge, and sharing."""
+
+from types import SimpleNamespace
+
+import pytest
+from django.urls import reverse
+
+from apps.ttt_planner.models import PlanRider, TttPlan
+from apps.ttt_planner.services import physics, zwiftgopher
+from apps.ttt_planner.services.compute import compute_plan, optimize_plan, sustainable_speed
+from apps.ttt_planner.services.roster import get_rider_data, search_riders
+from apps.ttt_planner.tasks import run_zwiftgopher_optimize
+from apps.zwift_data.models import ZwiftRoute
+
+
+def make_route(name="Route", distance_km=10, elevation_m=0, world="Watopia", world_id=1, name_hash=None, **velo):
+    """Create a canonical ZwiftRoute for planner tests (ascent from elevation_m).
+
+    Extra keyword args (velo_sprint, recommended_laps, …) pass straight to the model.
+
+    Returns:
+        The created ZwiftRoute.
+
+    """
+    return ZwiftRoute.objects.create(
+        name=name,
+        world=world,
+        world_id=world_id,
+        name_hash=name_hash or name[:32],
+        distance_km=distance_km,
+        ascent_m=elevation_m,
+        **velo,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Physics
+# --------------------------------------------------------------------------- #
+
+
+def test_power_speed_round_trip():
+    """speed_for_power inverts power_for_speed."""
+    for speed in (30.0, 40.0, 50.0):
+        power = physics.power_for_speed(speed, weight_kg=75, height_cm=180)
+        recovered = physics.speed_for_power(power, weight_kg=75, height_cm=180)
+        assert recovered == pytest.approx(speed, abs=0.1)
+
+
+def test_power_increases_with_speed():
+    """Higher speed requires more power."""
+    p30 = physics.power_for_speed(30, weight_kg=75, height_cm=180)
+    p40 = physics.power_for_speed(40, weight_kg=75, height_cm=180)
+    assert p40 > p30
+
+
+def test_calibration_reference_rider():
+    """A 75 kg / 180 cm rider needs a realistic ~250-340 W to hold 40 km/h solo."""
+    power = physics.power_for_speed(40, weight_kg=75, height_cm=180)
+    assert 250 < power < 340
+
+
+def test_draft_savings_monotonic_then_clamped():
+    """Draft savings: zero on front, increasing, then clamped past the table."""
+    assert physics.draft_savings_fraction(1) == pytest.approx(0.0)
+    assert physics.draft_savings_fraction(2) > 0.0
+    assert physics.draft_savings_fraction(3) > physics.draft_savings_fraction(2)
+    # Beyond the table length it clamps to the last value rather than erroring.
+    last = physics.draft_savings_fraction(len(physics.DEFAULT_PARAMS.draft_savings))
+    assert physics.draft_savings_fraction(99) == last
+
+
+def test_draft_reduces_power():
+    """Drafting requires less power than pulling at the same speed."""
+    front = physics.power_for_speed(40, weight_kg=75, height_cm=180, draft_factor=1.0)
+    draft = physics.power_for_speed(40, weight_kg=75, height_cm=180, draft_factor=0.7)
+    assert draft < front
+
+
+def test_estimate_cda_scales_with_size():
+    """CdA grows with both height and weight."""
+    base = physics.estimate_cda(180, 75)
+    assert physics.estimate_cda(190, 75) > base
+    assert physics.estimate_cda(180, 90) > base
+
+
+def test_intensity_factor():
+    """IF is power/FTP, and None without FTP."""
+    assert physics.intensity_factor(300, 300) == pytest.approx(1.0)
+    assert physics.intensity_factor(285, 300) == pytest.approx(0.95)
+    assert physics.intensity_factor(300, None) is None
+    assert physics.intensity_factor(300, 0) is None
+
+
+def test_estimate_time_uphill_slower_than_flat():
+    """A climbing route takes longer than a flat one of the same distance."""
+    flat = physics.estimate_time_seconds(20, 0, 40)
+    hilly = physics.estimate_time_seconds(20, 400, 40)
+    assert hilly > flat > 0
+
+
+# --------------------------------------------------------------------------- #
+# Plan computation
+# --------------------------------------------------------------------------- #
+
+
+def test_normalized_power_constant_equals_power():
+    """NP of a constant series equals that power."""
+    assert physics.normalized_power([250.0] * 120) == pytest.approx(250.0, abs=0.5)
+
+
+def test_normalized_power_variable_exceeds_mean():
+    """NP of a variable series exceeds its simple average (weights hard efforts)."""
+    series = ([150.0] * 60 + [350.0] * 60) * 5  # mean 250
+    assert physics.normalized_power(series) > 250.0
+
+
+def test_training_stress_score():
+    """TSS is 100 for an hour at FTP, and None without FTP."""
+    assert physics.training_stress_score(300, 300, 3600) == pytest.approx(100.0)
+    assert physics.training_stress_score(300, None, 3600) is None
+    assert physics.training_stress_score(300, 300, 0) is None
+
+
+@pytest.mark.django_db
+def test_compute_plan_np_tss_with_route(team_member):
+    """With a route (finish time), riders get Normalized Power and TSS."""
+    route = make_route(name="NP Route", distance_km=20, elevation_m=0)
+    plan = TttPlan.objects.create(created_by=team_member, route=route, target_speed_kph=42)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300, pull_duration_s=45)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=78, height_cm=182, ftp_w=300, pull_duration_s=45)
+
+    result = compute_plan(plan)
+    for rr in result.riders:
+        assert rr.normalized_power_w is not None
+        assert rr.normalized_power_w > 0
+        assert rr.tss is not None
+        assert rr.tss > 0
+
+
+@pytest.mark.django_db
+def test_compute_plan_np_and_if_but_no_tss_without_route(team_member):
+    """NP comes from one rotation, so it needs no route; TSS needs the race length, so it does."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300)
+    result = compute_plan(plan)
+    assert result.riders[0].normalized_power_w is not None
+    assert result.riders[0].intensity_factor is not None
+    assert result.riders[0].tss is None
+
+
+@pytest.mark.django_db
+def test_np_tss_none_without_ftp(team_member):
+    """A rider with no FTP gets NP but no TSS."""
+    route = make_route(name="NP Route 2", distance_km=15, elevation_m=0)
+    plan = TttPlan.objects.create(created_by=team_member, route=route, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="NoFTP", weight_kg=70, height_cm=175)
+    result = compute_plan(plan)
+    assert result.riders[0].normalized_power_w is not None
+    assert result.riders[0].tss is None
+
+
+@pytest.mark.django_db
+def test_sustainable_speed_higher_if_is_faster(team_member):
+    """A higher target IF yields a higher sustainable speed."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=10)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=78, height_cm=182, ftp_w=300)
+    slow = sustainable_speed(plan, target_if=0.85)
+    fast = sustainable_speed(plan, target_if=1.0)
+    assert fast > slow > 0
+
+
+@pytest.mark.django_db
+def test_sustainable_speed_depends_on_pull_durations(team_member):
+    """Giving the stronger rider longer pulls raises the sustainable speed."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=10)
+    strong = PlanRider.objects.create(
+        plan=plan, order=0, name="Strong", weight_kg=70, height_cm=175, ftp_w=360, pull_duration_s=60
+    )
+    weak = PlanRider.objects.create(
+        plan=plan, order=1, name="Weak", weight_kg=80, height_cm=185, ftp_w=240, pull_duration_s=60
+    )
+    even = sustainable_speed(plan, target_if=0.95)
+
+    strong.pull_duration_s = 150
+    strong.save(update_fields=["pull_duration_s"])
+    weak.pull_duration_s = 30
+    weak.save(update_fields=["pull_duration_s"])
+    skewed = sustainable_speed(plan, target_if=0.95)
+
+    assert skewed > even
+
+
+@pytest.mark.django_db
+def test_optimize_gives_stronger_rider_longer_pull(team_member):
+    """Optimize (fastest, even effort) gives the stronger rider a longer pull and orders them first."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=10)
+    strong = PlanRider.objects.create(plan=plan, order=0, name="Strong", weight_kg=70, height_cm=175, ftp_w=360)
+    weak = PlanRider.objects.create(plan=plan, order=1, name="Weak", weight_kg=80, height_cm=185, ftp_w=240)
+
+    result = optimize_plan(plan, target_if=0.95)
+    assert result is not None
+    # A rider set to take no pulls spends no time on the front, whatever their stored length.
+    pulled = {a.rider_pk: 0 if a.zero_pull else a.pull_duration_s for a in result.assignments}
+    orders = {a.rider_pk: a.order for a in result.assignments}
+    assert pulled[strong.pk] > pulled[weak.pk]
+    assert orders[strong.pk] < orders[weak.pk]  # strongest leads
+    assert result.speed_kph > 0
+
+
+@pytest.mark.django_db
+def test_optimize_view_applies(auth_client, team_member):
+    """The optimize endpoint writes durations/order and sets the speed."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=10)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=70, height_cm=175, ftp_w=360, pull_duration_s=60)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=82, height_cm=186, ftp_w=240, pull_duration_s=60)
+
+    resp = auth_client.post(reverse("ttt_planner:optimize", args=[plan.pk]))
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert float(plan.target_speed_kph) > 10
+    durations = sorted(plan.riders.values_list("pull_duration_s", flat=True))
+    assert durations[0] != durations[1]  # no longer equal
+
+
+@pytest.mark.django_db
+def test_compute_plan_basic(team_member):
+    """compute_plan produces per-rider pull power and a team average."""
+    route = make_route(name="Test Flat", distance_km=20, elevation_m=0)
+    plan = TttPlan.objects.create(created_by=team_member, route=route, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=70, height_cm=175, ftp_w=300)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=80, height_cm=185, ftp_w=320)
+
+    result = compute_plan(plan)
+    assert len(result.riders) == 2
+    assert all(rr.pull_power_w > 0 for rr in result.riders)
+    assert result.avg_team_power_w > 0
+    assert result.estimated_time_s > 0
+
+
+@pytest.mark.django_db
+def test_compute_plan_zero_pull_excluded_from_pull(team_member):
+    """A zero-pull rider shows zero pull power but still gets an avg power."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=70, height_cm=175, ftp_w=300)
+    rider = PlanRider.objects.create(
+        plan=plan, order=1, name="Recovery", weight_kg=80, height_cm=185, ftp_w=250, zero_pull=True
+    )
+
+    result = compute_plan(plan)
+    zero = next(rr for rr in result.riders if rr.rider.pk == rider.pk)
+    assert zero.pull_power_w == 0
+    assert zero.avg_power_w > 0
+
+
+@pytest.mark.django_db
+def test_compute_plan_missing_data_flagged(team_member):
+    """A rider without weight/height is flagged and still computed via defaults."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="Guest")
+    result = compute_plan(plan)
+    assert result.riders[0].missing_data is True
+    assert result.riders[0].pull_power_w > 0
+
+
+# --------------------------------------------------------------------------- #
+# Rider data, from the rider profile cache
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def on_team(user_model):
+    """Put zwids on the team, as members here with that Zwift id.
+
+    Returns:
+        A function taking zwids.
+
+    """
+
+    def _on_team(*zwids):
+        for zwid in zwids:
+            user_model.objects.create(username=f"member-{zwid}", zwid=zwid)
+
+    return _on_team
+
+
+@pytest.mark.django_db
+def test_a_rider_is_read_from_their_profile(rider_profile_factory, on_team):
+    on_team(123)
+    rider_profile_factory(
+        zwid=123,
+        name="Profile Rider",
+        weight_kg=72.46,
+        height_cm=181.4,
+        category_open="B",
+        power={"ftp": 290, "zftp": 305, "cp": 312.4, "awc": 21480.6},
+    )
+
+    data = get_rider_data([123])[123]
+
+    assert (data.name, data.weight_kg, data.height_cm, data.category) == ("Profile Rider", 72.5, 181, "B")
+    assert data.ftp_w == 305  # zFTP, as on the team roster, over the sparser in-game FTP
+    assert (data.cp_w, data.w_prime_j) == (312, 21481)  # Zwift Racing's CP and W′
+
+
+@pytest.mark.django_db
+def test_the_in_game_ftp_stands_in_only_without_a_zftp(rider_profile_factory, on_team):
+    on_team(124)
+    rider_profile_factory(zwid=124, power={"ftp": 280, "zftp": None})
+
+    assert get_rider_data([124])[124].ftp_w == 280
+
+
+@pytest.mark.django_db
+def test_a_zero_cp_or_w_prime_is_unknown(rider_profile_factory, on_team):
+    on_team(125)
+    rider_profile_factory(zwid=125, power={"cp": 0, "awc": 0})
+
+    data = get_rider_data([125])[125]
+
+    assert (data.cp_w, data.w_prime_j) == (None, None)
+
+
+@pytest.mark.django_db
+def test_only_the_teams_riders_are_found_and_read(rider_profile_factory, on_team):
+    """The cache also keeps riders who have left, and other teams' riders, until it is purged."""
+    on_team(201)
+    rider_profile_factory(zwid=201, name="Rider Tess")
+    rider_profile_factory(zwid=202, name="Rider Elsewhere")
+
+    assert set(get_rider_data([201, 202])) == {201}
+    assert [r.zwid for r in search_riders("Rider")] == [201]
+    assert [r.zwid for r in search_riders("201")] == [201]  # an exact zwid finds them too
+    assert search_riders("Rider", exclude_zwids={201}) == []  # already on the plan
+
+
+# --------------------------------------------------------------------------- #
+# Sharing / permissions
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.django_db
+def test_owner_can_edit_shared_view_readonly(auth_client, team_member, app_admin):
+    """Owner sees edit controls; another team member sharing the link sees read-only."""
+    plan = TttPlan.objects.create(created_by=team_member, name="Mine")
+    url = reverse("ttt_planner:detail", args=[plan.pk])
+
+    owner_resp = auth_client.get(url)
+    assert owner_resp.status_code == 200
+    assert owner_resp.context["can_edit"] is True
+
+    auth_client.force_login(app_admin)
+    other_resp = auth_client.get(url)
+    assert other_resp.status_code == 200
+    assert other_resp.context["can_edit"] is False
+
+
+@pytest.mark.django_db
+def test_a_non_owner_can_add_riders_and_is_named_last_editor(auth_client, team_member, app_admin):
+    """Any team member may change someone else's plan once they confirm in the page; the plan says who."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    auth_client.force_login(app_admin)
+    resp = auth_client.post(reverse("ttt_planner:rider_add_manual", args=[plan.pk]), {"name": "Guest"})
+    plan.refresh_from_db()
+    assert resp.status_code == 200
+    assert plan.riders.count() == 1
+    assert plan.updated_by == app_admin
+
+
+@pytest.mark.django_db
+def test_add_manual_rider_flow(auth_client, team_member):
+    """Posting the manual-add form creates a rider and returns the plan body."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(
+        reverse("ttt_planner:rider_add_manual", args=[plan.pk]),
+        {"name": "Guest", "weight_kg": "70", "height_cm": "178", "ftp_w": "280"},
+    )
+    assert resp.status_code == 200
+    rider = plan.riders.get()
+    assert rider.name == "Guest"
+    assert rider.ftp_w == 280
+
+
+@pytest.mark.django_db
+def test_plan_update_changes_speed_and_route(auth_client, team_member):
+    """Posting plan settings updates the speed and route and recomputes."""
+    route = make_route(name="Update Route", distance_km=15, elevation_m=0)
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    resp = auth_client.post(
+        reverse("ttt_planner:update", args=[plan.pk]),
+        {"name": "Renamed", "team_name": "", "target_speed_kph": "44.5", "route": str(route.pk)},
+    )
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.name == "Renamed"
+    assert float(plan.target_speed_kph) == pytest.approx(44.5)
+    assert plan.route_id == route.pk
+    # The recomputed body reflects the chosen route (finish-time block shows it).
+    assert b"Update Route" in resp.content
+
+
+@pytest.mark.django_db
+def test_optimize_keeping_pulls_sets_sustainable_speed_and_if(auth_client, team_member):
+    """Optimize with the pulls kept stores the posted IF and a positive sustainable target speed."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=10)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=78, height_cm=182, ftp_w=300)
+    resp = auth_client.post(
+        reverse("ttt_planner:optimize", args=[plan.pk]),
+        {"speed_goal": "fastest", "pull_rule": "keep", "target_if": "0.9"},
+    )
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.target_if == pytest.approx(0.9)
+    assert float(plan.target_speed_kph) > 10
+
+
+@pytest.mark.django_db
+def test_rider_search_renders(auth_client, team_member, rider_profile_factory, on_team):
+    """The search endpoint finds a team rider and renders the dropdown partial."""
+    on_team(789)
+    rider_profile_factory(zwid=789, name="Searchable Sam", weight_kg=70, ftp=280)
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.get(reverse("ttt_planner:rider_search", args=[plan.pk]), {"q": "Searchable"})
+    assert resp.status_code == 200
+    assert b"Searchable Sam" in resp.content
+
+
+@pytest.mark.django_db
+def test_riders_remove_selected(auth_client, team_member):
+    """Bulk remove deletes only the checked riders."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    a = PlanRider.objects.create(plan=plan, order=0, name="A")
+    b = PlanRider.objects.create(plan=plan, order=1, name="B")
+    c = PlanRider.objects.create(plan=plan, order=2, name="C")
+    resp = auth_client.post(
+        reverse("ttt_planner:riders_remove_selected", args=[plan.pk]),
+        {"rider_ids": [str(a.pk), str(c.pk)]},
+    )
+    assert resp.status_code == 200
+    assert set(plan.riders.values_list("pk", flat=True)) == {b.pk}
+
+
+@pytest.mark.django_db
+def test_riders_remove_selected_by_a_non_owner(auth_client, team_member, app_admin):
+    """A non-owner may bulk-remove riders from someone else's plan, and is named its last editor."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    rider = PlanRider.objects.create(plan=plan, order=0, name="A")
+    auth_client.force_login(app_admin)
+    resp = auth_client.post(
+        reverse("ttt_planner:riders_remove_selected", args=[plan.pk]),
+        {"rider_ids": [str(rider.pk)]},
+    )
+    plan.refresh_from_db()
+    assert resp.status_code == 200
+    assert plan.riders.count() == 0
+    assert plan.updated_by == app_admin
+
+
+@pytest.mark.django_db
+def test_owner_can_delete_plan(auth_client, team_member):
+    """The owner can delete their plan and is redirected to the list."""
+    plan = TttPlan.objects.create(created_by=team_member, name="Doomed")
+    resp = auth_client.post(reverse("ttt_planner:delete", args=[plan.pk]))
+    assert resp.status_code == 302
+    assert not TttPlan.objects.filter(pk=plan.pk).exists()
+
+
+@pytest.mark.django_db
+def test_non_owner_cannot_delete_plan(auth_client, team_member, app_admin):
+    """A non-owner cannot delete another captain's plan."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    auth_client.force_login(app_admin)
+    resp = auth_client.post(reverse("ttt_planner:delete", args=[plan.pk]))
+    assert resp.status_code == 403
+    assert TttPlan.objects.filter(pk=plan.pk).exists()
+
+
+@pytest.mark.django_db
+def test_rider_reorder_swaps_order(auth_client, team_member):
+    """Moving a rider up swaps its order with the neighbour."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    a = PlanRider.objects.create(plan=plan, order=0, name="A")
+    b = PlanRider.objects.create(plan=plan, order=1, name="B")
+    resp = auth_client.post(reverse("ttt_planner:rider_reorder", args=[plan.pk, b.pk, "up"]))
+    assert resp.status_code == 200
+    a.refresh_from_db()
+    b.refresh_from_db()
+    assert b.order < a.order
+
+
+# --------------------------------------------------------------------------- #
+# Per-plan draft savings
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_draft_savings_json_and_csv():
+    """Both JSON arrays and comma-separated lists parse to the same tuple."""
+    assert physics.parse_draft_savings("[0.0, 0.2, 0.3]") == (0.0, 0.2, 0.3)
+    assert physics.parse_draft_savings("0, 0.2, 0.3") == (0.0, 0.2, 0.3)
+
+
+def test_parse_draft_savings_percent_and_leading_zero():
+    """Percentages are converted to fractions and a leading front 0 is prepended."""
+    # Values > 1 are treated as percentages.
+    assert physics.parse_draft_savings("0, 23, 30") == pytest.approx((0.0, 0.23, 0.30))
+    # First value non-zero -> a front 0.0 is prepended.
+    assert physics.parse_draft_savings("23, 30") == pytest.approx((0.0, 0.23, 0.30))
+
+
+def test_parse_draft_savings_empty_and_bad():
+    """Empty / unparseable input returns None (caller falls back to default)."""
+    assert physics.parse_draft_savings("") is None
+    assert physics.parse_draft_savings(None) is None
+    assert physics.parse_draft_savings("not numbers") is None
+    assert physics.parse_draft_savings([]) is None
+
+
+def test_parse_draft_savings_accepts_list():
+    """A stored JSON list (fractions) round-trips through the parser."""
+    assert physics.parse_draft_savings([0.0, 0.23, 0.30]) == pytest.approx((0.0, 0.23, 0.30))
+    # Percentages in a list are converted, and a leading front 0 is prepended.
+    assert physics.parse_draft_savings([23, 30]) == pytest.approx((0.0, 0.23, 0.30))
+
+
+@pytest.mark.django_db
+def test_plan_draft_savings_overrides_default(team_member):
+    """A per-plan draft list changes the computed draft table and avg power."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=78, height_cm=182, ftp_w=300)
+
+    baseline = compute_plan(plan)
+
+    plan.draft_savings = [0.0, 0.5]  # much bigger draft than the default
+    plan.save(update_fields=["draft_savings"])
+    boosted = compute_plan(plan)
+
+    # Position-2 saving in the table reflects the override.
+    assert boosted.draft_table[1].saving_pct == pytest.approx(50.0)
+    # More draft -> lower average team power than the default.
+    assert boosted.avg_team_power_w < baseline.avg_team_power_w
+
+
+@pytest.mark.django_db
+def test_rider_cda_computed_and_default_coef(team_member):
+    """Each rider gets a CdA, body and TT bike, and the plan reports the default coef."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=75, height_cm=180, ftp_w=300)
+    result = compute_plan(plan)
+    assert result.cda_coef == pytest.approx(physics.DEFAULT_PARAMS.cda_coef)
+    body = physics.estimate_cda(180, 75)
+    assert result.riders[0].cda == pytest.approx(body + physics.TT_BIKE_CDA_M2, abs=0.001)
+
+
+@pytest.mark.django_db
+def test_plan_cda_coef_overrides_default(team_member):
+    """A bigger per-plan CdA coef raises each rider's CdA and required pull power."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=75, height_cm=180, ftp_w=300)
+
+    baseline = compute_plan(plan)
+
+    plan.cda_coef = physics.DEFAULT_PARAMS.cda_coef * 1.2
+    plan.save(update_fields=["cda_coef"])
+    bigger = compute_plan(plan)
+
+    assert bigger.cda_coef == pytest.approx(physics.DEFAULT_PARAMS.cda_coef * 1.2)
+    assert bigger.riders[0].cda > baseline.riders[0].cda
+    assert bigger.riders[0].pull_power_w > baseline.riders[0].pull_power_w
+
+
+@pytest.mark.django_db
+def test_plan_update_stores_and_clears_cda_coef(auth_client, team_member):
+    """Posting a CdA coef stores it; clearing it falls back to the global default."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(reverse("ttt_planner:update", args=[plan.pk]), {"cda_coef": "0.035"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.cda_coef == pytest.approx(0.035)
+
+    resp = auth_client.post(reverse("ttt_planner:update", args=[plan.pk]), {"cda_coef": ""})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.cda_coef is None
+
+
+@pytest.mark.django_db
+def test_draft_table_present(team_member):
+    """compute_plan always returns a draft table and a pre-fill string."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    result = compute_plan(plan)
+    assert result.draft_table
+    assert result.draft_table[0].position == 1
+    assert result.draft_table[0].saving_pct == pytest.approx(0.0)
+    assert isinstance(result.draft_savings_input, str)
+
+
+@pytest.mark.django_db
+def test_draft_savings_table_update_stores_fraction_list(auth_client, team_member):
+    """Editing the position table (percentages for pos 2..N) stores a fraction list."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(
+        reverse("ttt_planner:draft_savings_update", args=[plan.pk]),
+        {"saving": ["25", "35"]},
+    )
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.draft_savings == pytest.approx([0.0, 0.25, 0.35])
+
+
+@pytest.mark.django_db
+def test_draft_savings_table_clamps_and_fronts_zero(auth_client, team_member):
+    """Out-of-range percentages clamp to 95% and the front stays 0."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(
+        reverse("ttt_planner:draft_savings_update", args=[plan.pk]),
+        {"saving": ["200", "30"]},
+    )
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.draft_savings == pytest.approx([0.0, 0.95, 0.30])
+
+
+@pytest.mark.django_db
+def test_draft_savings_reset_uses_default(auth_client, team_member):
+    """Reset clears the per-plan list back to an empty list (global default)."""
+    plan = TttPlan.objects.create(created_by=team_member, draft_savings=[0.0, 0.4])
+    resp = auth_client.post(reverse("ttt_planner:draft_savings_update", args=[plan.pk]), {"reset": "1"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.draft_savings == []
+
+
+@pytest.mark.django_db
+def test_draft_savings_table_by_a_non_owner(auth_client, team_member, app_admin):
+    """A non-owner may edit another captain's draft savings, and is named the plan's last editor."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    auth_client.force_login(app_admin)
+    resp = auth_client.post(
+        reverse("ttt_planner:draft_savings_update", args=[plan.pk]),
+        {"saving": ["25"]},
+    )
+    plan.refresh_from_db()
+    assert resp.status_code == 200
+    assert plan.draft_savings == pytest.approx([0.0, 0.25])
+    assert plan.updated_by == app_admin
+
+
+@pytest.mark.django_db
+def test_create_plan_stores_name_team_and_event(auth_client, team_member):
+    """The create form stores name, team, and event; draft savings stays default (empty)."""
+    resp = auth_client.post(
+        reverse("ttt_planner:create"),
+        {"name": "Created Plan", "team_name": "Coalition", "event_type": "zrl"},
+    )
+    assert resp.status_code == 302
+    plan = TttPlan.objects.get(name="Created Plan")
+    assert plan.team_name == "Coalition"
+    assert plan.event_type == "zrl"
+    assert plan.draft_savings == []
+
+
+@pytest.mark.django_db
+def test_create_plan_rejects_bad_event(auth_client, team_member):
+    """An invalid event_type on create is stored as blank."""
+    resp = auth_client.post(reverse("ttt_planner:create"), {"name": "P", "event_type": "bogus"})
+    assert resp.status_code == 302
+    assert TttPlan.objects.get(name="P").event_type == ""
+
+
+@pytest.mark.django_db
+def test_plan_update_stores_event_type(auth_client, team_member):
+    """Posting a valid event_type stores it; an invalid value clears it."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(reverse("ttt_planner:update", args=[plan.pk]), {"event_type": "wtrl_ttt"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.event_type == "wtrl_ttt"
+
+    resp = auth_client.post(reverse("ttt_planner:update", args=[plan.pk]), {"event_type": "bogus"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.event_type == ""
+
+
+@pytest.mark.django_db
+def test_plan_list_shows_event_riders_team_and_time(auth_client, team_member):
+    """The plan list shows team name, event, rider count, and an estimated time."""
+    route = make_route(name="List Route", distance_km=20, elevation_m=0)
+    plan = TttPlan.objects.create(
+        created_by=team_member,
+        name="My Plan",
+        team_name="Coalition A",
+        event_type=TttPlan.EventType.WTRL_TTT,
+        route=route,
+        target_speed_kph=42,
+    )
+    PlanRider.objects.create(plan=plan, order=0, name="A", weight_kg=72, height_cm=178, ftp_w=300)
+    PlanRider.objects.create(plan=plan, order=1, name="B", weight_kg=78, height_cm=182, ftp_w=300)
+
+    resp = auth_client.get(reverse("ttt_planner:list"))
+    assert resp.status_code == 200
+    rows = resp.context["plan_rows"]
+    assert rows[0]["rider_count"] == 2
+    assert rows[0]["finish_s"] > 0
+    content = resp.content
+    assert b"Coalition A" in content
+    assert b"WTRL TTT" in content
+
+
+# --------------------------------------------------------------------------- #
+# zwiftgopher integration
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.django_db
+def test_build_optimize_request(team_member):
+    """Request body sends zwid riders as IDs+overrides and complete manual riders as custom_riders."""
+    plan = TttPlan.objects.create(created_by=team_member, team_name="Squad", target_speed_kph=42)
+    PlanRider.objects.create(plan=plan, order=0, name="A", zwid=111, ftp_w=300, weight_kg=72, height_cm=178)
+    PlanRider.objects.create(plan=plan, order=1, name="Guest", ftp_w=250, weight_kg=70, height_cm=175)
+    PlanRider.objects.create(plan=plan, order=2, name="NoData")  # incomplete manual -> skipped
+
+    payload = zwiftgopher.build_optimize_request(plan, "next_wtrl")
+    assert payload["riders"] == [111]
+    assert payload["rider_overrides"]["111"]["ftp"] == 300
+    assert payload["rider_overrides"]["111"]["weight"] == pytest.approx(72.0)
+    assert {"name": "Guest", "ftp": 250, "weight": 70.0, "height": 175} in payload["custom_riders"]
+    assert all(c["name"] != "NoData" for c in payload["custom_riders"])
+    assert payload["route"] == "next_wtrl"
+    assert payload["target_speed"] == pytest.approx(42.0)
+    assert payload["request_id"] == str(plan.pk)
+
+
+@pytest.mark.django_db
+def test_build_optimize_request_invalid_schedule_defaults(team_member):
+    """An unknown route schedule falls back to the default."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    payload = zwiftgopher.build_optimize_request(plan, "bogus")
+    assert payload["route"] == zwiftgopher.DEFAULT_ROUTE_SCHEDULE
+
+
+@pytest.mark.django_db
+def test_count_optimizable_riders(team_member):
+    """Counts zwid riders and complete manual riders, skipping incomplete manuals."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    PlanRider.objects.create(plan=plan, order=0, name="A", zwid=111)
+    PlanRider.objects.create(plan=plan, order=1, name="Guest", ftp_w=250, weight_kg=70, height_cm=175)
+    PlanRider.objects.create(plan=plan, order=2, name="NoData")
+    assert zwiftgopher.count_optimizable_riders(plan) == 2
+
+
+def test_parse_optimize_response_success():
+    """A successful response normalizes fields and sorts riders by pull order."""
+    data = {
+        "success": True,
+        "data": {
+            "route": "Canopies and Coastlines",
+            "estimated_time_seconds": 1947,
+            "estimated_time_formatted": "32:27",
+            "estimated_avg_speed": 43.2,
+            "team_avg_power": 285,
+            "team_avg_if": 93,
+            "riders": [
+                {"name": "Second", "order": 2, "pull_power": 250, "if_percent": 95},
+                {"name": "First", "order": 1, "pull_power": 240, "if_percent": 92},
+            ],
+        },
+    }
+    result = zwiftgopher.parse_optimize_response(200, data)
+    assert result["ok"] is True
+    assert result["estimated_time_seconds"] == 1947
+    assert result["estimated_time_formatted"] == "32:27"
+    assert result["team_avg_if"] == 93
+    assert result["route"] == "Canopies and Coastlines"
+    # Riders come back sorted by their suggested pull order.
+    assert [r["name"] for r in result["riders"]] == ["First", "Second"]
+    assert result["riders"][0]["pull_power"] == 240
+
+
+def test_parse_optimize_response_rate_limited():
+    """A 429 is reported as a rate-limit error."""
+    result = zwiftgopher.parse_optimize_response(429, {})
+    assert result["ok"] is False
+    assert "rate limited" in result["error"].lower()
+
+
+def test_parse_optimize_response_errors():
+    """Error and transport-failure shapes surface a message."""
+    result = zwiftgopher.parse_optimize_response(400, {"success": False, "message": "At least 2 riders are required"})
+    assert result["ok"] is False
+    assert "2 riders" in result["error"]
+    transport = zwiftgopher.parse_optimize_response(0, {"error": "boom"})
+    assert transport["ok"] is False
+    assert transport["error"] == "boom"
+
+
+@pytest.mark.django_db
+def test_zwiftgopher_run_enqueues(auth_client, team_member, monkeypatch):
+    """Run sets status to pending and enqueues the task with the chosen schedule."""
+
+    class _FakeTask:
+        def __init__(self):
+            self.calls = []
+
+        def enqueue(self, *args):
+            self.calls.append(args)
+
+    fake = _FakeTask()
+    monkeypatch.setattr("apps.ttt_planner.views.run_zwiftgopher_optimize", fake)
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.post(reverse("ttt_planner:zwiftgopher_run", args=[plan.pk]), {"route_schedule": "next_zrl"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.zwiftgopher_status == TttPlan.GopherStatus.PENDING
+    assert fake.calls == [(str(plan.pk), "next_zrl")]
+
+
+@pytest.mark.django_db
+def test_zwiftgopher_run_by_a_non_owner(auth_client, team_member, app_admin, monkeypatch):
+    """A non-owner may start a run on someone else's plan, and is named its last editor."""
+    calls = []
+    monkeypatch.setattr(
+        "apps.ttt_planner.views.run_zwiftgopher_optimize", SimpleNamespace(enqueue=lambda *args: calls.append(args))
+    )
+    plan = TttPlan.objects.create(created_by=team_member)
+    auth_client.force_login(app_admin)
+    resp = auth_client.post(reverse("ttt_planner:zwiftgopher_run", args=[plan.pk]))
+    plan.refresh_from_db()
+    assert resp.status_code == 200
+    assert plan.zwiftgopher_status == TttPlan.GopherStatus.PENDING
+    assert len(calls) == 1
+    assert plan.updated_by == app_admin
+
+
+@pytest.mark.django_db
+def test_run_task_stores_result(team_member, monkeypatch):
+    """The task calls the client, stores the parsed result, and marks done."""
+    monkeypatch.setattr("apps.ttt_planner.tasks.time.sleep", lambda *a: None)
+    monkeypatch.setattr("apps.ttt_planner.tasks.zwiftgopher_client.is_configured", lambda: True)
+    monkeypatch.setattr(
+        "apps.ttt_planner.tasks.zwiftgopher_client.optimize",
+        lambda payload: (
+            200,
+            {
+                "success": True,
+                "data": {
+                    "route": "Canopies",
+                    "estimated_time_seconds": 1947,
+                    "estimated_avg_speed": 43.2,
+                    "team_avg_power": 285,
+                    "riders": [{"name": "Dave", "power_300_watts": 295, "speed_index": 68}],
+                },
+            },
+        ),
+    )
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", zwid=111, ftp_w=300, weight_kg=72, height_cm=178)
+    PlanRider.objects.create(plan=plan, order=1, name="B", zwid=222, ftp_w=310, weight_kg=78, height_cm=182)
+
+    run_zwiftgopher_optimize.func(str(plan.pk), "next_wtrl")
+
+    plan.refresh_from_db()
+    assert plan.zwiftgopher_status == TttPlan.GopherStatus.DONE
+    assert plan.zwiftgopher_result["estimated_time_seconds"] == 1947
+    assert plan.zwiftgopher_fetched_at is not None
+    # Raw request + response are stored for the in-panel viewers.
+    assert plan.zwiftgopher_request["request_id"] == str(plan.pk)
+    assert sorted(plan.zwiftgopher_request["riders"]) == [111, 222]
+    assert plan.zwiftgopher_raw_response["success"] is True
+
+
+@pytest.mark.django_db
+def test_run_task_too_few_riders(team_member, monkeypatch):
+    """The task errors out when fewer than 2 optimizable riders are present."""
+    monkeypatch.setattr("apps.ttt_planner.tasks.zwiftgopher_client.is_configured", lambda: True)
+    plan = TttPlan.objects.create(created_by=team_member)
+    PlanRider.objects.create(plan=plan, order=0, name="A", zwid=111, ftp_w=300, weight_kg=72, height_cm=178)
+
+    run_zwiftgopher_optimize.func(str(plan.pk))
+
+    plan.refresh_from_db()
+    assert plan.zwiftgopher_status == TttPlan.GopherStatus.ERROR
+    assert "at least" in plan.zwiftgopher_error.lower()
+
+
+@pytest.mark.django_db
+def test_run_task_not_configured(team_member, monkeypatch):
+    """The task errors when no API key is configured."""
+    monkeypatch.setattr("apps.ttt_planner.tasks.zwiftgopher_client.is_configured", lambda: False)
+    plan = TttPlan.objects.create(created_by=team_member)
+    run_zwiftgopher_optimize.func(str(plan.pk))
+    plan.refresh_from_db()
+    assert plan.zwiftgopher_status == TttPlan.GopherStatus.ERROR
+
+
+@pytest.mark.django_db
+def test_gopher_panel_renders(auth_client, team_member):
+    """The panel endpoint renders for a plan."""
+    plan = TttPlan.objects.create(created_by=team_member)
+    resp = auth_client.get(reverse("ttt_planner:zwiftgopher_panel", args=[plan.pk]))
+    assert resp.status_code == 200
+    assert b"zwiftgopher" in resp.content
+
+
+@pytest.mark.django_db
+def test_gopher_panel_shows_request_response_viewers(auth_client, team_member):
+    """When raw request/response are stored, the panel shows the JSON viewers."""
+    plan = TttPlan.objects.create(
+        created_by=team_member,
+        zwiftgopher_status=TttPlan.GopherStatus.DONE,
+        zwiftgopher_request={"request_id": "abc", "riders": [111, 222]},
+        zwiftgopher_raw_response={"success": True, "data": {"route": "Probe Route"}},
+    )
+    resp = auth_client.get(reverse("ttt_planner:zwiftgopher_panel", args=[plan.pk]))
+    assert resp.status_code == 200
+    assert b"View API request" in resp.content
+    assert b"View API response" in resp.content
+    assert b"Probe Route" in resp.content
+
+
+def test_pretty_json_filter():
+    """The pretty_json filter indents dicts and handles None."""
+    from apps.ttt_planner.templatetags.ttt_extras import pretty_json
+
+    assert pretty_json(None) == ""
+    out = pretty_json({"a": 1})
+    assert '"a": 1' in out
+
+
+# ----- route terrain / course selector -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("distance_km", "elevation_m", "expected"),
+    [
+        (28.21, 132, "flat"),  # ~4.7 m/km
+        (20.0, 200, "rolling"),  # 10 m/km
+        (10.0, 200, "hilly"),  # 20 m/km
+        (8.05, 236, "mountainous"),  # ~29 m/km
+        (0, 100, "rolling"),  # unknown distance -> default
+    ],
+)
+def test_derive_terrain(distance_km, elevation_m, expected):
+    """derive_terrain classifies routes by climbing density."""
+    from apps.ttt_planner import terrain
+
+    assert terrain.derive_terrain(distance_km, elevation_m) == expected
+
+
+@pytest.mark.django_db
+def test_route_options_includes_terrain():
+    """route_options exposes a derived terrain type per active route."""
+    from apps.ttt_planner import terrain
+
+    make_route(name="Flatland", distance_km=30, elevation_m=120)
+    make_route(name="Climby", distance_km=10, elevation_m=300)
+    by_name = {o["name"]: o for o in terrain.route_options()}
+    assert by_name["Flatland"]["terrain"] == "flat"
+    assert by_name["Climby"]["terrain"] == "mountainous"
+
+
+@pytest.mark.django_db
+def test_plan_update_sets_course_name_and_type(auth_client, team_member):
+    """The plan update endpoint persists the course name and type."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    route = make_route(name="Bon Voyage", distance_km=28.21, elevation_m=132)
+    resp = auth_client.post(
+        reverse("ttt_planner:update", args=[plan.pk]),
+        {"route": route.pk, "course_name": "Bon Voyage", "course_type": "flat"},
+    )
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.route_id == route.pk
+    assert plan.course_name == "Bon Voyage"
+    assert plan.course_type == "flat"
+
+
+@pytest.mark.django_db
+def test_plan_update_rejects_invalid_course_type(auth_client, team_member):
+    """An invalid course type is coerced to empty rather than stored."""
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    resp = auth_client.post(reverse("ttt_planner:update", args=[plan.pk]), {"course_type": "bogus"})
+    assert resp.status_code == 200
+    plan.refresh_from_db()
+    assert plan.course_type == ""
+
+
+@pytest.mark.django_db
+def test_route_list_page_renders(auth_client):
+    """The routes reference page lists canonical Zwift routes."""
+    from apps.zwift_data.models import ZwiftRoute
+
+    ZwiftRoute.objects.create(
+        name="Climby Loop", world="Watopia", world_id=1, name_hash="123", distance_km=10, ascent_m=300
+    )
+    resp = auth_client.get(reverse("routes:list"))
+    assert resp.status_code == 200
+    assert b"Climby Loop" in resp.content
+    # Columns are sortable.
+    assert b"sortRoutes" in resp.content
+    assert b"data-sort=" in resp.content
+
+
+@pytest.mark.django_db
+def test_route_detail_renders(auth_client):
+    """The canonical route detail page renders and wires up the Speed Lab charts."""
+    from apps.zwift_data.models import ZwiftRoute
+
+    ZwiftRoute.objects.create(
+        name="Test Route", world="Watopia", world_id=1, name_hash="777", distance_km=20, ascent_m=100
+    )
+    resp = auth_client.get(reverse("routes:detail", args=["777"]))
+    assert resp.status_code == 200
+    assert b"Elevation profile" in resp.content
+    assert b"zsl-route" in resp.content
+
+
+@pytest.mark.django_db
+def test_route_detail_surfaces_velo_bars(auth_client):
+    """A canonical route shows its vELO2 bars from the imported factor weights."""
+    from apps.zwift_data.models import ZwiftRoute
+
+    ZwiftRoute.objects.create(
+        name="Bon Voyage",
+        world="France",
+        world_id=10,
+        name_hash="555",
+        distance_km=28,
+        ascent_m=132,
+        velo_sprint=38.13,
+        velo_punch=21.87,
+        velo_climb=0,
+        velo_endurance=40.0,
+        velo_pursuit=0,
+    )
+    body = auth_client.get(reverse("routes:detail", args=["555"])).content.decode()
+    assert "vELO2 Event Factor Weights" in body
+    assert "Endurance" in body
+
+
+@pytest.mark.django_db
+def test_route_detail_hides_velo_card_without_weights(auth_client):
+    """A canonical route with no vELO2 weights shows no vELO2 card."""
+    from apps.zwift_data.models import ZwiftRoute
+
+    ZwiftRoute.objects.create(
+        name="Orphan Route", world="Watopia", world_id=1, name_hash="556", distance_km=10, ascent_m=20
+    )
+    body = auth_client.get(reverse("routes:detail", args=["556"])).content.decode()
+    assert "vELO2 Event Factor Weights" not in body
+
+
+@pytest.mark.django_db
+def test_velo_factor_bars_sorted_nonzero():
+    """velo_factor_bars drops zero factors and sorts high→low with colour + icon."""
+    route = make_route(
+        name="Weighted",
+        distance_km=2,
+        elevation_m=17,
+        velo_sprint=38.13,
+        velo_punch=21.87,
+        velo_climb=0,
+        velo_endurance=40.00,
+        velo_pursuit=0,
+    )
+    bars = route.velo_factor_bars()
+    assert [b["label"] for b in bars] == ["Endurance", "Sprint", "Punch"]
+    assert all(b["value"] > 0 and b["color"] and b["icon"] for b in bars)
+    assert make_route(name="Bare", distance_km=5, elevation_m=10).velo_factor_bars() == []
+
+
+# --------------------------------------------------------------------------- #
+# Squad picker
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.django_db
+def test_plan_squad_add_adds_members(auth_client, team_member, user_model, rider_profile_factory):
+    """Adding a squad snapshots each member's profile where there is one, else name-only; skips no-zwid."""
+    from datetime import date, timedelta
+
+    from apps.events.models import Event, Squad, SquadMember
+
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    today = date.today()
+    event = Event.objects.create(title="ZRL", start_date=today, end_date=today + timedelta(days=7), visible=True)
+    squad = Squad.objects.create(event=event, name="Alpha")
+
+    synced = user_model.objects.create(username="synced", zwid=7001, first_name="Syn")
+    rider_profile_factory(zwid=7001, name="Synced Rider", weight_kg=72, ftp=300)
+    unsynced = user_model.objects.create(username="unsynced", zwid=7002, first_name="Uns")
+    no_zwid = user_model.objects.create(username="nozwid")
+    for u in (synced, unsynced, no_zwid):
+        SquadMember.objects.create(squad=squad, user=u, status=SquadMember.Status.MEMBER)
+
+    resp = auth_client.post(reverse("ttt_planner:plan_squad_add", args=[plan.pk]), {"squad": squad.pk})
+    assert resp.status_code == 200
+    riders = plan.riders.all()
+    assert set(riders.values_list("zwid", flat=True)) == {7001, 7002}  # no_zwid skipped
+    synced_rider = riders.get(zwid=7001)
+    assert float(synced_rider.weight_kg) == pytest.approx(72)
+    assert synced_rider.ftp_w == 300
+    unsynced_rider = riders.get(zwid=7002)
+    assert unsynced_rider.weight_kg is None
+    assert unsynced_rider.name  # name-only fallback present
+
+
+@pytest.mark.django_db
+def test_plan_squad_add_dedupes(auth_client, team_member, user_model):
+    """Adding the same squad twice doesn't duplicate riders."""
+    from datetime import date, timedelta
+
+    from apps.events.models import Event, Squad, SquadMember
+
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    today = date.today()
+    event = Event.objects.create(title="ZRL", start_date=today, end_date=today + timedelta(days=7), visible=True)
+    squad = Squad.objects.create(event=event, name="Alpha")
+    u = user_model.objects.create(username="dup", zwid=7100)
+    SquadMember.objects.create(squad=squad, user=u, status=SquadMember.Status.MEMBER)
+
+    auth_client.post(reverse("ttt_planner:plan_squad_add", args=[plan.pk]), {"squad": squad.pk})
+    auth_client.post(reverse("ttt_planner:plan_squad_add", args=[plan.pk]), {"squad": squad.pk})
+    assert plan.riders.filter(zwid=7100).count() == 1
+
+
+# ----- climb compare (per-rider climb strength) --------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_climb_strength_per_rider_gaps(team_member, rider_profile_factory):
+    from apps.ttt_planner.services.compute import TTT_CLIMB_LENGTHS_M, climb_strength
+
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    # Zwift Racing's power curve, as the rider profile carries it: watts by duration in seconds.
+    strong_w = {"5": 1100, "15": 880, "30": 770, "60": 560, "120": 500, "300": 420, "1200": 360}
+    weak_w = {k: int(v * 0.75) for k, v in strong_w.items()}
+    rider_profile_factory(zwid=101, name="Strong", weight_kg=66, height_cm=178, power={"curve_w": strong_w})
+    rider_profile_factory(zwid=102, name="Weak", weight_kg=80, height_cm=178, power={"curve_w": weak_w})
+    PlanRider.objects.create(plan=plan, order=0, name="Strong", zwid=101, weight_kg=66, height_cm=178, ftp_w=320)
+    PlanRider.objects.create(plan=plan, order=1, name="Weak", zwid=102, weight_kg=80, height_cm=178, ftp_w=240)
+
+    climb = climb_strength(plan)
+    assert climb["available"] is True
+    assert len(climb["lengths"]) == len(TTT_CLIMB_LENGTHS_M)
+    assert len(climb["rows"]) == 2
+    strong_row = next(r for r in climb["rows"] if r["name"] == "Strong")
+    weak_row = next(r for r in climb["rows"] if r["name"] == "Weak")
+    assert any(c["label"] == "0" for c in strong_row["cells"])  # strong+light sets the pace
+    assert any(c.get("gap_s", 0) > 0 for c in weak_row["cells"])  # weak rider trails
+
+
+@pytest.mark.django_db
+def test_climb_strength_unavailable_without_a_profile(team_member):
+    from apps.ttt_planner.services.compute import climb_strength
+
+    plan = TttPlan.objects.create(created_by=team_member, target_speed_kph=40)
+    PlanRider.objects.create(plan=plan, order=0, name="A", zwid=None, weight_kg=70, height_cm=175, ftp_w=300)
+    assert climb_strength(plan)["available"] is False
+
+
+# ----- route / segment editing (race-verified) ---------------------------------------------------
+
+
+@pytest.mark.django_db
+@pytest.mark.django_db
+def test_segment_detail_view(auth_client):
+    """The canonical segment detail page renders a Zwift segment by its id."""
+    from apps.zwift_data.models import ZwiftSegment
+
+    seg = ZwiftSegment.objects.create(
+        segment_id=1047919487,
+        name="Epic KOM",
+        segment_type="climb",
+        world="Watopia",
+        world_id=1,
+        length_m=9500,
+        avg_grade_pct=4,
+        max_grade_pct=9,
+        ascent_m=380,
+    )
+    resp = auth_client.get(reverse("routes:segment_detail", args=[seg.segment_id]))
+    assert resp.status_code == 200
+    assert "Epic KOM" in resp.content.decode()

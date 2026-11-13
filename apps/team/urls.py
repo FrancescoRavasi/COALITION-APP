@@ -1,0 +1,52 @@
+"""URL patterns for team app."""
+
+from django.urls import path
+from django.views.generic import RedirectView
+
+from apps.team import views
+
+app_name = "team"
+
+urlpatterns = [
+    # The card roster is THE roster. The table it replaced is still here, one click away:
+    # it carries the category, FTP and W/kg distribution charts, which the cards do not,
+    # and the Discord bot's filtered-channel link renders through the same template.
+    path("roster/", views.rosterv2_view, name="roster"),
+    path("roster/table/", views.team_roster_view, name="roster_table"),
+    path("roster/f/<uuid:filter_id>/", views.filtered_roster_view, name="filtered_roster"),
+    # Where the card roster lived while it was being built. Kept as a redirect rather than
+    # deleted: the link was handed round while it was under construction.
+    path("rosterv2/", RedirectView.as_view(pattern_name="team:roster", permanent=True), name="rosterv2"),
+    path("links/", views.team_links_view, name="links"),
+    path("links/submit/", views.submit_team_link_view, name="submit_link"),
+    path("links/<int:pk>/edit/", views.edit_team_link_view, name="edit_link"),
+    path("links/<int:pk>/delete/", views.delete_team_link_view, name="delete_link"),
+    path("verification/", views.verification_records_view, name="verification_records"),
+    # Body of the captain banner's modal, fetched on click.
+    path(
+        "verification/squad-expiring/",
+        views.squad_expiring_modal_view,
+        name="squad_expiring_modal",
+    ),
+    path("verification/<int:pk>/", views.verification_record_detail_view, name="verification_record_detail"),
+    path(
+        "verification/<int:pk>/media/",
+        views.verification_record_media_view,
+        name="verification_record_media",
+    ),
+    path("verification/delete-expired-media/", views.delete_expired_media_view, name="delete_expired_media"),
+    path("verification/delete-rejected-media/", views.delete_rejected_media_view, name="delete_rejected_media"),
+    path("performance-review/", views.performance_review_view, name="performance_review"),
+    path("team-feed/", views.team_feed_view, name="team_feed"),
+    # Membership
+    path("discord-review/", views.discord_review_view, name="discord_review"),
+    path("discord-review/export/", views.discord_review_export_csv, name="discord_review_export"),
+    path("zwift-connections/", views.zwift_connections_view, name="zwift_connections"),
+    path("applications/", views.membership_application_list_view, name="application_list"),
+    path("applications/<uuid:pk>/", views.membership_application_admin_view, name="application_admin"),
+    path("applications/<uuid:pk>/delete/", views.membership_application_delete_view, name="application_delete"),
+    path("applications/bulk-delete/", views.membership_application_bulk_delete_view, name="application_bulk_delete"),
+    path("apply/<uuid:pk>/", views.membership_application_public_view, name="application_public"),
+    path("apply/<uuid:pk>/unverify-zwift/", views.application_unverify_zwift, name="application_unverify_zwift"),
+    path("apply/<uuid:pk>/zauth-connect/", views.application_zauth_connect, name="application_zauth_connect"),
+]

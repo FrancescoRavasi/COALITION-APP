@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% load ttt_extras %}
+
+{% block title %}TTT Planner{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-wrap justify-between items-center gap-3 mb-6">
+        <div>
+          <h1 class="card-title text-2xl">TTT Planner</h1>
+          <p class="text-sm text-base-content/70">
+            Plan team time trial pull schedules.
+            <a href="{% url 'ttt_planner:help' %}" class="link">How the planner works</a>
+          </p>
+        </div>
+        <button type="button" class="btn btn-primary btn-sm" onclick="new_plan_modal.showModal()">New Plan</button>
+      </div>
+
+      <dialog id="new_plan_modal" class="modal" aria-labelledby="new-plan-title">
+        <div class="modal-box">
+          <h2 id="new-plan-title" class="font-bold text-lg mb-4">New TTT plan</h2>
+          <form method="post" action="{% url 'ttt_planner:create' %}" class="space-y-3">
+            {% csrf_token %}
+            <label class="form-control">
+              <span class="label-text mb-1">Plan name</span>
+              <input type="text" name="name" placeholder="e.g. WTRL Round 3"
+                     class="input input-bordered input-sm w-full" />
+            </label>
+            <label class="form-control">
+              <span class="label-text mb-1">Team name <span class="text-base-content/70">(optional)</span></span>
+              <input type="text" name="team_name" class="input input-bordered input-sm w-full" />
+            </label>
+            <label class="form-control">
+              <span class="label-text mb-1">Event</span>
+              <select name="event_type" class="select select-bordered select-sm w-full">
+                <option value="">— Unspecified —</option>
+                {% for value, label in event_types %}
+                  <option value="{{ value }}">{{ label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <div class="modal-action">
+              <button type="button" class="btn btn-ghost btn-sm" onclick="new_plan_modal.close()">Cancel</button>
+              <button type="submit" class="btn btn-primary btn-sm">Create</button>
+            </div>
+          </form>
+        </div>
+        <form method="dialog" class="modal-backdrop">
+          <button>close</button>
+        </form>
+      </dialog>
+
+      {% if plan_rows %}
+      <div class="overflow-x-auto">
+        <table class="table table-zebra">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Event</th>
+              <th>Team</th>
+              <th>Route</th>
+              <th class="text-right">Riders</th>
+              <th class="text-right">Target</th>
+              <th class="text-right">Est. time</th>
+              <th>Updated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in plan_rows %}
+            <tr class="hover">
+              <td>
+                <a href="{% url 'ttt_planner:detail' row.plan.pk %}" class="link link-primary font-medium">
+                  {{ row.plan.name|default:"Untitled plan" }}
+                </a>
+              </td>
+              <td>{{ row.plan.get_event_type_display|default:"—" }}</td>
+              <td>{{ row.plan.team_name|default:"—" }}</td>
+              <td>{{ row.plan.route.name|default:"—" }}</td>
+              <td class="text-right">{{ row.rider_count }}</td>
+              <td class="text-right">{{ row.plan.target_speed_kph }} kph</td>
+              <td class="text-right">{% if row.finish_s %}{{ row.finish_s|duration_hms }}{% else %}—{% endif %}</td>
+              <td class="text-sm text-base-content/60">{{ row.plan.updated_at|date:"M j, Y" }}</td>
+              <td class="text-right">
+                <form method="post" action="{% url 'ttt_planner:delete' row.plan.pk %}"
+                      onsubmit="return confirm('Delete &quot;{{ row.plan.name|default:'Untitled plan'|escapejs }}&quot;?');">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-ghost btn-xs text-error">Delete</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-base-content/60">You have no plans yet. Create one to get started.</p>
+      {% endif %}
+
+      {% if other_plan_rows %}
+      <div class="divider text-sm text-base-content/60 mt-8">Other team members' plans</div>
+      <div class="overflow-x-auto">
+        <table class="table table-zebra">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Created by</th>
+              <th>Event</th>
+              <th>Team</th>
+              <th>Route</th>
+              <th class="text-right">Riders</th>
+              <th class="text-right">Target</th>
+              <th class="text-right">Est. time</th>
+              <th>Updated</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in other_plan_rows %}
+            <tr class="hover">
+              <td>
+                <a href="{% url 'ttt_planner:detail' row.plan.pk %}" class="link link-primary font-medium">
+                  {{ row.plan.name|default:"Untitled plan" }}
+                </a>
+              </td>
+              <td class="text-sm">{{ row.plan.created_by.discord_nickname|default:row.plan.created_by.discord_username|default:row.plan.created_by.username }}</td>
+              <td>{{ row.plan.get_event_type_display|default:"—" }}</td>
+              <td>{{ row.plan.team_name|default:"—" }}</td>
+              <td>{{ row.plan.route.name|default:"—" }}</td>
+              <td class="text-right">{{ row.rider_count }}</td>
+              <td class="text-right">{{ row.plan.target_speed_kph }} kph</td>
+              <td class="text-right">{% if row.finish_s %}{{ row.finish_s|duration_hms }}{% else %}—{% endif %}</td>
+              <td class="text-sm text-base-content/60">{{ row.plan.updated_at|date:"M j, Y" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

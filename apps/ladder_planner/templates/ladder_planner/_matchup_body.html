@@ -1,0 +1,567 @@
+{# Tabbed comparison body for a ladder matchup. Swapped into #ladder-body on every edit. #}
+
+{% if notice %}
+  <div class="alert alert-success mb-4 py-2">{{ notice }}</div>
+{% endif %}
+{% if error %}
+  <div class="alert alert-error mb-4 py-2">{{ error }}</div>
+{% endif %}
+
+{# ---- Riders: add controls + rosters, collapsible (open when empty) ---- #}
+<details id="ladder-riders" class="card bg-base-200 shadow-xl overflow-visible group mb-6" {% if not matchup.riders.all %}open{% endif %}>
+  <summary class="card-body py-3 cursor-pointer select-none list-none marker:hidden [&::-webkit-details-marker]:hidden flex-row flex-wrap items-center justify-between gap-3">
+    <span class="flex items-center gap-2 shrink-0">
+      <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 transition-transform group-open:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+      <span class="card-title text-lg">Riders</span>
+    </span>
+    {# Rather than push the page sideways on a phone or at a large text size, the badges drop below the title, #}
+    {# then onto separate lines, and a long team name wraps inside its badge (which keeps its usual height for one line). #}
+    <span class="flex flex-wrap justify-end gap-2 min-w-0">
+      <span class="badge badge-sm h-auto min-h-(--size) max-w-full">{{ summary.our_count }} {{ summary.projected.our_label|default:"ours" }}</span>
+      <span class="badge badge-sm badge-ghost">{{ summary.opp_count }} opp</span>
+    </span>
+  </summary>
+  <div class="card-body pt-0">
+
+  {% if can_edit %}
+  {# ---- Add riders ---- #}
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-4">
+    <div class="space-y-3">
+      {% if my_squads or other_squads %}
+      <form hx-post="{% url 'ladder_planner:our_squad_add' matchup.pk %}"
+            hx-target="#ladder-body" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) this.reset()">
+        <span class="label-text mb-1 block">Our team — add a whole squad</span>
+        <select name="squad" class="select select-bordered select-sm w-full"
+                onchange="if(this.value) this.form.requestSubmit()">
+          <option value="">Choose squad…</option>
+          {% if my_squads %}
+          <optgroup label="Your squads">
+            {% for s in my_squads %}<option value="{{ s.pk }}">{{ s.label }}</option>{% endfor %}
+          </optgroup>
+          {% endif %}
+          {% if other_squads %}
+          <optgroup label="Other active squads">
+            {% for s in other_squads %}<option value="{{ s.pk }}">{{ s.label }}</option>{% endfor %}
+          </optgroup>
+          {% endif %}
+        </select>
+      </form>
+      {% endif %}
+
+      <div class="relative">
+        <span class="label-text mb-1 block">Our team — search our roster</span>
+        <input type="text" name="q" placeholder="Name or Zwift ID…"
+               class="input input-bordered input-sm w-full"
+               hx-get="{% url 'ladder_planner:our_rider_search' matchup.pk %}"
+               hx-trigger="keyup changed delay:300ms, search"
+               hx-target="#ladder-our-search" hx-swap="innerHTML" />
+        <div id="ladder-our-search"></div>
+      </div>
+    </div>
+
+    <div class="space-y-3">
+      <div class="relative">
+        <span class="label-text mb-1 block">Opponent — search cached riders</span>
+        <input type="text" name="q" placeholder="Name or Zwift ID…"
+               class="input input-bordered input-sm w-full"
+               hx-get="{% url 'ladder_planner:opponent_search' matchup.pk %}"
+               hx-trigger="keyup changed delay:300ms, search"
+               hx-target="#ladder-opp-search" hx-swap="innerHTML" />
+        <div id="ladder-opp-search"></div>
+        <span class="label-text-alt text-base-content/50">Searches the cache; unknown riders offer a live fetch.</span>
+      </div>
+
+      <form hx-post="{% url 'ladder_planner:opponents_add' matchup.pk %}"
+            hx-target="#ladder-body" hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) this.reset()">
+        <span class="label-text mb-1 block">…or paste many Zwift IDs at once</span>
+        <textarea name="zwids" rows="2" placeholder="e.g. 12345, 67890 123456"
+                  class="textarea textarea-bordered textarea-sm w-full font-mono"></textarea>
+        <button type="submit" class="btn btn-primary btn-sm mt-2">Add opponents</button>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ---- Rider rosters ---- #}
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="card bg-base-100 border border-base-300 overflow-visible">
+      <div class="card-body p-4">
+        <h3 class="font-semibold text-sm flex items-center justify-between">
+          <span>{{ summary.projected.our_label }}</span>
+          <span class="badge badge-sm">{{ summary.our_count }} racing</span>
+        </h3>
+        <ul class="divide-y divide-base-200">
+        {% for rider in matchup.riders.all %}{% if rider.side == Side.OURS %}
+          <li class="flex items-center justify-between gap-2 py-1 text-sm {% if not rider.is_racing %}opacity-40{% endif %}">
+            <span class="min-w-0">{% include "accounts/_user_tooltip.html" with display_name=rider.name zwid=rider.zwid zp_category=rider.zr_data.zp_category zr_category=rider.zr_data.rank zr_rating=rider.zr_data.rating_current zr_phenotype=rider.zr_data.phenotype in_zwiftpower=rider.zr_data.zp_category in_zwiftracing=True hide_verification=True %}</span>
+            {% if can_edit %}
+            <span class="flex gap-1 shrink-0">
+              <button aria-label="Toggle racing status for {{ rider.name }}" class="btn btn-ghost btn-xs" title="Toggle racing"
+                      hx-post="{% url 'ladder_planner:rider_toggle' matchup.pk rider.pk %}"
+                      hx-target="#ladder-body" hx-swap="innerHTML">
+                {% if rider.is_racing %}✓{% else %}—{% endif %}
+              </button>
+              <button aria-label="Remove {{ rider.name }} from our roster" class="btn btn-ghost btn-xs text-error" title="Remove"
+                      hx-post="{% url 'ladder_planner:rider_remove' matchup.pk rider.pk %}"
+                      hx-target="#ladder-body" hx-swap="innerHTML">✕</button>
+            </span>
+            {% endif %}
+          </li>
+        {% endif %}{% empty %}{% endfor %}
+      </ul>
+    </div>
+  </div>
+
+  <div class="card bg-base-100 border border-base-300 overflow-visible">
+    <div class="card-body p-4">
+      <h3 class="font-semibold text-sm flex items-center justify-between">
+        <span>{{ summary.projected.opp_label }}</span>
+        <span class="badge badge-sm">{{ summary.opp_count }} racing</span>
+      </h3>
+      <ul class="divide-y divide-base-200">
+        {% for rider in matchup.riders.all %}{% if rider.side == Side.OPPONENT %}
+          <li class="flex items-center justify-between gap-2 py-1 text-sm {% if not rider.is_racing %}opacity-40{% endif %}">
+            <span class="inline-flex items-center gap-1 min-w-0">{% include "accounts/_user_tooltip.html" with display_name=rider.name zwid=rider.zwid zp_category=rider.zr_data.zp_category zr_category=rider.zr_data.rank zr_rating=rider.zr_data.rating_current zr_phenotype=rider.zr_data.phenotype in_zwiftpower=rider.zr_data.zp_category in_zwiftracing=True hide_verification=True %}
+              {% if rider.fetched_at %}<span class="text-xs text-base-content/40">· {{ rider.fetched_at|timesince }} old</span>{% endif %}
+            </span>
+            {% if can_edit %}
+            <span class="flex gap-1 shrink-0">
+              <button aria-label="Toggle racing status for {{ rider.name }}" class="btn btn-ghost btn-xs" title="Toggle racing"
+                      hx-post="{% url 'ladder_planner:rider_toggle' matchup.pk rider.pk %}"
+                      hx-target="#ladder-body" hx-swap="innerHTML">
+                {% if rider.is_racing %}✓{% else %}—{% endif %}
+              </button>
+              <button aria-label="Remove {{ rider.name }} from the opponent roster" class="btn btn-ghost btn-xs text-error" title="Remove"
+                      hx-post="{% url 'ladder_planner:rider_remove' matchup.pk rider.pk %}"
+                      hx-target="#ladder-body" hx-swap="innerHTML">✕</button>
+            </span>
+            {% endif %}
+          </li>
+        {% endif %}{% empty %}{% endfor %}
+      </ul>
+    </div>
+  </div>
+  </div>
+  </div>
+</details>
+
+{# ---- Tabs ---- #}
+<div class="relative">
+  {# Display options for all stat tables: font size, bold, gradient coloring. #}
+  <div class="flex justify-end mb-1">
+    <div class="dropdown dropdown-end z-20">
+    <button type="button" tabindex="0" class="btn btn-ghost btn-sm btn-circle" title="Table display options" aria-label="Table display options">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.03 7.03 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.241.437-.613.43-.992a7.03 7.03 0 0 1 0-.255c.007-.378-.138-.75-.43-.991l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28Z" />
+        <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+      </svg>
+    </button>
+    <div tabindex="0" class="dropdown-content z-30 mt-2 w-60 bg-base-100 rounded-box shadow-lg border border-base-300 p-3 space-y-3">
+      <div>
+        <div class="text-xs font-semibold mb-1">Text size</div>
+        <div class="join" role="group" aria-label="Text size">
+          <button type="button" class="btn btn-xs join-item" data-stat-size="xs" onclick="window.setLadderStatPref('size','xs')">XS</button>
+          <button type="button" class="btn btn-xs join-item" data-stat-size="sm" onclick="window.setLadderStatPref('size','sm')">S</button>
+          <button type="button" class="btn btn-xs join-item" data-stat-size="md" onclick="window.setLadderStatPref('size','md')">M</button>
+          <button type="button" class="btn btn-xs join-item" data-stat-size="lg" onclick="window.setLadderStatPref('size','lg')">L</button>
+          <button type="button" class="btn btn-xs join-item" data-stat-size="xl" onclick="window.setLadderStatPref('size','xl')">XL</button>
+        </div>
+      </div>
+      <div class="flex items-center justify-between">
+        <span class="text-xs font-semibold">Bold</span>
+        <input type="checkbox" class="toggle toggle-sm" data-stat-bold onchange="window.setLadderStatPref('bold', this.checked)" />
+      </div>
+      <div>
+        <div class="text-xs font-semibold mb-1">Gradient coloring</div>
+        <div class="grid grid-cols-2 gap-1">
+          <button type="button" class="btn btn-xs" data-stat-grad="off" onclick="window.setLadderStatPref('gradient','off')">Default</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="rg" onclick="window.setLadderStatPref('gradient','rg')">Red–Green</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="cw" onclick="window.setLadderStatPref('gradient','cw')">Cool–Warm</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="viridis" onclick="window.setLadderStatPref('gradient','viridis')">Viridis</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="blues" onclick="window.setLadderStatPref('gradient','blues')">Blues</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="cividis" onclick="window.setLadderStatPref('gradient','cividis')">Cividis</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="spectral" onclick="window.setLadderStatPref('gradient','spectral')">Spectral</button>
+          <button type="button" class="btn btn-xs" data-stat-grad="plasma" onclick="window.setLadderStatPref('gradient','plasma')">Plasma</button>
+        </div>
+        <p class="text-[10px] text-base-content/50 mt-1">Colors numeric columns; higher = top of scale.</p>
+        <div class="flex items-center justify-between mt-2">
+          <span class="text-xs font-semibold">Invert colors</span>
+          <input type="checkbox" class="toggle toggle-sm" data-stat-invert onchange="window.setLadderStatPref('invert', this.checked)" />
+        </div>
+      </div>
+    </div>
+    </div>
+  </div>
+  <div role="tablist" class="tabs tabs-lift tabs-lg">
+
+  {# ===== Projected Score ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Projected Score" checked />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    {% with projected=summary.projected %}
+    {# pr-8 keeps the text clear of the "Copy tab as image" button pinned in the panel's top-right corner. #}
+    <div class="flex flex-wrap items-end justify-between gap-3 mb-4 pr-8">
+      <div>
+        {% comment %}
+          What the ranking rests on (compute.projected_score): the route's vELO 2 factor weights
+          when it has them, else the vELO 2 race rating. The course profile no longer enters it:
+          zwiftracing removed terrain handicaps from its API on 2026-10-29.
+        {% endcomment %}
+        <p class="text-sm text-base-content/70">
+          {% if projected.weights %}
+            Ranked on vELO 2 weighted for <span class="font-medium">{{ projected.route_name }}</span>:
+            {% for w in projected.weights %}{{ w.label }} {{ w.percent }}%{% if not forloop.last %} &middot; {% endif %}{% endfor %}
+          {% elif projected.route_name %}
+            Ranked on vELO 2 race rating: Zwift Racing has no factor weights for <span class="font-medium">{{ projected.route_name }}</span>.
+          {% else %}
+            Ranked on vELO 2 race rating. Pick a route to weight it by what the route rewards.
+          {% endif %}
+        </p>
+        {% if projected.favored %}
+          <div class="text-lg font-bold">Projected winner: <span class="text-primary">{{ projected.favored }}</span></div>
+        {% else %}
+          <div class="text-lg font-bold">Projected: tied</div>
+        {% endif %}
+      </div>
+      <div class="flex gap-4 text-center">
+        <div><div class="text-xs text-base-content/60">{{ projected.our_label }}</div><div class="text-2xl font-bold">{{ projected.our_points }}</div></div>
+        <div><div class="text-xs text-base-content/60">{{ projected.opp_label }}</div><div class="text-2xl font-bold">{{ projected.opp_points }}</div></div>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="table table-sm table-zebra">
+        <thead>
+          <tr>
+            <th>Rider</th><th>Team</th><th class="text-right">vELO 2</th>
+            {% if projected.weights %}<th class="text-right">Route rating</th>{% endif %}
+            <th class="text-right">Finish</th><th class="text-right">Points</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in projected.rows %}
+          <tr class="{% if row.side == Side.OURS %}bg-primary/5{% endif %}">
+            <td class="font-medium">{% include "accounts/_user_tooltip.html" with display_name=row.name zwid=row.zwid zp_category=row.zp_category zr_category=row.zr_category zr_rating=row.zr_rating zr_phenotype=row.zr_phenotype in_zwiftpower=row.zp_category in_zwiftracing=True hide_verification=True %}</td>
+            <td>{{ row.team }}</td>
+            <td class="text-right{% if not projected.weights %} font-semibold{% endif %}">{{ row.velo2|default_if_none:"&mdash;" }}</td>
+            {% if projected.weights %}
+              <td class="text-right font-semibold">{% if row.approx %}<span aria-hidden="true">~</span><span class="sr-only">race rating </span>{% endif %}{{ row.score }}</td>
+            {% endif %}
+            <td class="text-right">{{ row.finish }}</td>
+            <td class="text-right">{{ row.points }}</td>
+          </tr>
+          {% empty %}
+          <tr><td colspan="{% if projected.weights %}6{% else %}5{% endif %}" class="text-center text-base-content/70 py-6">Add riders with a vELO 2 rating to project a score.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if projected.any_approx %}
+      <p class="text-xs text-base-content/70 mt-2">~ Ranked on their vELO 2 race rating: Zwift Racing has no value for a factor this route weights.</p>
+    {% endif %}
+    {% if projected.unranked %}
+      <p class="text-xs text-base-content/70 mt-2">Not ranked, no vELO 2 rating: {{ projected.unranked|join:", " }}</p>
+    {% endif %}
+    {% endwith %}
+  </div>
+
+  {# ===== Power Comparison ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Power Comparison"
+         onclick="window.renderLadderCharts && window.renderLadderCharts()" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    {% for table in summary.power.tables %}
+    <div class="overflow-x-auto mb-6">
+      <h3 class="font-semibold mb-2">{{ table.domain_label }}</h3>
+      <table class="table table-xs">
+        <thead>
+          <tr class="text-center">
+            <th class="text-left">Metric</th>
+            <th></th>
+            {% for d in summary.power.durations %}<th>{{ d }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for m in table.metrics %}
+          <tr class="text-center">
+            <td class="text-left font-medium" rowspan="3">{{ m.label }}</td>
+            <td class="text-left text-xs text-base-content/60">{{ summary.power.our_label }}</td>
+            {% for v in m.ours %}<td>{{ v|default_if_none:"—" }}</td>{% endfor %}
+          </tr>
+          <tr class="text-center"><td class="text-left text-xs text-base-content/60">{{ summary.power.opp_label }}</td>{% for v in m.opp %}<td>{{ v|default_if_none:"—" }}</td>{% endfor %}</tr>
+          <tr class="text-center text-xs"><td class="text-left text-base-content/60">Advantage</td>{% for v in m.adv %}<td class="{% if v > 0 %}bg-success/25{% elif v < 0 %}bg-error/25{% endif %}">{{ v|default_if_none:"—" }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div><div class="text-sm font-medium mb-1">w/kg (Average)</div><div style="height:240px"><canvas id="chart-wkg-average"></canvas></div></div>
+      <div><div class="text-sm font-medium mb-1">w/kg (Median)</div><div style="height:240px"><canvas id="chart-wkg-median"></canvas></div></div>
+      <div><div class="text-sm font-medium mb-1">Raw Watts (Average)</div><div style="height:240px"><canvas id="chart-w-average"></canvas></div></div>
+      <div><div class="text-sm font-medium mb-1">Raw Watts (Median)</div><div style="height:240px"><canvas id="chart-w-median"></canvas></div></div>
+    </div>
+  </div>
+
+  {# ===== Per-rider & Top riders ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Riders" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    <h3 class="font-semibold mb-2">Top riders</h3>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      {% for group in summary.top %}
+      <div class="overflow-x-auto">
+        <table class="table table-xs">
+          <thead><tr><th>{{ group.domain_label }}</th><th>Rider</th><th>Team</th><th class="text-right">Best</th></tr></thead>
+          <tbody>
+            {% for r in group.rows %}
+            <tr class="{% if r.side == Side.OURS %}bg-primary/5{% endif %}">
+              <td class="font-medium">{{ r.duration }}</td><td>{{ r.name }}</td><td>{{ r.team }}</td><td class="text-right">{{ r.value }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+      <h3 class="font-semibold">Per-rider power</h3>
+      <div class="join" role="group" aria-label="Column grouping">
+        <button type="button" class="btn btn-xs join-item btn-active" data-ladder-grouping-btn="domain"
+                onclick="window.applyLadderPerRiderGrouping('domain')">Group by metric</button>
+        <button type="button" class="btn btn-xs join-item" data-ladder-grouping-btn="time"
+                onclick="window.applyLadderPerRiderGrouping('time')">Group by time</button>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table id="ladder-per-rider-table" class="table table-xs">
+        <thead>
+          <tr>
+            <th class="text-left cursor-pointer select-none" data-sort-col="name" onclick="window.sortLadderPerRiderRows(this)">Rider</th>
+            <th class="cursor-pointer select-none" data-sort-col="team" onclick="window.sortLadderPerRiderRows(this)">Team</th>
+            {% for d in summary.per_rider.durations %}<th class="text-center cursor-pointer select-none" data-grp="wkg" data-dur="{{ forloop.counter0 }}" onclick="window.sortLadderPerRiderRows(this)">{{ d }}<div class="text-[10px] font-normal text-base-content/50">w/kg</div></th>{% endfor %}
+            {% for d in summary.per_rider.durations %}<th class="text-center cursor-pointer select-none" data-grp="w" data-dur="{{ forloop.counter0 }}" onclick="window.sortLadderPerRiderRows(this)">{{ d }}<div class="text-[10px] font-normal text-base-content/50">W</div></th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in summary.per_rider.rows %}
+          <tr>
+            <td class="font-medium whitespace-nowrap">{{ row.name }}</td>
+            <td class="whitespace-nowrap">{{ row.team }}</td>
+            {% for c in row.wkg %}<td class="text-center text-black" data-grp="wkg" data-dur="{{ forloop.counter0 }}" style="{% if c.rgb %}background:{{ c.rgb }}{% endif %}">{{ c.value|default_if_none:"—" }}</td>{% endfor %}
+            {% for c in row.w %}<td class="text-center text-black" data-grp="w" data-dur="{{ forloop.counter0 }}" style="{% if c.rgb %}background:{{ c.rgb }}{% endif %}">{{ c.value|default_if_none:"—" }}</td>{% endfor %}
+          </tr>
+          {% empty %}
+          <tr><td colspan="16" class="text-center text-base-content/60 py-6">No racing riders yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# ===== vELO2 Scores ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="vELO2" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    <h3 class="font-semibold mb-2">vELO2 scores</h3>
+    <div class="overflow-x-auto mb-6">
+      <table class="table table-xs">
+        <thead>
+          <tr>
+            <th class="text-left cursor-pointer select-none" onclick="window.sortLadderTable(this)">Rider</th><th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Team</th><th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Rank</th>
+            {% for d in summary.velo2.disciplines %}<th class="text-center cursor-pointer select-none" onclick="window.sortLadderTable(this)">{{ d }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in summary.velo2.rows %}
+          <tr>
+            <td class="font-medium whitespace-nowrap">{{ row.name }}</td>
+            <td class="whitespace-nowrap">{{ row.team }}</td>
+            <td class="whitespace-nowrap">{{ row.rank|default:"—" }}</td>
+            {% for c in row.cells %}<td class="text-center text-black" style="{% if c.rgb %}background:{{ c.rgb }}{% endif %}">{{ c.value|default_if_none:"—" }}</td>{% endfor %}
+          </tr>
+          {% empty %}
+          <tr><td colspan="10" class="text-center text-base-content/60 py-6">No racing riders yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="font-semibold mb-2">vELO2 comparison</h3>
+    <div class="overflow-x-auto">
+      <table class="table table-xs">
+        <thead>
+          <tr class="text-center"><th class="text-left">Metric</th><th></th>{% for d in summary.velo2.disciplines %}<th>{{ d }}</th>{% endfor %}</tr>
+        </thead>
+        <tbody>
+          {% for m in summary.velo2.metrics %}
+          <tr class="text-center">
+            <td class="text-left font-medium" rowspan="3">{{ m.label }}</td>
+            <td class="text-left text-xs text-base-content/60">{{ summary.velo2.our_label }}</td>
+            {% for v in m.ours %}<td>{{ v|default_if_none:"—" }}</td>{% endfor %}
+          </tr>
+          <tr class="text-center"><td class="text-left text-xs text-base-content/60">{{ summary.velo2.opp_label }}</td>{% for v in m.opp %}<td>{{ v|default_if_none:"—" }}</td>{% endfor %}</tr>
+          <tr class="text-center text-xs"><td class="text-left text-base-content/60">Advantage</td>{% for v in m.adv %}<td class="{% if v > 0 %}bg-success/25{% elif v < 0 %}bg-error/25{% endif %}">{{ v|default_if_none:"—" }}</td>{% endfor %}</tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# ===== Event Factors ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Event Factors" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    {% if summary.event_factors.available %}
+    <div class="max-w-xl">
+      <h3 class="font-semibold mb-1">Event Factor Weights</h3>
+      <p class="text-xs text-base-content/60 mb-4">
+        vELO2 Race-rating blend for <span class="font-medium">{{ summary.event_factors.route_name }}</span>.
+        Factors sum to 100%.
+      </p>
+      <div class="space-y-2">
+        {% for f in summary.event_factors.factors %}
+        <div class="flex items-center gap-3">
+          <span class="w-5 text-center shrink-0">{{ f.icon }}</span>
+          <span class="w-20 text-sm shrink-0">{{ f.label }}</span>
+          <div class="flex-1 h-5 rounded bg-base-200 overflow-hidden">
+            <div class="h-full rounded flex items-center justify-end pr-1.5 text-[10px] font-semibold text-white"
+                 style="width: {{ f.value }}%; background: {{ f.color }};">{% if f.value >= 12 %}{{ f.value }}%{% endif %}</div>
+          </div>
+          <span class="w-12 text-right text-sm tabular-nums shrink-0">{{ f.value }}%</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    {# ----- Event Factor Match ----- #}
+    {% with m=summary.event_factor_match %}
+    <div class="divider"></div>
+    <h3 class="font-semibold mb-1">Event Factor Match</h3>
+    {% if m.available %}
+    <p class="text-xs text-base-content/60 mb-3">
+      How each lineup's vELO2 factor strengths line up with what this route rewards.
+      Fit = route-weighted average of each team's factor scores.
+    </p>
+    <div class="flex flex-wrap items-end gap-6 mb-4">
+      <div>
+        <div class="text-xs text-base-content/60">{{ m.our_label }} fit</div>
+        <div class="text-2xl font-bold">{{ m.our_fit|default_if_none:"—" }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-base-content/60">{{ m.opp_label }} fit</div>
+        <div class="text-2xl font-bold">{{ m.opp_fit|default_if_none:"—" }}</div>
+      </div>
+      {% if m.favored %}
+      <div class="text-sm pb-1">Route favors <span class="font-bold text-primary">{{ m.favored }}</span> by {{ m.margin_abs }}</div>
+      {% elif m.our_fit is not None %}
+      <div class="text-sm pb-1 text-base-content/60">Evenly matched</div>
+      {% endif %}
+    </div>
+    <div class="overflow-x-auto max-w-2xl">
+      <table class="table table-xs">
+        <thead>
+          <tr class="text-right">
+            <th class="text-left">Factor</th>
+            <th>Route weight</th>
+            <th>{{ m.our_label }}</th>
+            <th>{{ m.opp_label }}</th>
+            <th>Edge</th>
+            <th>Weighted edge</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in m.rows %}
+          <tr class="text-right">
+            <td class="text-left">{{ r.icon }} {{ r.label }}</td>
+            <td class="tabular-nums">{{ r.weight }}%</td>
+            <td class="tabular-nums">{{ r.ours|default_if_none:"—" }}</td>
+            <td class="tabular-nums">{{ r.opp|default_if_none:"—" }}</td>
+            <td class="tabular-nums {% if r.edge > 0 %}text-success{% elif r.edge < 0 %}text-error{% endif %}">
+              {% if r.edge > 0 %}+{% endif %}{{ r.edge|default_if_none:"—" }}
+            </td>
+            <td class="tabular-nums font-medium {% if r.weighted_edge > 0 %}text-success{% elif r.weighted_edge < 0 %}text-error{% endif %}">
+              {% if r.weighted_edge > 0 %}+{% endif %}{{ r.weighted_edge|default_if_none:"—" }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+        <tfoot>
+          <tr class="text-right border-t border-base-300 font-semibold">
+            <td class="text-left" colspan="5">Weighted edge total (= margin)</td>
+            <td class="tabular-nums {% if m.weighted_edge_total > 0 %}text-success{% elif m.weighted_edge_total < 0 %}text-error{% endif %}">
+              {% if m.weighted_edge_total > 0 %}+{% endif %}{{ m.weighted_edge_total|default_if_none:"—" }}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+    {% else %}
+    <p class="text-sm text-base-content/60">Add racing riders to both teams to see the factor match.</p>
+    {% endif %}
+    {% endwith %}
+    {% else %}
+    <div class="text-center text-base-content/60 py-10">Select a route to see its vELO2 event factor weights.</div>
+    {% endif %}
+  </div>
+
+  {# ===== Other Stats ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Other Stats" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    <div class="overflow-x-auto">
+      <table class="table table-xs">
+        <thead>
+          <tr>
+            <th class="text-left cursor-pointer select-none" onclick="window.sortLadderTable(this)">Rider</th><th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Team</th>
+            <th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">kg</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">lb</th>
+            <th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">cm</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">ft</th>
+            <th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">zFTP</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">zFTP w/kg</th>
+            <th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Cat</th><th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Rank</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">Podium %</th><th class="cursor-pointer select-none" onclick="window.sortLadderTable(this)">Phenotype</th>
+            <th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">zRapp</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">30d</th><th class="text-right cursor-pointer select-none" onclick="window.sortLadderTable(this)">90d</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in summary.other.rows %}
+          <tr>
+            <td class="font-medium whitespace-nowrap">{{ row.name }}</td>
+            <td class="whitespace-nowrap">{{ row.team }}</td>
+            <td class="text-right">{{ row.weight_kg|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.weight_lb|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.height_cm|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.height_ft|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.zftp|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.zftp_wkg|default_if_none:"—" }}</td>
+            <td>{{ row.category|default:"—" }}</td>
+            <td class="whitespace-nowrap">{{ row.rank|default:"—" }}</td>
+            <td class="text-right">{% if row.podium_pct is not None %}{{ row.podium_pct }}%{% else %}—{% endif %}</td>
+            <td class="whitespace-nowrap">{{ row.phenotype|default:"—" }}</td>
+            <td class="text-right">{{ row.zrapp_curr|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.zrapp_30|default_if_none:"—" }}</td>
+            <td class="text-right">{{ row.zrapp_90|default_if_none:"—" }}</td>
+          </tr>
+          {% empty %}
+          <tr><td colspan="15" class="text-center text-base-content/60 py-6">No racing riders yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="text-xs text-base-content/50 mt-2">Podium % is podiums / finishes over the last 90 days.</p>
+  </div>
+
+  {# ===== Climb compare (lazy — computed on demand, see matchup_climb) ===== #}
+  <input type="radio" name="ladder_tabs" role="tab" class="tab" aria-label="Climb compare" />
+  <div role="tabpanel" class="tab-content bg-base-100 border-base-300 rounded-box p-4">
+    {# ?edit=1 carries edit mode to the panel (its CdA control), for someone who confirmed "Edit anyway". #}
+    <div hx-get="{% url 'ladder_planner:climb' matchup.pk %}{% if can_edit %}?edit=1{% endif %}" hx-trigger="intersect once"
+         hx-target="this" hx-swap="innerHTML">
+      <div class="flex justify-center py-10"><span class="loading loading-spinner loading-lg"></span></div>
+    </div>
+  </div>
+  </div>
+</div>
+
+{# Chart data for this matchup; re-emitted on each swap so charts stay in sync. #}
+{{ summary.power.charts|json_script:"ladder-chart-data" }}
+{{ summary.power.durations|json_script:"ladder-chart-durations" }}
+<script id="ladder-chart-labels" type="application/json">{"ours": "{{ summary.power.our_label|escapejs }}", "opp": "{{ summary.power.opp_label|escapejs }}"}</script>
+<script>window.renderLadderCharts && window.renderLadderCharts();</script>
+<script>window.applyLadderPerRiderGrouping && window.applyLadderPerRiderGrouping();</script>
+<script>window.applyLadderStatPrefs && window.applyLadderStatPrefs();</script>

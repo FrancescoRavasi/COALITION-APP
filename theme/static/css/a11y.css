@@ -1,0 +1,140 @@
+/*
+ * Site-wide accessibility rules.
+ *
+ * Plain CSS served as a static file, loaded AFTER {% tailwind_css %} in base.html, for two
+ * reasons: it needs no Tailwind rebuild to take effect (the compiled bundle is a tracked
+ * artifact that is only regenerated on deploy), and coming later in the cascade lets it win
+ * ties against daisyUI without an !important arms race.
+ */
+
+/*
+ * Respect prefers-reduced-motion.
+ * ------------------------------
+ * Nothing in the codebase honoured this setting. daisyUI animates dropdowns, toasts, radios,
+ * ratings and progress bars, and Tailwind transitions are used throughout.
+ *
+ * Durations go to ~0 rather than `animation: none`, so animations still fire their start and
+ * end events -- code that waits on transitionend keeps working instead of hanging.
+ *
+ * Spinners are deliberately exempt: a frozen spinner reads as a hung page rather than as
+ * calm. They are slowed instead, which removes the spin-flicker without losing the signal.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .loading,
+  .htmx-indicator,
+  .htmx-indicator * {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/*
+ * Make keyboard focus visible.
+ * ---------------------------
+ * daisyUI's own focus ring is `outline-color: currentColor`, so on a coloured button it is
+ * the button's own text colour against the button -- effectively invisible on several
+ * variants. It also sets `outline-style: none` outright on thirteen selectors: .tab:focus,
+ * .link:focus, .card:focus, .toggle>:focus, .dropdown>*:focus, the .input/.select/.textarea
+ * inner controls, the breadcrumb items, and every .menu item -- which is the entire sidebar.
+ *
+ * Those rules use `:where()` in places but still reach specificity 0,2,1, and they are
+ * scattered across the bundle. Matching each one would be brittle, so the outline properties
+ * are forced. That is safe here in a way it usually is not: the project defines no focus
+ * styles of its own (0 occurrences in source CSS) and no template uses outline-none, so
+ * there is nothing of ours to override -- only daisyUI's suppression.
+ *
+ * The ring is base-content with a 2px offset, so it sits outside the control on the page
+ * background. base-content is guaranteed to contrast with base-100 in both themes by the
+ * theme's own construction, which is what makes one rule work in light and dark alike.
+ *
+ * :focus-visible, not :focus -- mouse users should not see rings on every click.
+ */
+:focus-visible {
+  outline: 2px solid var(--color-base-content) !important;
+  outline-offset: 2px !important;
+}
+
+/* Inside a scroll container an offset ring is clipped, so tuck it against the control. */
+.overflow-x-auto :focus-visible,
+.overflow-y-auto :focus-visible,
+.overflow-auto :focus-visible,
+.overflow-hidden :focus-visible {
+  outline-offset: 0 !important;
+}
+
+/*
+ * Text size preference.
+ * --------------------
+ * Scales the whole UI from one declaration, because every size in the stack is rem:
+ * Tailwind's utilities, and -- crucially -- daisyUI's component sizes, which are written as
+ * literal rem values (.table, .menu, .badge, .select, .alert, .tab are all .875rem).
+ *
+ * That literal-rem detail is why this is the only mechanism that works. Overriding
+ * --text-xs / --text-sm reaches exactly one rule each: `var(--text-xs)` appears once in the
+ * entire compiled bundle, on the .text-xs utility itself. Measured on the roster at 150%:
+ * root scaling takes table cells 14->21px, menu links 14->21, badges 12->18 and even the
+ * inline `font-size: 0.6rem` chart labels 9.6->24; the variable override moved only .text-xs,
+ * 12->14, and left every component untouched.
+ *
+ * Percentages, not px, so a member who has already raised their browser's default font size
+ * keeps that as the baseline and this multiplies it rather than overriding it.
+ *
+ * Capped at 150%. Above that the fixed shell (body is `flex flex-col h-screen`) starts losing
+ * real estate to chrome: the announcement banner and the profile-incomplete warning grow with
+ * the text, and at 200% they take about half the viewport. At 150% chrome is ~29%, which is
+ * the same order as today's 17%.
+ */
+:root[data-text-size="large"] { font-size: 112.5%; }   /* 18px */
+:root[data-text-size="larger"] { font-size: 125%; }    /* 20px */
+:root[data-text-size="largest"] { font-size: 150%; }   /* 24px */
+
+/*
+ * Keep hidden tooltips out of the layout.
+ * --------------------------------------
+ * daisyUI hides a tooltip bubble with `opacity: 0` only. The bubble is still laid out -- up to
+ * 20rem wide (`width: max-content`) and centred on its trigger -- so a trigger near the right
+ * edge of a phone made .drawer-content wider than the screen and the whole page scrolled
+ * sideways (WCAG 1.4.10 Reflow). Measured at 375px: 194px on the profile page, 41px on a
+ * verification record, 21px on the verification page at the largest text size; 0 on every
+ * page once the hidden bubbles were taken out of layout.
+ *
+ * So a bubble is `display: none` except in the three states daisyUI itself shows it in:
+ * `.tooltip-open`, `:hover`, and `:has(:focus-visible)`. The selectors mirror daisyUI's so
+ * the two can never disagree about when a tooltip is visible. The cost is daisyUI's fade-in,
+ * which cannot run from `display: none` -- the bubble now appears at once.
+ *
+ * This does not make the text reachable on a phone (there is no hover), which is the separate
+ * data-tip backlog item in docs/accessibility.md.
+ */
+.tooltip:not(.tooltip-open):not(:hover):not(:has(:focus-visible))[data-tip]::before,
+.tooltip:not(.tooltip-open):not(:hover):not(:has(:focus-visible))::after,
+.tooltip:not(.tooltip-open):not(:hover):not(:has(:focus-visible)) > .tooltip-content {
+  display: none;
+}
+
+/*
+ * Keep an unselected tab's label readable.
+ * ---------------------------------------
+ * daisyUI dims a tab that is not `.tab-active` to 50% of `--color-base-content`. Measured on
+ * the event page's tab strip, that is 3.33:1 in the light theme -- under the 4.5:1 a label
+ * needs (WCAG 1.4.3). Dark happens to pass at 4.91:1, but the same rule is used in both.
+ *
+ * 70% restores the margin (6.38:1 light, 8.26:1 dark) while keeping the selected tab clearly
+ * ahead: it stays at full strength, 16.68:1 light and 15.62:1 dark. `color` rather than
+ * `opacity`, so the count badges inside the tabs keep their own colours.
+ *
+ * Selection is never carried by this dimming alone: `.tab-active` also changes the tab's
+ * background (`tabs-box`), and every tab bar sets `aria-selected`.
+ */
+.tabs .tab:not(.tab-active):not(.tab-disabled):not([disabled]) {
+  color: color-mix(in oklab, var(--color-base-content) 70%, transparent);
+}

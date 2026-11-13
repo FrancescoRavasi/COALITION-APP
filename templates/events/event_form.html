@@ -1,0 +1,1039 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}{{ page_title }}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+  {% if event %}
+  <div class="mb-4 flex flex-wrap gap-2">
+    <a href="{% url 'events:squad_manage' event.pk %}" class="btn btn-primary btn-sm">Manage Squads</a>
+    <a href="{% url 'events:signup_questions' event.pk %}" class="btn btn-outline btn-sm">Signup Questions</a>
+    <a href="{% url 'events:signup_statuses' event.pk %}" class="btn btn-outline btn-sm">Signup Statuses</a>
+  </div>
+  {% endif %}
+
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <h2 class="card-title text-2xl mb-6">{{ page_title }}</h2>
+
+      <form method="post" enctype="multipart/form-data" class="space-y-4">
+        {% csrf_token %}
+
+        {% comment %}
+          A refused save re-renders this long page at the top, while the field's own error
+          can sit a long scroll further down -- so say here that nothing was saved, and why.
+        {% endcomment %}
+        {% if form.errors %}
+        <div role="alert" class="alert alert-error" id="event-form-errors">
+          <div>
+            <h3 class="font-bold">Not saved</h3>
+            <ul class="mt-1 list-disc pl-5 text-sm">
+              {% for field in form %}{% for error in field.errors %}
+              <li>{% if field.id_for_label %}<a href="#{{ field.id_for_label }}" class="link">{{ field.label }}</a>{% else %}{{ field.label }}{% endif %}: {{ error }}</li>
+              {% endfor %}{% endfor %}
+              {% for error in form.non_field_errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+          </div>
+        </div>
+        {% endif %}
+
+        <!-- ===== Event Details ===== -->
+        <h3 class="text-lg font-semibold">Event Details</h3>
+
+        <!-- Title -->
+        <div class="form-control w-full">
+          <label class="label" for="id_title">
+            <span class="label-text">Title <span class="text-error">*</span></span>
+          </label>
+          {{ form.title }}
+          {% if form.title.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.title.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Logo -->
+        <div class="form-control w-full">
+          <label class="label" for="id_logo">
+            <span class="label-text">Logo</span>
+          </label>
+          {% if event and event.logo %}
+          <div class="mb-2">
+            <img src="{{ event.logo.url }}" alt="Current logo" class="h-16 rounded">
+          </div>
+          {% endif %}
+          {{ form.logo }}
+          {% if form.logo.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.logo.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Optional image shown on the event card</span>
+          </label>
+        </div>
+
+        <!-- Description -->
+        <div class="form-control w-full">
+          <label class="label" for="id_description">
+            <span class="label-text">Description</span>
+          </label>
+          <div role="tablist" class="tabs tabs-box mb-1">
+            <button type="button" role="tab" class="tab tab-active" data-md-tab="write" data-md-target="description">Write</button>
+            <button type="button" role="tab" class="tab" data-md-tab="preview" data-md-target="description">Preview</button>
+          </div>
+          <div data-md-write="description">
+            {{ form.description }}
+          </div>
+          <div data-md-preview="description" class="prose prose-sm max-w-none border border-base-300 rounded-lg p-3 min-h-[8rem] bg-base-100 hidden"></div>
+          {% if form.description.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.description.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Supports Markdown</span>
+          </label>
+        </div>
+
+        <!-- Date Range -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label" for="id_start_date">
+              <span class="label-text">Start Date <span class="text-error">*</span></span>
+            </label>
+            {{ form.start_date }}
+            {% if form.start_date.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.start_date.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <div class="form-control w-full">
+            <label class="label" for="id_end_date">
+              <span class="label-text">End Date <span class="text-error">*</span></span>
+            </label>
+            {{ form.end_date }}
+            {% if form.end_date.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.end_date.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- URL -->
+        <div class="form-control w-full">
+          <label class="label" for="id_url">
+            <span class="label-text">External URL</span>
+          </label>
+          {{ form.url }}
+          {% if form.url.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.url.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Link to external event page or signup</span>
+          </label>
+        </div>
+
+        <!-- ===== Signup ===== -->
+        <div class="divider"></div>
+        <h3 class="text-lg font-semibold">Signup</h3>
+
+        <!-- Signup Instructions -->
+        <div class="form-control w-full">
+          <label class="label" for="id_signup_instructions">
+            <span class="label-text">Signup Instructions</span>
+          </label>
+          <div role="tablist" class="tabs tabs-box mb-1">
+            <button type="button" role="tab" class="tab tab-active" data-md-tab="write" data-md-target="signup_instructions">Write</button>
+            <button type="button" role="tab" class="tab" data-md-tab="preview" data-md-target="signup_instructions">Preview</button>
+          </div>
+          <div data-md-write="signup_instructions">
+            {{ form.signup_instructions }}
+          </div>
+          <div data-md-preview="signup_instructions" class="prose prose-sm max-w-none border border-base-300 rounded-lg p-3 min-h-[6rem] bg-base-100 hidden"></div>
+          {% if form.signup_instructions.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.signup_instructions.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Supports Markdown. Shown at the top of the signup modal form</span>
+          </label>
+        </div>
+
+        <!-- Timezones or Regions (chip/tag input) -->
+        <div class="form-control w-full">
+          <label class="label">
+            <span class="label-text">Timezones or Regions</span>
+          </label>
+          {{ form.timezone_options }}
+          <div id="tz-chips" class="flex flex-wrap gap-2 mb-2 min-h-[2rem]"></div>
+          <div class="join w-full">
+            <input type="text" id="tz-input" class="input input-bordered join-item w-full" placeholder="e.g. WEMA, AMER, APAC">
+            <button type="button" id="tz-add-btn" class="btn btn-primary join-item">Add</button>
+          </div>
+          {% if form.timezone_options.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.timezone_options.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Type a timezone label and press Enter or click Add</span>
+          </label>
+        </div>
+
+        {% if timezone_role_rows %}
+        <!-- Optional: grant a Discord role on signup for each region a rider picks.
+             Rendered from the SAVED options, so add a region and save before mapping it. -->
+        <div class="form-control md:col-span-2">
+          <label class="label">
+            <span class="label-text">Regional roles on signup <span class="text-base-content/50">(optional)</span></span>
+          </label>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+            {% for row in timezone_role_rows %}
+            <label class="flex items-center gap-2">
+              <span class="text-sm w-32 shrink-0 truncate" title="{{ row.option }}">{{ row.option }}</span>
+              <select name="{{ row.field_name }}" class="select select-bordered select-sm flex-1 min-w-0"{% if row.disabled %} disabled{% endif %}>
+                {% for value, label in row.choices %}
+                <option value="{{ value }}"{% if value == row.selected %} selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            {% endfor %}
+          </div>
+          <label class="label">
+            <span class="label-text-alt">Leave as (none) to skip. Riders get the role for each region they
+              select at signup; changing their selection later updates it.</span>
+          </label>
+        </div>
+        {% endif %}
+
+        <!-- Timezone Required -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.timezone_required }}
+            <span class="label-text">Require timezone, region selection at signup</span>
+          </label>
+        </div>
+
+        <!-- Squad Gender Required -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.squad_gender_required }}
+            <span class="label-text">Require squad gender preference at signup</span>
+          </label>
+          <label class="label">
+            <span class="label-text-alt">When on, riders pick which squad types (Male / Female / COED) they're willing to join at signup.</span>
+          </label>
+        </div>
+
+        <!-- Availability grid defaults -->
+        <div class="form-control">
+          <label class="label"><span class="label-text">Availability grid defaults</span></label>
+          <div class="overflow-x-auto">
+            <table class="table table-sm">
+              <thead>
+                <tr>
+                  <th>Setting</th>
+                  <th class="w-40">Event default</th>
+                  <th class="w-24 text-center">Enforce</th>
+                </tr>
+              </thead>
+              <tbody>
+            <tr>
+              <td class="align-middle">Ask: Max number of races</td>
+              <td>{{ form.grid_default_max_races_question }}</td>
+              <td class="text-center align-middle">
+                <label class="cursor-pointer inline-flex items-center">{{ form.grid_enforce_max_races_question }}</label>
+              </td>
+            </tr>
+            <tr>
+              <td class="align-middle">Ask: Rest days between races</td>
+              <td>{{ form.grid_default_rest_days_question }}</td>
+              <td class="text-center align-middle">
+                <label class="cursor-pointer inline-flex items-center">{{ form.grid_enforce_rest_days_question }}</label>
+              </td>
+            </tr>
+            <tr>
+              <td class="align-middle">Hide days with no available times</td>
+              <td>{{ form.grid_default_hide_empty_days }}</td>
+              <td class="text-center align-middle">
+                <label class="cursor-pointer inline-flex items-center">{{ form.grid_enforce_hide_empty_days }}</label>
+              </td>
+            </tr>
+            <tr>
+              <td class="align-middle">Single Time Slot</td>
+              <td>{{ form.grid_default_single_slot }}</td>
+              <td class="text-center align-middle">
+                <label class="cursor-pointer inline-flex items-center">{{ form.grid_enforce_single_slot }}</label>
+              </td>
+            </tr>
+            <tr>
+              <td class="align-middle">Expand Features</td>
+              <td>{{ form.grid_default_expanded_features }}</td>
+              <td class="text-center align-middle">
+                <label class="cursor-pointer inline-flex items-center">{{ form.grid_enforce_expanded_features }}</label>
+              </td>
+            </tr>
+              </tbody>
+            </table>
+          </div>
+          <label class="label">
+            <span class="label-text-alt">
+              A default seeds new availability grids and can still be changed by a captain.
+              Enforce locks it &mdash; to Yes or to No &mdash; on every grid for this event.
+            </span>
+          </label>
+        </div>
+
+        <!-- Who may join the event: checked on signup, on squad invite links, and when a captain adds members -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.require_complete_profile_signup }}
+            <span class="label-text">Require a complete profile to sign up</span>
+          </label>
+          <label class="label">
+            <span class="label-text-alt">
+              When on, a rider missing any required profile field &mdash; including Zwift verification &mdash;
+              is told what to finish before they can sign up. Captains can&rsquo;t add them either.
+            </span>
+          </label>
+        </div>
+
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.require_race_verified_signup }}
+            <span class="label-text">Require Race Verified status to sign up</span>
+          </label>
+          <label class="label">
+            <span class="label-text-alt">
+              When on, only Race Verified riders can sign up, join through a squad invite, or be added by a captain.
+            </span>
+          </label>
+        </div>
+
+        <!-- Require Race Verified for Availability -->
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.require_race_verified_availability }}
+            <span class="label-text">Require Race Verified status to submit availability</span>
+          </label>
+          <label class="label">
+            <span class="label-text-alt">When on, only Race Verified members can submit an availability response for this event.</span>
+          </label>
+        </div>
+
+        {% comment %}
+          Signup statuses: the event's own list (signup_status_views.signup_statuses_view), on a
+          page of its own like Signup Questions. A new event has none, so before it is saved
+          this only says where they will be.
+        {% endcomment %}
+        <div class="rounded-box border border-base-300 p-4">
+          <h4 class="text-sm font-semibold">Signup statuses</h4>
+          <p class="text-sm text-base-content/80 mt-1">What event staff can mark a signup as on this event. Withdrawn and Left the team are on every event, so they aren't listed.</p>
+          {% if event %}
+          {% if signup_statuses %}
+          <div class="flex flex-wrap items-center gap-2 mt-3">
+            {% for status in signup_statuses %}{% include "events/_signup_status_badge.html" with status=status withdrawn=False departed=False %}{% endfor %}
+          </div>
+          {% else %}
+          <p class="text-sm mt-2">None yet.</p>
+          {% endif %}
+          <div class="mt-3"><a href="{% url 'events:signup_statuses' event.pk %}" class="btn btn-sm btn-outline">{% if signup_statuses %}Edit statuses ({{ signup_statuses|length }}){% else %}Add statuses{% endif %}</a></div>
+          {% else %}
+          <p class="text-xs text-base-content/80 mt-2">You add them after creating the event.</p>
+          {% endif %}
+        </div>
+
+        <!-- ===== Squads ===== -->
+        <div class="divider"></div>
+        <h3 class="text-lg font-semibold">Squads</h3>
+
+        <!-- Squad tags (chip input). The event's list is the only source of squad tags:
+             the script below writes it to the hidden JSON input, and saving the event
+             prunes every squad's tags to it. -->
+        <div class="form-control w-full" id="squad-tags-field">
+          <label class="label" for="squad-tag-input">
+            <span class="label-text">{{ form.squad_tags.label }}</span>
+          </label>
+          {{ form.squad_tags }}
+          <ul id="squad-tag-chips" class="flex flex-wrap gap-2 mb-2 min-h-[2rem]" aria-label="Squad tags on this event"></ul>
+          <div class="join w-full">
+            <input type="text" id="squad-tag-input" class="input input-bordered join-item w-full"
+                   maxlength="{{ form.squad_tag_max_length }}" autocomplete="off"
+                   placeholder="e.g. Red, Blue, Tall, Short"
+                   aria-describedby="id_squad_tags_helptext{% if form.squad_tags.errors %} squad-tags-error{% endif %}">
+            <button type="button" id="squad-tag-add-btn" class="btn btn-primary join-item">Add</button>
+          </div>
+          <p id="squad-tag-status" role="status" class="text-sm mt-1"></p>
+          {% if form.squad_tags.errors %}
+          <p id="squad-tags-error" class="flex items-start gap-2 text-sm mt-1">
+            <span class="badge badge-error badge-sm shrink-0">Error</span>
+            <span>{{ form.squad_tags.errors.0 }}</span>
+          </p>
+          {% endif %}
+          <p id="id_squad_tags_helptext" class="label whitespace-normal">
+            {{ form.squad_tags.help_text }} Type a tag and press Enter or click Add; at most
+            {{ form.squad_tag_max_count }} tags of up to {{ form.squad_tag_max_length }} characters each.
+          </p>
+        </div>
+
+        <!-- ===== Status ===== -->
+        <div class="divider"></div>
+        <h3 class="text-lg font-semibold">Status</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control">
+            <label class="label cursor-pointer justify-start gap-2">
+              {{ form.signups_open }}
+              <span class="label-text">Signups open</span>
+            </label>
+          </div>
+          <div class="form-control">
+            <label class="label cursor-pointer justify-start gap-2">
+              {{ form.visible }}
+              <span class="label-text">Visible to team members</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- ===== Options ===== -->
+        <div class="divider"></div>
+        <h3 class="text-lg font-semibold">Options</h3>
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.show_signups }}
+            <span class="label-text">Show signups to all members (names only)</span>
+          </label>
+        </div>
+
+        <!-- Event Type -->
+        <div class="form-control w-full">
+          <label class="label" for="id_config_option">
+            <span class="label-text">Event Type</span>
+          </label>
+          {{ form.config_option }}
+          {% if form.config_option.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.config_option.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Configuration profile for optional event behaviors</span>
+          </label>
+        </div>
+
+        <!-- Availability: how squads ask their riders -->
+        <fieldset class="flex flex-col gap-2 mt-2">
+          <legend class="label-text font-medium mb-2">Availability</legend>
+          <div class="grid gap-3 sm:grid-cols-2">
+            {% for radio in form.availability_type %}
+            <label class="flex items-start gap-3 rounded-box border-2 border-base-300 bg-base-100 p-4 cursor-pointer has-checked:border-primary">
+              {{ radio.tag }}
+              <span class="flex flex-col gap-1">
+                <span class="font-semibold">{{ radio.choice_label }}</span>
+                <span class="text-sm text-base-content/80">
+                  {% if radio.data.value == "series" %}
+                  You list the stages. Each squad sets its own date and time for every stage, and riders answer
+                  Available, Maybe or No per stage.
+                  {% else %}
+                  Captains publish a date &times; time grid and riders mark every slot they can race. For ladders and
+                  leagues where the squad picks its own times.
+                  {% endif %}
+                </span>
+              </span>
+            </label>
+            {% endfor %}
+          </div>
+          {% for error in form.availability_type.errors %}
+          <p class="rounded px-2 py-1 text-xs bg-error text-error-content">{{ error }}</p>
+          {% endfor %}
+          <p class="text-xs text-base-content/80">Switching to Race series keeps every published weekly sheet working as it is. Going back to Weekly is refused once a squad has published stage times.</p>
+          {% if event and event.is_race_series %}
+          <div>
+            <a href="{% url 'events:series_stages' event.pk %}" class="btn btn-sm btn-outline">Edit stages ({{ event.series_stages.count }})</a>
+          </div>
+          {% elif not event %}
+          <p class="text-xs text-base-content/80">For a race series, you add the stages right after creating the event.</p>
+          {% endif %}
+        </fieldset>
+
+        <!-- ===== Discord Config ===== -->
+        <div class="divider"></div>
+        <h3 class="text-lg font-semibold">Discord Config</h3>
+
+        <!-- Discord Channel -->
+        <div class="form-control w-full" data-channel-field>
+          <label class="label" for="id_discord_channel_id">
+            <span class="label-text">Discord Channel</span>
+          </label>
+          <div data-channel-select>
+            {{ form.discord_channel_id }}
+          </div>
+          <div data-channel-manual class="hidden">
+            <input type="text" class="input input-bordered w-full"
+                   placeholder="Enter Discord channel ID" inputmode="numeric" pattern="[0-9]*">
+          </div>
+          {% if form.discord_channel_id.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.discord_channel_id.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">
+              <button type="button" data-channel-toggle class="link link-primary text-xs">or enter ID manually</button>
+            </span>
+          </label>
+        </div>
+
+        <!-- Signup Notification Channel -->
+        <div class="form-control w-full">
+          <label class="label" for="id_signup_notification_channel_id">
+            <span class="label-text">Signup Notification Channel</span>
+          </label>
+          {{ form.signup_notification_channel_id }}
+          {% if form.signup_notification_channel_id.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.signup_notification_channel_id.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Optional. When set, a message is posted here each time a rider signs up.</span>
+          </label>
+        </div>
+
+        {% if form.non_field_errors %}
+        <div class="alert alert-error">
+          {% for error in form.non_field_errors %}
+          <span>{{ error }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <div class="form-control mt-6">
+          <button type="submit" class="btn btn-primary">
+            {{ submit_label }}
+          </button>
+        </div>
+      </form>
+
+      {% if event %}
+      <!-- Role Setup (read-only) -->
+      <div class="divider"></div>
+      <div class="space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-lg font-semibold">Role Setup</h3>
+          <a href="{% url 'events:event_role_setup' event.pk %}" class="btn btn-primary btn-sm">Role Setup</a>
+        </div>
+        <div class="bg-base-300 rounded-lg p-4 text-sm space-y-2">
+          <p><span class="font-semibold">Prefixes:</span> {% if event.prefixes %}<span class="font-mono">{% for p in event.prefixes %}{{ p }}{% if not forloop.last %}  {% endif %}{% endfor %}</span>{% else %}(none){% endif %}</p>
+          <p><span class="font-semibold">Head Captain Role:</span> {{ role_display.head_captain_role_id }}</p>
+          <p><span class="font-semibold">Event Role:</span> {{ role_display.event_role }}</p>
+        </div>
+      </div>
+
+      <!-- Info (read-only) -->
+      <div class="divider"></div>
+      <div class="space-y-3">
+        <h3 class="text-lg font-semibold">Info</h3>
+        <div class="bg-base-300 rounded-lg p-4 text-sm text-base-content/70 space-y-1">
+          <p><span class="font-semibold">Created:</span> {{ event.created_at|date:"M j, Y g:i A" }}{% if event.created_by %} by {{ event.created_by.get_full_name|default:event.created_by.username }}{% endif %}</p>
+          <p><span class="font-semibold">Last updated:</span> {{ event.updated_at|date:"M j, Y g:i A" }}</p>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+      <div class="flex justify-between items-center">
+        <a href="{% url 'events:event_detail' event.pk %}" class="link link-primary">Back to Event</a>
+        <form method="post" action="{% url 'events:event_delete' event.pk %}"
+              onsubmit="return confirm('Are you sure you want to delete this event? This cannot be undone.');">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-error btn-sm btn-outline">Delete Event</button>
+        </form>
+      </div>
+      {% else %}
+      <div class="divider"></div>
+      <div class="text-center">
+        <a href="{% url 'events:event_list' %}" class="link link-primary">Back to Events</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if event %}
+  {# Signups Management #}
+  <div class="card bg-base-200 shadow-xl mt-6">
+    <div class="card-body">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="text-lg font-semibold">
+          Signups
+          {% if signups %}
+          <span class="badge badge-neutral ml-2">{{ signups|length }}</span>
+          {% endif %}
+        </h3>
+      </div>
+
+      {% if signups %}
+      <div class="mb-2">
+        <input type="text" class="input input-bordered input-sm w-48" placeholder="Search by name..." data-signup-search="edit">
+      </div>
+      <div class="overflow-x-auto pb-8">
+        <table class="table table-sm table-pin-col" data-signup-table="edit">
+          <thead>
+            <tr>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Name</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Timezone</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Gender</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Category</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Rating</th>
+              <th data-sort="num" class="cursor-pointer hover:text-primary select-none">FTP</th>
+              <th data-sort="num" class="cursor-pointer hover:text-primary select-none">WKG</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Verified</th>
+              {% if event.event_role %}<th data-sort="text" class="cursor-pointer hover:text-primary select-none">Event Role</th>{% endif %}
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Notes</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in signups %}
+            <tr>
+              <td>
+                <a href="{% url 'accounts:public_profile' entry.user.pk %}" class="link link-hover">{{ entry.user.get_full_name|default:entry.user.discord_username }}</a>
+                {% if entry.in_zwiftpower and entry.zwid %}
+                <a href="https://zwiftpower.com/profile.php?z={{ entry.zwid }}" target="_blank" rel="noopener"
+                   class="ml-1 inline-block px-1 text-xs font-bold text-warning-content bg-warning rounded"
+                   title="View on ZwiftPower">ZP</a>
+                {% endif %}
+                {% if entry.in_zwiftracing and entry.zwid %}
+                <a href="https://www.zwiftracing.app/riders/{{ entry.zwid }}" target="_blank" rel="noopener"
+                   class="ml-1 inline-block px-1 text-xs font-bold text-info-content bg-info rounded"
+                   title="View on Zwift Racing">ZR</a>
+                {% endif %}
+              </td>
+              <td>{% if entry.signup.signup_timezone %}{% for tz in entry.signup.signup_timezone %}<span class="badge badge-outline badge-sm mr-1">{{ tz }}</span>{% endfor %}{% else %}<span class="text-base-content/30">-</span>{% endif %}</td>
+              <td>
+                {% if entry.gender == "male" %}
+                <span class="badge badge-info badge-sm">M</span>
+                {% elif entry.gender == "female" %}
+                <span class="badge badge-secondary badge-sm">F</span>
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.in_zwiftpower %}
+                  {% if entry.zp_category_w %}
+                  {% zp_category_badge entry.zp_category_w is_women=True %}
+                  {% else %}
+                  {% zp_category_badge entry.zp_category|default:"-" %}
+                  {% endif %}
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.in_zwiftracing %}
+                <span class="badge badge-secondary badge-sm">{{ entry.zr_category|default:"N/A" }}</span>
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.zp_ftp %}
+                <span class="font-mono text-sm">{{ entry.zp_ftp }}</span>
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.wkg %}
+                <span class="font-mono text-sm">{{ entry.wkg }}</span>
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.is_extra_verified %}
+                  {% if site_settings.extra_verified_emoji %}
+                  <img src="{{ site_settings.extra_verified_emoji.url }}" alt="Extra Verified" class="h-5 w-5">
+                  {% else %}
+                  <span class="badge badge-warning badge-sm">EV</span>
+                  {% endif %}
+                {% elif entry.is_race_ready %}
+                  {% if site_settings.verified_emoji %}
+                  <img src="{{ site_settings.verified_emoji.url }}" alt="Yes" class="h-5 w-5">
+                  {% else %}
+                  <span class="badge badge-success badge-sm">Yes</span>
+                  {% endif %}
+                {% else %}
+                  {% if site_settings.not_verified_emoji %}
+                  <img src="{{ site_settings.not_verified_emoji.url }}" alt="No" class="h-5 w-5">
+                  {% else %}
+                  <span class="badge badge-error badge-sm">No</span>
+                  {% endif %}
+                {% endif %}
+              </td>
+              {% if event.event_role %}
+              <td>
+                {% if entry.has_event_role %}
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-success" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/></svg>
+                {% else %}
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-error" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+                {% endif %}
+              </td>
+              {% endif %}
+              <td>
+                {% if entry.signup.notes %}
+                <div class="tooltip tooltip-left" data-tip="{{ entry.signup.notes }}">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-info cursor-pointer" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z" /></svg>
+                </div>
+                {% else %}
+                <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if entry.signup.status == "registered" %}
+                <form method="post" action="{% url 'events:event_signup_withdraw' event.pk entry.signup.pk %}" onsubmit="return confirm('Withdraw signup for {{ entry.user }}?')">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-warning btn-outline btn-xs">Withdraw</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/70">No signups yet.</p>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+(function() {
+  document.querySelectorAll('[data-channel-field]').forEach(function(field) {
+    var selectWrap = field.querySelector('[data-channel-select]');
+    var manualWrap = field.querySelector('[data-channel-manual]');
+    var toggle = field.querySelector('[data-channel-toggle]');
+    var select = selectWrap.querySelector('select');
+    var manualInput = manualWrap.querySelector('input');
+    var isManual = false;
+
+    toggle.addEventListener('click', function() {
+      isManual = !isManual;
+      if (isManual) {
+        selectWrap.classList.add('hidden');
+        manualWrap.classList.remove('hidden');
+        select.removeAttribute('name');
+        manualInput.setAttribute('name', 'discord_channel_id');
+        manualInput.value = select.value !== '0' ? select.value : '';
+        manualInput.focus();
+        toggle.textContent = 'or select from list';
+      } else {
+        manualWrap.classList.add('hidden');
+        selectWrap.classList.remove('hidden');
+        manualInput.removeAttribute('name');
+        select.setAttribute('name', 'discord_channel_id');
+        toggle.textContent = 'or enter ID manually';
+      }
+    });
+  });
+})();
+</script>
+
+<script>
+(function() {
+  const hiddenInput = document.getElementById('id_timezone_options');
+  const chipsContainer = document.getElementById('tz-chips');
+  const textInput = document.getElementById('tz-input');
+  const addBtn = document.getElementById('tz-add-btn');
+
+  // Parse existing value from hidden input
+  let timezones = [];
+  try {
+    const val = hiddenInput.value;
+    if (val) timezones = JSON.parse(val);
+  } catch(e) {
+    timezones = [];
+  }
+  if (!Array.isArray(timezones)) timezones = [];
+
+  function sync() {
+    hiddenInput.value = JSON.stringify(timezones);
+  }
+
+  function render() {
+    chipsContainer.innerHTML = '';
+    timezones.forEach(function(tz, i) {
+      const chip = document.createElement('span');
+      chip.className = 'badge badge-lg gap-1';
+      chip.textContent = tz;
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-ghost btn-xs btn-circle';
+      removeBtn.innerHTML = '&times;';
+      removeBtn.setAttribute('aria-label', 'Remove ' + tz);
+      removeBtn.addEventListener('click', function() {
+        timezones.splice(i, 1);
+        sync();
+        render();
+      });
+      chip.appendChild(removeBtn);
+      chipsContainer.appendChild(chip);
+    });
+  }
+
+  function addTimezone() {
+    const val = textInput.value.trim().toUpperCase();
+    if (!val) return;
+    if (timezones.indexOf(val) !== -1) {
+      textInput.value = '';
+      return;
+    }
+    timezones.push(val);
+    sync();
+    render();
+    textInput.value = '';
+    textInput.focus();
+  }
+
+  addBtn.addEventListener('click', addTimezone);
+  textInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addTimezone();
+    }
+  });
+
+  sync();
+  render();
+})();
+
+document.querySelectorAll('[data-signup-search]').forEach(function(input) {
+  var tableId = input.getAttribute('data-signup-search');
+  var table = document.querySelector('[data-signup-table="' + tableId + '"]');
+  if (!table) return;
+  input.addEventListener('input', function() {
+    var query = this.value.toLowerCase();
+    table.querySelectorAll('tbody tr').forEach(function(row) {
+      var name = row.cells[0].textContent.toLowerCase();
+      row.style.display = name.indexOf(query) !== -1 ? '' : 'none';
+    });
+  });
+});
+
+document.querySelectorAll('[data-signup-table]').forEach(function(table) {
+  var headers = table.querySelectorAll('th[data-sort]');
+  headers.forEach(function(th, colIdx) {
+    th.addEventListener('click', function() {
+      var sortType = th.getAttribute('data-sort');
+      var asc = th.getAttribute('data-dir') !== 'asc';
+      headers.forEach(function(h) {
+        h.removeAttribute('data-dir');
+        var ind = h.querySelector('.sort-indicator');
+        if (ind) ind.remove();
+      });
+      th.setAttribute('data-dir', asc ? 'asc' : 'desc');
+      var indicator = document.createElement('span');
+      indicator.className = 'sort-indicator text-primary ml-1';
+      indicator.textContent = asc ? '\u25B2' : '\u25BC';
+      th.appendChild(indicator);
+
+      var tbody = table.querySelector('tbody');
+      var rows = Array.from(tbody.querySelectorAll('tr'));
+      rows.sort(function(a, b) {
+        var aText = a.cells[colIdx].textContent.trim();
+        var bText = b.cells[colIdx].textContent.trim();
+        if (sortType === 'num') {
+          var aNum = parseFloat(aText) || 0;
+          var bNum = parseFloat(bText) || 0;
+          return asc ? aNum - bNum : bNum - aNum;
+        }
+        return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+      });
+      rows.forEach(function(row) { tbody.appendChild(row); });
+    });
+  });
+});
+</script>
+<script>
+// Squad tags chip editor. Writes the list to the hidden JSON input; the server re-checks
+// everything (apps/events/squad_tags.py), this only mirrors its tidying so the admin sees
+// what will be saved. Case is kept as typed, unlike the timezone chips.
+(function() {
+  var hiddenInput = document.getElementById('id_squad_tags');
+  var chips = document.getElementById('squad-tag-chips');
+  var textInput = document.getElementById('squad-tag-input');
+  var addBtn = document.getElementById('squad-tag-add-btn');
+  var status = document.getElementById('squad-tag-status');
+  if (!hiddenInput || !chips || !textInput || !addBtn) return;
+  var maxLength = parseInt(hiddenInput.getAttribute('data-max-length'), 10) || 40;
+  var maxTags = parseInt(hiddenInput.getAttribute('data-max-tags'), 10) || 30;
+
+  var tags = [];
+  try {
+    if (hiddenInput.value) tags = JSON.parse(hiddenInput.value);
+  } catch (e) {
+    tags = [];
+  }
+  if (!Array.isArray(tags)) tags = [];
+  tags = tags.filter(function(tag) { return typeof tag === 'string'; });
+
+  function tidy(value) {
+    return value.replace(/\s+/g, ' ').trim();
+  }
+  function indexOfTag(tag) {
+    var key = tag.toLowerCase();
+    for (var i = 0; i < tags.length; i++) {
+      if (tags[i].toLowerCase() === key) return i;
+    }
+    return -1;
+  }
+  function say(message) {
+    if (status) status.textContent = message;
+  }
+  function sync() {
+    hiddenInput.value = JSON.stringify(tags);
+  }
+
+  function render(focusIndex) {
+    chips.innerHTML = '';
+    tags.forEach(function(tag, i) {
+      var chip = document.createElement('li');
+      // h-auto: a long tag wraps on a phone, and the chip has to grow with it.
+      chip.className = 'badge badge-lg gap-1 h-auto py-1 max-w-full';
+      var text = document.createElement('span');
+      text.className = 'break-words min-w-0';
+      text.textContent = tag;
+      chip.appendChild(text);
+      var removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'btn btn-ghost btn-xs btn-circle';
+      removeBtn.setAttribute('aria-label', 'Remove tag ' + tag);
+      removeBtn.innerHTML = '<span aria-hidden="true">&times;</span>';
+      removeBtn.addEventListener('click', function() {
+        tags.splice(i, 1);
+        sync();
+        // The pressed button is gone: move focus to the chip that took its place, the
+        // one before it, or the text box, so keyboard users are not dropped to <body>.
+        render(tags.length ? Math.min(i, tags.length - 1) : -1);
+        say('Removed tag ' + tag + '.');
+      });
+      chip.appendChild(removeBtn);
+      chips.appendChild(chip);
+    });
+    if (focusIndex === undefined) return;
+    var buttons = chips.querySelectorAll('button');
+    if (focusIndex >= 0 && buttons[focusIndex]) {
+      buttons[focusIndex].focus();
+    } else {
+      textInput.focus();
+    }
+  }
+
+  // Why a new tag cannot be added, or '' when it can. A duplicate is not a problem: it is
+  // already in the list.
+  function problemWith(tag) {
+    if (tag.length > maxLength) return 'A squad tag can be at most ' + maxLength + ' characters.';
+    if (indexOfTag(tag) === -1 && tags.length >= maxTags) {
+      return 'An event can have at most ' + maxTags + ' squad tags. Remove one first.';
+    }
+    return '';
+  }
+
+  // Adds what is typed in the box. Returns false when the text had to stay in the box
+  // because it cannot be added, true otherwise (added, already listed, or nothing typed).
+  function addTag() {
+    var tag = tidy(textInput.value);
+    if (!tag) return true;
+    var problem = problemWith(tag);
+    if (problem) {
+      say(problem);
+      return false;
+    }
+    if (indexOfTag(tag) !== -1) {
+      say(tags[indexOfTag(tag)] + ' is already in the list.');
+      textInput.value = '';
+      return true;
+    }
+    // Alphabetical, ignoring case, as the server stores them: a chip stays where the reader
+    // will look for it instead of jumping on the next save.
+    tags.push(tag);
+    tags.sort(function(a, b) { return a.localeCompare(b, undefined, {sensitivity: 'base'}); });
+    sync();
+    render();
+    textInput.value = '';
+    textInput.focus();
+    say('Added tag ' + tag + '.');
+    return true;
+  }
+
+  addBtn.addEventListener('click', function() { addTag(); });
+  textInput.addEventListener('keydown', function(e) {
+    // Enter adds the tag instead of submitting the whole event form (but not while an
+    // input method is still composing a character).
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      addTag();
+    }
+  });
+  // A tag typed but never added (Save pressed instead of Enter or Add) would otherwise be
+  // dropped behind "Event updated": add it as the event is saved, or stop the save and say
+  // why it cannot be added.
+  if (textInput.form) {
+    textInput.form.addEventListener('submit', function(e) {
+      var tag = tidy(textInput.value);
+      if (!tag || addTag()) return;
+      e.preventDefault();
+      say('The event was not saved. ' + problemWith(tag) + ' Or clear the Squad tags box to save without it.');
+      textInput.focus();
+    });
+  }
+
+  sync();
+  render();
+})();
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+(function() {
+  var fieldMap = {
+    description: 'id_description',
+    signup_instructions: 'id_signup_instructions'
+  };
+
+  document.querySelectorAll('[data-md-tab]').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var target = tab.getAttribute('data-md-target');
+      var mode = tab.getAttribute('data-md-tab');
+      var writePane = document.querySelector('[data-md-write="' + target + '"]');
+      var previewPane = document.querySelector('[data-md-preview="' + target + '"]');
+      var tabs = tab.parentElement.querySelectorAll('[role="tab"]');
+
+      tabs.forEach(function(t) { t.classList.remove('tab-active'); });
+      tab.classList.add('tab-active');
+
+      if (mode === 'preview') {
+        var textarea = document.getElementById(fieldMap[target]);
+        previewPane.innerHTML = marked.parse(textarea.value || '');
+        writePane.classList.add('hidden');
+        previewPane.classList.remove('hidden');
+      } else {
+        writePane.classList.remove('hidden');
+        previewPane.classList.add('hidden');
+      }
+    });
+  });
+})();
+</script>
+{% include "events/_filter_select_script.html" %}
+{% endblock %}

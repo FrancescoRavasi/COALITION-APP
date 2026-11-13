@@ -1,0 +1,2976 @@
+"""Views for team app."""
+
+import csv
+from dataclasses import replace
+from datetime import datetime
+from typing import TYPE_CHECKING
+from urllib.parse import urlencode
+
+import logfire
+from django.contrib import messages
+from django.contrib.auth.decorators import login_required
+from django.core.cache import cache
+from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
+from django.db.models import Q
+from django.http import Http404, HttpRequest, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
+from django.utils.cache import patch_vary_headers
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
+
+from apps.accounts.decorators import discord_permission_required, team_member_required
+from apps.accounts.discord_service import send_verification_notification
+from apps.accounts.models import User
+from apps.accounts.utils import resolve_country
+from apps.rider_data.models import velo2_categories_by_zwid
+from apps.rider_data.services import last_successful_sync
+from apps.rider_data.tasks import refresh_zwift_profile
+from apps.team.context_processors import SQUAD_EXPIRING_CACHE_PREFIX, SQUAD_EXPIRING_CACHE_TIMEOUT
+from apps.team.forms import (
+    MembershipApplicationAdminForm,
+    MembershipApplicationApplicantForm,
+    TeamLinkEditForm,
+    TeamLinkForm,
+)
+from apps.team.models import MembershipApplication, RaceReadyRecord, RecordView, RosterFilter, TeamLink
+from apps.team.rosterv2 import (
+    DEFAULT_SORT,
+    FTP_STEPS,
+    JOINED_WINDOWS,
+    LINK_LABELS,
+    LINK_NOUNS,
+    LINK_VALUES,
+    RACE_WINDOW_DAYS,
+    SORTS,
+    WKG_STEPS,
+    ZR_CATEGORY_ORDER,
+    apply_filters,
+    build_link_rows,
+    filter_options,
+    matching_squads,
+    parse_filters,
+    roster_index_for,
+    search_link_rows,
+    sort_link_rows,
+    sort_rows,
+    squad_summaries,
+)
+from apps.team.rosterv2 import search as roster_search
+from apps.team.services import (
+    SAME_GENDER_REVIEW,
+    ZP_DIV_TO_CATEGORY,
+    ZWIFT_LINK_NOT_RELEASED_MESSAGE,
+    can_decide_verification_record,
+    can_open_verification_record,
+    can_view_verification_media,
+    get_performance_review_data,
+    get_unified_team_roster,
+    log_record_view,
+    purge_expired_verification_media,
+    purge_rejected_verification_media,
+    records_decidable_by,
+    release_application_zwift_links,
+    review_requirements,
+    squad_expiring_summary,
+    unmet_review_requirements,
+    verification_media_url,
+)
+from apps.team.tasks import notify_application_update, notify_captains_verification, notify_race_ready_change
+from apps.team.zauth_panel import build_zauth_panel
+from apps.zwift import client as zwift_client
+from apps.zwiftpower.models import ZPTeamRiders
+from apps.zwiftracing.models import ZRRider
+from gotta_bike_platform.csv_utils import csv_safe
+
+if TYPE_CHECKING:
+    import uuid
+
+# How long a rejected record keeps its evidence, so a rider has a window to query the
+# decision before the photo is thrown away.
+REJECTED_MEDIA_GRACE_DAYS = 30
+
+
+def _format_field_value_for_notification(field_name: str, value) -> str:
+    """Format field value for display in Discord notifications.
+
+    Args:
+        field_name: The name of the field.
+        value: The value to format.
+
+    Returns:
+        A human-readable string representation of the value.
+
+    """
+    if value is None or value == "":
+        return "(cleared)"
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    # Handle django-countries Country object
+    if hasattr(value, "name"):
+        return value.name
+    return str(value)
+
+
+@login_required
+@team_member_required()
+@require_GET
+def team_roster_view(request: HttpRequest) -> HttpResponse:
+    """Display unified team roster.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered team roster page.
+
+    """
+    roster = get_unified_team_roster()
+
+    # Exclude riders who have left (have zp_date_left set)
+    roster = [r for r in roster if not r.zp_date_left]
+
+    # Get filter parameters
+    search_query = request.GET.get("q", "").strip()
+    zp_category_filter = request.GET.get("zp_category", "")
+    zr_category_filter = request.GET.get("zr_category", "")
+    velo2_filter = request.GET.get("velo2", "")
+    velo2_women_filter = request.GET.get("velo2_women", "")
+    gender_filter = request.GET.get("gender", "")
+    race_ready_filter = request.GET.get("race_ready", "")
+
+    # Get sort parameters (default: result_count descending)
+    sort_by = request.GET.get("sort", "results")
+    sort_dir = request.GET.get("dir", "desc")
+
+    # Collect unique values for filter dropdowns (before filtering)
+    # For ZP categories, use the mapping to show letters
+    zp_divs_present = sorted({r.zp_div for r in roster if r.in_zwiftpower and r.zp_div})
+    zp_categories = [(div, ZP_DIV_TO_CATEGORY.get(div, str(div))) for div in zp_divs_present]
+    zr_categories = sorted({r.zr_category for r in roster if r.in_zwiftracing and r.zr_category})
+    velo2_categories = [tier for tier in ZR_CATEGORY_ORDER if tier in {r.zr_v2_category for r in roster}]
+    velo2_women_categories = [tier for tier in ZR_CATEGORY_ORDER if tier in {r.zr_v2_women_category for r in roster}]
+
+    # Apply search filter (by zwid or name)
+    if search_query:
+        search_lower = search_query.lower()
+        roster = [r for r in roster if search_lower in r.display_name.lower() or search_query in str(r.zwid)]
+
+    # Apply ZwiftPower category filter (filter by div number)
+    if zp_category_filter:
+        try:
+            div_value = int(zp_category_filter)
+            roster = [r for r in roster if r.in_zwiftpower and r.zp_div == div_value]
+        except ValueError:
+            pass
+
+    # Apply Zwift Racing category filter
+    if zr_category_filter:
+        roster = [r for r in roster if r.in_zwiftracing and r.zr_category == zr_category_filter]
+
+    # vELO 2: the mixed tier, and the women's tier only women have.
+    if velo2_filter:
+        roster = [r for r in roster if r.zr_v2_category == velo2_filter]
+    if velo2_women_filter:
+        roster = [r for r in roster if r.zr_v2_women_category == velo2_women_filter]
+
+    # Apply gender filter
+    if gender_filter:
+        roster = [r for r in roster if r.gender == gender_filter]
+
+    # Apply race ready filter
+    if race_ready_filter:
+        if race_ready_filter == "yes":
+            roster = [r for r in roster if r.is_race_ready]
+        elif race_ready_filter == "no":
+            roster = [r for r in roster if not r.is_race_ready]
+
+    # Apply sorting
+    reverse = sort_dir == "desc"
+    sort_keys = {
+        "name": lambda r: r.display_name.lower(),
+        "zwid": lambda r: r.zwid,
+        "gender": lambda r: r.gender or "",
+        "member_since": lambda r: r.member_since_sort_key,
+        "account": lambda r: r.has_account,
+        "verified": lambda r: r.zwid_verified,
+        "race_ready": lambda r: r.is_race_ready,
+        "category": lambda r: r.zp_div or 0,
+        "catw": lambda r: r.zp_divw or 0,
+        "rating": lambda r: r.zr_category or "",
+        "results": lambda r: r.result_count,
+        "rank": lambda r: r.zp_rank or 0,
+        "ftp": lambda r: r.zp_ftp or 0,
+        "wkg": lambda r: r.wkg or 0,
+    }
+    if sort_by in sort_keys:
+        roster = sorted(roster, key=sort_keys[sort_by], reverse=reverse)
+
+    total_count = len(roster)
+
+    # Build ZP category distribution from filtered roster (split by gender)
+    zp_m_counts: dict[str, int] = {}
+    zp_w_counts: dict[str, int] = {}
+    for r in roster:
+        if not r.in_zwiftpower:
+            continue
+        div = r.zp_divw or r.zp_div
+        if not div:
+            continue
+        cat = ZP_DIV_TO_CATEGORY.get(div, "")
+        if not cat:
+            continue
+        if r.gender == "F":
+            zp_w_counts[cat] = zp_w_counts.get(cat, 0) + 1
+        else:
+            zp_m_counts[cat] = zp_m_counts.get(cat, 0) + 1
+    category_order = ["A+", "A", "B", "C", "D"]
+    zp_dist_max = max(
+        [zp_m_counts.get(c, 0) + zp_w_counts.get(c, 0) for c in category_order],
+        default=0,
+    )
+    zp_distribution = []
+    for cat in category_order:
+        m = zp_m_counts.get(cat, 0)
+        w = zp_w_counts.get(cat, 0)
+        total = m + w
+        zp_distribution.append({
+            "category": cat,
+            "count_m": m,
+            "count_w": w,
+            "total": total,
+            "bar_h_m": f"{m / zp_dist_max * 3:.2f}" if zp_dist_max else "0",
+            "bar_h_w": f"{w / zp_dist_max * 3:.2f}" if zp_dist_max else "0",
+        })
+    zp_distribution_max = zp_dist_max
+
+    # Build ZR category distribution from filtered roster (split by gender)
+    zr_m_counts: dict[str, int] = {}
+    zr_w_counts: dict[str, int] = {}
+    for r in roster:
+        if r.in_zwiftracing and r.zr_category:
+            if r.gender == "F":
+                zr_w_counts[r.zr_category] = zr_w_counts.get(r.zr_category, 0) + 1
+            else:
+                zr_m_counts[r.zr_category] = zr_m_counts.get(r.zr_category, 0) + 1
+    zr_cat_order = [
+        "Diamond",
+        "Ruby",
+        "Emerald",
+        "Sapphire",
+        "Amethyst",
+        "Platinum",
+        "Gold",
+        "Silver",
+        "Bronze",
+        "Copper",
+    ]
+    zr_dist_max = max(
+        [zr_m_counts.get(c, 0) + zr_w_counts.get(c, 0) for c in zr_cat_order],
+        default=0,
+    )
+    zr_distribution = []
+    for cat in zr_cat_order:
+        m = zr_m_counts.get(cat, 0)
+        w = zr_w_counts.get(cat, 0)
+        total = m + w
+        zr_distribution.append({
+            "category": cat,
+            "count_m": m,
+            "count_w": w,
+            "total": total,
+            "bar_h_m": f"{m / zr_dist_max * 3:.2f}" if zr_dist_max else "0",
+            "bar_h_w": f"{w / zr_dist_max * 3:.2f}" if zr_dist_max else "0",
+        })
+    zr_distribution_max = zr_dist_max
+
+    # Build FTP histogram from filtered roster (10W bins, split by gender)
+    ftp_m_bins: dict[int, int] = {}
+    ftp_w_bins: dict[int, int] = {}
+    for r in roster:
+        ftp = r.zp_ftp
+        if not ftp or ftp <= 0:
+            continue
+        bin_start = (ftp // 15) * 15
+        if r.gender == "F":
+            ftp_w_bins[bin_start] = ftp_w_bins.get(bin_start, 0) + 1
+        else:
+            ftp_m_bins[bin_start] = ftp_m_bins.get(bin_start, 0) + 1
+    all_ftp_bins = sorted(set(ftp_m_bins) | set(ftp_w_bins))
+    ftp_bin_range = range(all_ftp_bins[0], all_ftp_bins[-1] + 15, 15) if all_ftp_bins else range(0)
+    ftp_dist_max = max(
+        [ftp_m_bins.get(b, 0) + ftp_w_bins.get(b, 0) for b in ftp_bin_range],
+        default=0,
+    )
+    ftp_distribution = []
+    for b in ftp_bin_range:
+        m = ftp_m_bins.get(b, 0)
+        w = ftp_w_bins.get(b, 0)
+        ftp_distribution.append({
+            "label": str(b),
+            "count_m": m,
+            "count_w": w,
+            "total": m + w,
+            "bar_h_m": f"{m / ftp_dist_max * 3:.2f}" if ftp_dist_max else "0",
+            "bar_h_w": f"{w / ftp_dist_max * 3:.2f}" if ftp_dist_max else "0",
+        })
+    ftp_distribution_max = ftp_dist_max
+
+    # Build W/kg histogram from filtered roster (0.2 W/kg bins, split by gender)
+    wkg_m_bins: dict[str, int] = {}
+    wkg_w_bins: dict[str, int] = {}
+    for r in roster:
+        wkg = float(r.wkg or 0)
+        if wkg <= 0:
+            continue
+        bin_start = int(wkg / 0.2) * 0.2
+        bin_key = f"{bin_start:.1f}"
+        if r.gender == "F":
+            wkg_w_bins[bin_key] = wkg_w_bins.get(bin_key, 0) + 1
+        else:
+            wkg_m_bins[bin_key] = wkg_m_bins.get(bin_key, 0) + 1
+    all_wkg_keys = sorted(set(wkg_m_bins) | set(wkg_w_bins), key=float)
+    if all_wkg_keys:
+        low = float(all_wkg_keys[0])
+        high = float(all_wkg_keys[-1])
+        wkg_bin_values = []
+        v = low
+        while v <= high + 0.01:
+            wkg_bin_values.append(f"{v:.1f}")
+            v = round(v + 0.2, 1)
+    else:
+        wkg_bin_values = []
+    wkg_dist_max = max(
+        [wkg_m_bins.get(b, 0) + wkg_w_bins.get(b, 0) for b in wkg_bin_values],
+        default=0,
+    )
+    wkg_distribution = []
+    for b in wkg_bin_values:
+        m = wkg_m_bins.get(b, 0)
+        w = wkg_w_bins.get(b, 0)
+        wkg_distribution.append({
+            "label": b,
+            "count_m": m,
+            "count_w": w,
+            "total": m + w,
+            "bar_h_m": f"{m / wkg_dist_max * 3:.2f}" if wkg_dist_max else "0",
+            "bar_h_w": f"{w / wkg_dist_max * 3:.2f}" if wkg_dist_max else "0",
+        })
+    wkg_distribution_max = wkg_dist_max
+
+    per_page = request.GET.get("per_page", "100")
+    try:
+        per_page = int(per_page)
+    except ValueError:
+        per_page = 100
+    if per_page <= 0:
+        per_page = 100
+
+    paginator = Paginator(roster, per_page)
+    page_number = request.GET.get("page", "1")
+    page_obj = paginator.get_page(page_number)
+
+    # Build base query strings for template links
+    filter_params = {
+        "q": search_query,
+        "zp_category": zp_category_filter,
+        "zr_category": zr_category_filter,
+        "velo2": velo2_filter,
+        "velo2_women": velo2_women_filter,
+        "gender": gender_filter,
+        "race_ready": race_ready_filter,
+    }
+    filter_qs = urlencode({k: v for k, v in filter_params.items() if v})
+    base_params = {**filter_params, "sort": sort_by, "dir": sort_dir, "per_page": per_page}
+    base_qs = urlencode({k: v for k, v in base_params.items() if v})
+
+    return render(
+        request,
+        "team/roster.html",
+        {
+            "roster": page_obj,
+            "page_obj": page_obj,
+            "total_count": total_count,
+            "per_page": per_page,
+            "search_query": search_query,
+            "zp_category_filter": zp_category_filter,
+            "zr_category_filter": zr_category_filter,
+            "velo2_filter": velo2_filter,
+            "velo2_women_filter": velo2_women_filter,
+            "gender_filter": gender_filter,
+            "race_ready_filter": race_ready_filter,
+            "zp_categories": zp_categories,
+            "zr_categories": zr_categories,
+            "velo2_categories": velo2_categories,
+            "velo2_women_categories": velo2_women_categories,
+            "zp_distribution": zp_distribution,
+            "zp_distribution_max": zp_distribution_max,
+            "zr_distribution": zr_distribution,
+            "zr_distribution_max": zr_distribution_max,
+            "ftp_distribution": ftp_distribution,
+            "ftp_distribution_max": ftp_distribution_max,
+            "wkg_distribution": wkg_distribution,
+            "wkg_distribution_max": wkg_distribution_max,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+            "filter_qs": filter_qs,
+            "base_qs": base_qs,
+            "per_page_options": [25, 50, 100, 250],
+        },
+    )
+
+
+@require_GET
+def filtered_roster_view(request: HttpRequest, filter_id: uuid.UUID) -> HttpResponse:
+    """Display filtered team roster based on Discord channel members.
+
+    This view does not require login - it's accessed via time-limited links
+    generated by the Discord bot /in_channel command.
+
+    Open on purpose, reviewed and kept on 11 September 2026. The link is the credential, and
+    three things bound it: the bot answers /in_channel only for holders of the Team Member
+    Discord role, it replies ephemerally to that one person rather than posting in the channel,
+    and the link dies five minutes after it is minted. Everything around it stays gated -- the
+    full roster and every rider profile redirect to login -- so a leaked link discloses one
+    channel's rows for five minutes and nothing else. Requiring a login here would remove the
+    point of the feature: tapping the link in Discord, usually on a phone, and getting the
+    answer without signing in.
+
+    Residual risk, accepted: inside that window the link works for anyone who obtains it, it is
+    reusable rather than single-use, and nothing records who opened it. If that ever matters,
+    make the link single-use (bind it to its first viewer) rather than adding a login.
+
+    Args:
+        request: The HTTP request.
+        filter_id: UUID of the RosterFilter record.
+
+    Returns:
+        Rendered filtered team roster page or 404 if filter not found/expired.
+
+    """
+    # Get the filter, return 404 if not found
+    roster_filter = get_object_or_404(RosterFilter, id=filter_id)
+
+    # Check if filter has expired
+    if roster_filter.is_expired:
+        logfire.debug(
+            "Expired roster filter accessed",
+            filter_id=str(filter_id),
+            channel_name=roster_filter.channel_name,
+        )
+        return render(
+            request,
+            "team/roster_filter_expired.html",
+            {"filter": roster_filter},
+            status=410,  # Gone
+        )
+
+    # Get full roster
+    roster = get_unified_team_roster()
+
+    # Filter to only users whose discord_id is in the filter's discord_ids list
+    # Convert discord_ids to strings for comparison
+    discord_id_set = {str(did) for did in roster_filter.discord_ids}
+
+    # Import User model to look up discord_ids
+    from apps.accounts.models import User
+
+    # Get user_ids that match the discord_ids
+    matching_user_ids = set(User.objects.filter(discord_id__in=discord_id_set).values_list("id", flat=True))
+
+    # Filter roster to only include riders with matching user accounts
+    roster = [r for r in roster if r.user_id and r.user_id in matching_user_ids]
+
+    # Get sort parameters (default: name ascending for filtered view)
+    sort_by = request.GET.get("sort", "name")
+    sort_dir = request.GET.get("dir", "asc")
+
+    # Apply sorting
+    reverse = sort_dir == "desc"
+    sort_keys = {
+        "name": lambda r: r.display_name.lower(),
+        "zwid": lambda r: r.zwid,
+        "gender": lambda r: r.gender or "",
+        "member_since": lambda r: r.member_since_sort_key,
+        "account": lambda r: r.has_account,
+        "verified": lambda r: r.zwid_verified,
+        "race_ready": lambda r: r.is_race_ready,
+        "category": lambda r: r.zp_div or 0,
+        "catw": lambda r: r.zp_divw or 0,
+        "rating": lambda r: r.zr_category or "",
+        "results": lambda r: r.result_count,
+        "rank": lambda r: r.zp_rank or 0,
+        "ftp": lambda r: r.zp_ftp or 0,
+        "wkg": lambda r: r.wkg or 0,
+    }
+    if sort_by in sort_keys:
+        roster = sorted(roster, key=sort_keys[sort_by], reverse=reverse)
+
+    # Collect unique values for filter dropdowns
+    zp_divs_present = sorted({r.zp_div for r in roster if r.in_zwiftpower and r.zp_div})
+    zp_categories = [(div, ZP_DIV_TO_CATEGORY.get(div, str(div))) for div in zp_divs_present]
+    zr_categories = sorted({r.zr_category for r in roster if r.in_zwiftracing and r.zr_category})
+
+    return render(
+        request,
+        "team/roster.html",
+        {
+            "roster": roster,
+            "roster_filter": roster_filter,
+            "search_query": "",
+            "zp_category_filter": "",
+            "zr_category_filter": "",
+            "status_filter": "",
+            "gender_filter": "",
+            "race_ready_filter": "",
+            "zp_categories": zp_categories,
+            "zr_categories": zr_categories,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+        },
+    )
+
+
+ROSTER_PAGE_SIZE = 48
+# How many pages load by themselves as a reader scrolls before "Show more riders" has to be
+# pressed: past this the footer stays reachable, and a phone is not asked to hold the team.
+ROSTER_AUTO_LOAD_PAGES = 5
+# The parts of the roster page an HTMX request may ask for, by the id of what it replaces.
+ROSTER_PARTS = {"roster-results": "results", "roster-more": "more"}
+
+# Labels for the removable chips. Only what a reader would recognise: "Cat B", not "category=B".
+_CHIP_LABELS = {
+    "q": "Search",
+    "category": "Category",
+    "zr": "Zwift Racing",
+    "velo2": "vELO 2",
+    "velo2_women": "vELO 2 women's",
+    "gender": "Gender",
+    "phenotype": "Phenotype",
+    "verified": "Race Verified",
+    "age": "Age",
+    "account": "Account",
+    "wkg": "Min W/kg",
+    "ftp": "Min FTP",
+    "joined": "Joined within",
+    "racing": "Racing",
+    "country": "Country",
+    "link": "Not linked",
+}
+
+
+def _query_without(request: HttpRequest, *drop: str) -> str:
+    """Rebuild the querystring without the named parameters, or any left blank.
+
+    Blank ones go too: a live search that has been cleared sends ``q=``, and every link built
+    from that request would otherwise carry it along.
+
+    Args:
+        request: The HTTP request.
+        *drop: Parameter names to leave out.
+
+    Returns:
+        An encoded querystring, empty when nothing is left.
+
+    """
+    params = request.GET.copy()
+    for name in list(params):
+        if name in drop or not any(value.strip() for value in params.getlist(name)):
+            params.pop(name)
+    return params.urlencode()
+
+
+def _roster_part(request: HttpRequest) -> str:
+    """Name the part of the roster page an HTMX request wants, or "" for the whole page.
+
+    A live search asks for the results, "Show more riders" for the next page's cards. htmx
+    restoring history sends HX-Request too, but swaps whatever comes back in as the whole
+    page, so it gets the whole page.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        ``"results"``, ``"more"`` or ``""``.
+
+    """
+    htmx = getattr(request, "htmx", None)
+    if not htmx or htmx.history_restore_request:
+        return ""
+    return ROSTER_PARTS.get(htmx.target or "", "")
+
+
+def _roster_chips(request: HttpRequest, *, link: str = "") -> list[dict]:
+    """Describe each active control as a chip that can be taken off.
+
+    Takes the EFFECTIVE link value rather than reading it back off the querystring. This
+    function works in raw ``request.GET``, so it is the one place that cannot see a filter
+    the view declined to apply -- and a chip asserting a filter the page did not use is
+    worse than no chip, because the chip is what a reader trusts to tell them why the list
+    looks the way it does.
+
+    Args:
+        request: The HTTP request.
+        link: The not-linked population actually in force, empty when none is.
+
+    Returns:
+        One entry per active control, with the querystring that removes it.
+
+    """
+    chips = []
+    # The other half of the clear-the-stat-filters rule: without this guard,
+    # ?wkg=4.5&link=no_stats renders a removable "Min W/kg: 4.5" chip over a list where W/kg
+    # does not exist, asserting the opposite of what the panel below it shows.
+    on_link = bool(link)
+    for name, label in _CHIP_LABELS.items():
+        if on_link and name not in ("link", "q"):
+            continue
+        value = link if name == "link" else (request.GET.get(name) or "").strip()
+        if not value:
+            continue
+        shown = value
+        if name == "link":
+            # "Not linked: no_stats" names a database value at the reader.
+            shown = LINK_LABELS.get(value, value)
+        if name == "country":
+            # "Country: GB" tells a reader nothing; the chip says what the dropdown said.
+            shown = resolve_country(value)[1] or value
+        chips.append({"label": label, "value": shown, "without": _query_without(request, name, "page")})
+    return chips
+
+
+@login_required
+@team_member_required()
+@require_GET
+def rosterv2_view(request: HttpRequest) -> HttpResponse:
+    """Serve the card roster: one page of cards, or one of the not-linked worklists.
+
+    Team members only. The cache behind it holds riders who never registered here (the
+    ZwiftPower team page, the ZwiftRacing club), which is what the field allow-list in
+    ``apps.team.rosterv2`` exists to bound.
+
+    ``?link=`` swaps the whole body for a list of people who have NO card -- and the branch
+    has to happen before ``search``, ``apply_filters`` and ``sort_rows``, every one of which
+    dereferences ``row.card`` unconditionally. Handing them link rows is an AttributeError on
+    a live page, not an empty one. The toggle itself is membership-admin only: the same
+    population is already listed at /team/discord-review/ behind that permission, and the
+    roster is open to every team member.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        The roster page, in whichever of its two modes the querystring asked for.
+
+    """
+    roster = roster_index_for(request.user.pk)
+    query = request.GET.get("q", "").strip()
+    direction = request.GET.get("dir", "")
+    may_see_gaps = request.user.has_permission("membership_admin")
+
+    filters = parse_filters(request.GET, roster.rows)
+    if filters.link and not may_see_gaps:
+        filters = replace(filters, link="")
+
+    sort = DEFAULT_SORT
+    link_total = 0
+    squads = []
+    if filters.link:
+        link_rows = build_link_rows(filters.link)
+        link_total = len(link_rows)
+        rows = search_link_rows(link_rows, query) if query else link_rows
+        rows = sort_link_rows(rows, direction)
+    else:
+        # Squad names only find riders on the cards: a not-linked worklist is about accounts.
+        squads = matching_squads(query) if query else []
+        rows = roster_search(roster.rows, query, squads) if query else list(roster.rows)
+        rows = apply_filters(rows, filters)
+        sort = request.GET.get("sort", "") if request.GET.get("sort", "") in SORTS else DEFAULT_SORT
+        rows = sort_rows(rows, sort, direction)
+
+    # 48 a page: enough to fill four columns twelve deep, and the reason the whole index is
+    # never handed to the template. v1 sends ~450 KB of HTML for 100 rows.
+    paginator = Paginator(rows, ROSTER_PAGE_SIZE)
+    part = _roster_part(request)
+    if part == "more":
+        # "Show more" names a page after the one on screen. If the list has shrunk since (a
+        # new minute's index), there is no such page, and get_page's fallback to the last one
+        # would append riders already shown -- so the answer is nothing, which removes the button.
+        try:
+            page_obj = paginator.page(request.GET.get("page", ""))
+        except (EmptyPage, PageNotAnInteger):
+            return HttpResponse("")
+    else:
+        page_obj = paginator.get_page(request.GET.get("page", "1"))
+
+    # The query text is NOT logged: it is rider-authored free text, and someone looking up a
+    # teammate by real name should not leave that in telemetry. The count is the useful part.
+    if part:
+        # A live search sends one of these per pause in typing, so they stay at debug.
+        logfire.debug(
+            "Roster results updated",
+            user_id=request.user.pk,
+            part=part,
+            matched=len(rows),
+            squads_matched=len(squads),
+            page=page_obj.number,
+        )
+    else:
+        logfire.info(
+            "Roster viewed",
+            user_id=request.user.pk,
+            riders=roster.rider_count,
+            matched=len(rows),
+            squads_matched=len(squads),
+            # A roster that is thin because the stats cache is behind looks, from the outside,
+            # exactly like a team that shrank. The number says which.
+            unstatted=roster.unstatted_count,
+        )
+
+    template = {
+        "": "team/rosterv2.html",
+        "results": "team/partials/_roster_results.html",
+        "more": "team/partials/_roster_more.html",
+    }[part]
+    response = render(
+        request,
+        template,
+        {
+            "roster": roster,
+            "page_obj": page_obj,
+            "query": query,
+            "match_count": len(rows),
+            "rider_count": roster.rider_count,
+            "unstatted_count": roster.unstatted_count,
+            "team_size": roster.team_size,
+            "stats_synced_at": roster.synced_at,
+            "filters": filters,
+            "options": filter_options(roster.rows),
+            "wkg_steps": WKG_STEPS,
+            "ftp_steps": FTP_STEPS,
+            "joined_windows": JOINED_WINDOWS,
+            "chips": _roster_chips(request, link=filters.link),
+            "may_see_gaps": may_see_gaps,
+            "link_options": [
+                {"value": value, "label": LINK_LABELS[value]} for value in LINK_VALUES
+            ] if may_see_gaps else [],
+            "link_label": LINK_LABELS.get(filters.link, ""),
+            "link_noun": (
+                LINK_NOUNS[filters.link][0 if link_total == 1 else 1] if filters.link else ""
+            ),
+            "link_total": link_total,
+            "last_profile_sync": last_successful_sync() if filters.link == "no_stats" else None,
+            "sorts": [(key, label) for key, (label, _) in SORTS.items()],
+            "race_window_days": RACE_WINDOW_DAYS,
+            "sort": sort,
+            "direction": direction,
+            # Paging has to carry every control, or page 2 of a filtered search silently
+            # becomes page 2 of everyone.
+            "page_query": _query_without(request, "page"),
+            "squad_matches": squad_summaries(squads, roster.rows) if part != "more" else [],
+            # A live search keeps the filters in force, so the search form carries them.
+            "kept_params": [
+                (name, value)
+                for name, values in request.GET.lists()
+                if name not in {"q", "page"}
+                for value in values
+                if value.strip()
+            ],
+            "auto_load": page_obj.number < ROSTER_AUTO_LOAD_PAGES,
+            # Whether this page's cards are being added under the ones already shown, so
+            # "96 of 2,076 shown" is true; a page opened on its own shows only its own riders.
+            "appending": part == "more",
+            "part": part,
+        },
+    )
+    if part == "results":
+        # The address bar follows the search, minus the page (a new search starts at the top)
+        # and minus anything left blank, so clearing the box gives back the plain URL.
+        query_string = _query_without(request, "page")
+        response["HX-Replace-Url"] = reverse("team:roster") + (f"?{query_string}" if query_string else "")
+    # One URL answers with a whole page or with a fragment, so a cache must keep them apart.
+    patch_vary_headers(response, ("HX-Request",))
+    return response
+
+
+@login_required
+@team_member_required()
+@require_GET
+def team_links_view(request: HttpRequest) -> HttpResponse:
+    """Display team links with filtering.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered team links page.
+
+    """
+    now = timezone.now()
+    # Filter links that are currently visible:
+    # - active=True
+    # - date_open is null OR date_open <= now
+    # - date_closed is null OR date_closed > now
+    links = (
+        TeamLink.objects
+        .filter(
+            active=True,
+        )
+        .filter(
+            Q(date_open__isnull=True) | Q(date_open__lte=now),
+        )
+        .filter(
+            Q(date_closed__isnull=True) | Q(date_closed__gt=now),
+        )
+    )
+
+    # Get filter parameters
+    search_query = request.GET.get("q", "").strip()
+    type_filter = request.GET.get("type", "")
+    permission_filter = request.GET.get("permission", "").strip().lower()
+
+    # Get all available types for filter dropdown
+    available_types = TeamLink.LinkType.choices
+
+    # Build available permissions filter based on user's roles
+    from apps.team.templatetags.team_tags import PERMISSION_SHORT_TO_KEY
+
+    user_role_ids = [str(rid) for rid in request.user.get_discord_role_ids()]
+    available_permissions = []  # List of (short_form, display_name) tuples
+
+    import json
+
+    from constance import config
+
+    for perm_key, display_name in TeamLink.PERMISSION_CHOICES:
+        # Check if user has this permission
+        role_ids_raw = getattr(config, perm_key, []) or []
+        role_ids = json.loads(role_ids_raw) if isinstance(role_ids_raw, str) and role_ids_raw else role_ids_raw or []
+
+        if any(str(rid) in user_role_ids for rid in role_ids):
+            short_form = display_name.lower().replace(" ", "_")
+            available_permissions.append((short_form, display_name))
+
+    # Apply search filter
+    if search_query:
+        search_lower = search_query.lower()
+        links = links.filter(title__icontains=search_lower) | links.filter(description__icontains=search_lower)
+
+    # Apply type filter
+    if type_filter:
+        links = links.filter(link_types__contains=type_filter)
+
+    # Apply permission filter (e.g., ?permission=team_captain)
+    if permission_filter:
+        from apps.team.templatetags.team_tags import PERMISSION_SHORT_TO_KEY
+
+        permission_key = PERMISSION_SHORT_TO_KEY.get(permission_filter)
+        if permission_key:
+            links = links.filter(permissions__contains=permission_key)
+
+    # Filter links by user's permissions (convert to list for filtering)
+    links = [link for link in links if link.user_can_view(request.user)]
+
+    # Check if user can edit links
+    can_edit_links = request.user.is_link_admin or request.user.is_superuser
+
+    return render(
+        request,
+        "team/links.html",
+        {
+            "links": links,
+            "search_query": search_query,
+            "type_filter": type_filter,
+            "permission_filter": permission_filter,
+            "available_types": available_types,
+            "available_permissions": available_permissions,
+            "can_edit_links": can_edit_links,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def submit_team_link_view(request: HttpRequest) -> HttpResponse:
+    """Submit a new team link.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    # Check if user has permission to create links
+    if not request.user.is_link_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized team link creation attempt",
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to create team links.")
+        return redirect("team:links")
+
+    if request.method == "POST":
+        form = TeamLinkForm(request.POST)
+        if form.is_valid():
+            link = form.save()
+            logfire.info(
+                "Team link created",
+                link_id=link.pk,
+                link_title=link.title,
+                user_id=request.user.id,
+                username=request.user.username,
+            )
+            messages.success(request, "Team link submitted successfully!")
+            return redirect("team:links")
+    else:
+        form = TeamLinkForm()
+
+    return render(
+        request,
+        "team/submit_link.html",
+        {"form": form},
+    )
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def edit_team_link_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Edit an existing team link.
+
+    Args:
+        request: The HTTP request.
+        pk: The primary key of the TeamLink to edit.
+
+    Returns:
+        Rendered form or redirect on success.
+
+    """
+    link = get_object_or_404(TeamLink, pk=pk)
+
+    # Check if user has permission to edit
+    if not request.user.is_link_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized team link edit attempt",
+            link_id=pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to edit team links.")
+        return redirect("team:links")
+
+    if request.method == "POST":
+        form = TeamLinkEditForm(request.POST, instance=link)
+        if form.is_valid():
+            form.save()
+            logfire.info(
+                "Team link updated",
+                link_id=pk,
+                link_title=link.title,
+                user_id=request.user.id,
+                username=request.user.username,
+            )
+            messages.success(request, "Team link updated successfully!")
+            return redirect("team:links")
+    else:
+        form = TeamLinkEditForm(instance=link)
+
+    return render(
+        request,
+        "team/edit_link.html",
+        {"form": form, "link": link},
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def delete_team_link_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Delete a team link.
+
+    Args:
+        request: The HTTP request.
+        pk: The primary key of the TeamLink to delete.
+
+    Returns:
+        Redirect to links list.
+
+    """
+    link = get_object_or_404(TeamLink, pk=pk)
+
+    # Check if user has permission to delete
+    if not request.user.is_link_admin and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized team link delete attempt",
+            link_id=pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to delete team links.")
+        return redirect("team:links")
+
+    link_title = link.title
+    link.delete()
+    logfire.info(
+        "Team link deleted",
+        link_id=pk,
+        link_title=link_title,
+        user_id=request.user.id,
+        username=request.user.username,
+    )
+    messages.success(request, "Team link deleted successfully!")
+    return redirect("team:links")
+
+
+@login_required
+@team_member_required()
+@require_GET
+def verification_records_view(request: HttpRequest) -> HttpResponse:
+    """Display verification records for team captains.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered verification records page.
+
+    """
+    # Check if user can view/approve verification records
+    if not request.user.can_approve_verification and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized verification records access attempt",
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to view verification records.")
+        return redirect("home")
+
+    records = RaceReadyRecord.objects.select_related("user", "reviewed_by")
+
+    # Get filter parameters
+    search_query = request.GET.get("q", "").strip()
+    type_filter = request.GET.get("type", "")
+    status_filter = request.GET.get("status", "")
+    gender_filter = request.GET.get("gender", "")
+    reviewer_filter = request.GET.get("reviewer", "")
+
+    # Get choices for filter dropdowns
+    verify_type_choices = RaceReadyRecord._meta.get_field("verify_type").choices
+    status_choices = RaceReadyRecord.Status.choices
+    gender_choices = User.Gender.choices
+
+    # Apply search filter
+    if search_query:
+        records = records.filter(
+            Q(user__first_name__icontains=search_query)
+            | Q(user__last_name__icontains=search_query)
+            | Q(user__discord_nickname__icontains=search_query)
+            | Q(user__discord_username__icontains=search_query)
+            | Q(user__username__icontains=search_query)
+        )
+
+    # Apply type filter
+    if type_filter:
+        records = records.filter(verify_type=type_filter)
+
+    # Apply status filter
+    if status_filter:
+        records = records.filter(status=status_filter)
+
+    # Apply gender filter
+    if gender_filter:
+        records = records.filter(user__gender=gender_filter)
+
+    # Apply reviewer filter. "mine" is the one a reviewer reaches for -- what can I act on --
+    # and it asks the same rule the rows below do, in the database.
+    if reviewer_filter == "mine":
+        records = records_decidable_by(request.user, records)
+    elif reviewer_filter == "admin":
+        records = records.filter(media_type="other")
+    elif reviewer_filter == "same_gender":
+        records = records.filter(same_gender=True)
+
+    # Pending Other records are a queue only admins can clear, so say how long it is -- to
+    # them, as the way into it. Counted before the other filters so the number is the queue.
+    admin_queue_count = (
+        RaceReadyRecord.objects.filter(status=RaceReadyRecord.Status.PENDING, media_type="other").count()
+        if request.user.is_app_admin
+        else 0
+    )
+
+    # Sort by status (pending first), then newest within each status
+    from django.db.models import Case, IntegerField, Value, When
+
+    records = records.annotate(
+        status_order=Case(
+            When(status="pending", then=Value(0)),
+            When(status="verified", then=Value(1)),
+            When(status="rejected", then=Value(2)),
+            default=Value(3),
+            output_field=IntegerField(),
+        )
+    ).order_by("status_order", "-date_created")
+
+    # Paginate
+    from django.core.paginator import Paginator
+
+    page_number = request.GET.get("page", "1")
+    paginator = Paginator(records, 25)
+    page_obj = paginator.get_page(page_number)
+
+    # Check if user can verify records (has permission)
+    can_verify = request.user.can_approve_verification or request.user.is_superuser
+
+    # What each row may do for this reviewer, from the one rule the review page also uses.
+    # "can_open" decides whether the row links anywhere; "unmet" names the reason when it
+    # does not -- or when it links to a record they can look at but not decide.
+    records_list = list(page_obj)
+    records_with_review_status = [
+        {
+            "record": record,
+            "can_open": can_open_verification_record(request.user, record),
+            "can_decide": can_decide_verification_record(request.user, record),
+            "requirements": review_requirements(record),
+            "unmet": unmet_review_requirements(request.user, record),
+        }
+        for record in records_list
+    ]
+
+    # Batch-fetch ZP/ZR data for user tooltip display
+    zwids = [r.user.zwid for r in records_list if r.user.zwid]
+    zp_by_zwid = {r.zwid: r for r in ZPTeamRiders.objects.filter(zwid__in=zwids)} if zwids else {}
+    zr_by_zwid = {r.zwid: r for r in ZRRider.objects.filter(zwid__in=zwids)} if zwids else {}
+    velo2_by_zwid = velo2_categories_by_zwid((r.user.zwid, r.user.gender) for r in records_list)
+    for record in records_list:
+        zwid = record.user.zwid
+        zp = zp_by_zwid.get(zwid)
+        zr = zr_by_zwid.get(zwid)
+        record.tt_zr_v2_category = velo2_by_zwid[zwid].mixed if zwid in velo2_by_zwid else ""
+        record.tt_zp_category = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp and zp.div else ""
+        record.tt_zp_category_w = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and zp.divw else ""
+        record.tt_in_zwiftpower = zp is not None
+        record.tt_zr_category = getattr(zr, "race_current_category", "") or "" if zr else ""
+        record.tt_zr_rating = getattr(zr, "race_current_rating", None) if zr else None
+        record.tt_zr_phenotype = getattr(zr, "phenotype_value", "") or "" if zr else ""
+        record.tt_in_zwiftracing = zr is not None
+
+    return render(
+        request,
+        "team/verification_records.html",
+        {
+            "records_with_review_status": records_with_review_status,
+            "page_obj": page_obj,
+            "search_query": search_query,
+            "type_filter": type_filter,
+            "status_filter": status_filter,
+            "gender_filter": gender_filter,
+            "reviewer_filter": reviewer_filter,
+            "reviewer_choices": [
+                ("mine", "Ones I can decide"),
+                ("admin", "Needs admin review"),
+                ("same_gender", "Same gender only"),
+            ],
+            "admin_queue_count": admin_queue_count,
+            "verify_type_choices": verify_type_choices,
+            "status_choices": status_choices,
+            "gender_choices": gender_choices,
+            "can_verify": can_verify,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_GET
+def verification_record_media_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Serve a verification record's media behind a per-request permission check.
+
+    Object storage hands out presigned URLs: the signature travels in the query string, so
+    the URL *is* the credential. It is bound to no session, works from any browser, and
+    cannot be revoked before it expires. Embedding one in the review page meant the page
+    carried a forwardable key to body photography for as long as the signature lasted.
+
+    This view keeps that key out of the page. Templates point here instead; every request
+    re-runs :func:`can_view_verification_media` -- the same rule the review page renders by
+    -- and only then mints a short-lived URL to redirect to. Two things follow: revoking a
+    reviewer's role revokes their access immediately rather than at the next expiry, and a
+    forwarded link is worthless to anyone who cannot pass the check themselves.
+
+    Denials are 404, not 403, so the endpoint cannot be used to confirm that a record id
+    exists or that a rider has uploaded anything.
+
+    Args:
+        request: The HTTP request.
+        pk: The primary key of the RaceReadyRecord.
+
+    Returns:
+        A redirect to a freshly signed, short-lived URL for the record's media file.
+
+    Raises:
+        Http404: If the record does not exist, holds no file, or this user may not see it.
+
+    """
+    record = get_object_or_404(RaceReadyRecord.objects.select_related("user"), pk=pk)
+
+    if not can_view_verification_media(request.user, record):
+        logfire.warning(
+            "Blocked verification media request",
+            record_id=pk,
+            user_id=request.user.id,
+            record_status=record.status,
+        )
+        raise Http404
+
+    if not record.media_file:
+        raise Http404
+
+    logfire.info(
+        "Verification media served",
+        record_id=pk,
+        user_id=request.user.id,
+        verify_type=record.verify_type,
+        record_status=record.status,
+    )
+
+    response = redirect(verification_media_url(record))
+    # The Location header resolves to a credential. Keep it out of shared caches, and stop
+    # the browser reusing a stale one instead of coming back through this permission check.
+    response["Cache-Control"] = "no-store, private"
+    return response
+
+
+@login_required
+@team_member_required()
+@require_http_methods(["GET", "POST"])
+def verification_record_detail_view(request: HttpRequest, pk: int) -> HttpResponse:
+    """Display and verify or reject a verification record.
+
+    Args:
+        request: The HTTP request.
+        pk: The primary key of the RaceReadyRecord.
+
+    Returns:
+        Rendered record detail page.
+
+    """
+    # Check if user can view/approve verification records
+    if not request.user.can_approve_verification and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized verification record detail access attempt",
+            record_id=pk,
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to view verification records.")
+        return redirect("home")
+
+    record = RaceReadyRecord.objects.select_related("user", "reviewed_by").filter(pk=pk).first()
+    if record is None:
+        # Not a hypothetical: the submission DM links straight to this page, and the rider can
+        # delete or replace the record before a reviewer opens it. Following a real
+        # notification to a bare 404 reads as the app having lost their work, so say what
+        # actually happened and put them back in the queue -- the same shape as the
+        # same-gender redirect below.
+        logfire.info(
+            "Verification record from a notification no longer exists",
+            record_id=pk,
+            user_id=request.user.id,
+        )
+        messages.info(
+            request,
+            f"Verification record #{pk} no longer exists — the rider deleted or replaced it. "
+            "Any newer submission from them will be in the queue below.",
+        )
+        return redirect("team:verification_records")
+
+    # Check if user can verify records (has permission)
+    has_permission = request.user.can_approve_verification or request.user.is_superuser
+
+    # Requirements that block even opening the record: same-gender, which the rider asked for,
+    # and Admin review, for evidence submitted as Other. Superusers bypass both. See
+    # services.review_requirements.
+    if not can_open_verification_record(request.user, record):
+        blocking = [req for req in unmet_review_requirements(request.user, record) if req.blocks_opening]
+        if SAME_GENDER_REVIEW in blocking:
+            logfire.info(
+                "Same-gender restriction blocked verification review",
+                record_id=pk,
+                user_id=request.user.id,
+                user_gender=request.user.gender,
+                record_user_gender=record.user.gender,
+            )
+            messages.warning(request, "This record requires a same-gender reviewer.")
+        else:
+            logfire.info("Admin review restriction blocked verification review", record_id=pk, user_id=request.user.id)
+            messages.warning(request, "This record was submitted as Other, so only an Admin can open it.")
+        return redirect("team:verification_records")
+
+    # Whether this reviewer may approve or reject: the Power rule and the Other rule both live
+    # in services.review_requirements now, so the list and this page cannot disagree.
+    from apps.accounts.models import Permissions
+
+    unmet_requirements = unmet_review_requirements(request.user, record)
+    can_decide = can_decide_verification_record(request.user, record)
+    can_review = has_permission and can_decide
+
+    # Media visibility: pending records visible to all reviewers, approved/rejected only to verification team
+
+    is_own_record = record.user == request.user
+    is_pvt = request.user.has_permission(Permissions.PERFORMANCE_VERIFICATION_TEAM)
+    is_app_admin = request.user.has_permission(Permissions.APP_ADMIN)
+    can_delete = is_pvt or is_app_admin or request.user.is_superuser
+    # Changing a decided record's status is the team's and the admins' -- but still within the
+    # record's requirements. Without that, a team member who is not an admin could approve an
+    # Other record through this path while the Approve button told them they could not.
+    can_change_status = (is_pvt or is_app_admin or request.user.is_superuser) and can_decide
+    can_edit_weight = is_pvt or request.user.is_superuser
+    can_view_media = can_view_verification_media(request.user, record)
+    # Submitted values/ZP data: hide on reviewed records unless own record or PVT member
+    can_view_values = record.is_pending or is_own_record or is_pvt
+
+    # Re-read the rider's height and weight from Zwift. Open to anyone who can see this page:
+    # it changes nothing but the Zwift Auth panel's numbers, and the service throttles repeats.
+    if request.method == "POST" and request.POST.get("action") == "refresh_zwift_profile":
+        if record.is_body_measurement:
+            refresh_zwift_profile.enqueue(user_id=record.user_id)
+            logfire.info(
+                "Zwift profile refresh requested from verification review",
+                record_id=pk,
+                target_user_id=record.user_id,
+                requested_by_id=request.user.id,
+            )
+            messages.info(
+                request,
+                "Asking Zwift for this rider's current height and weight. It can take a minute "
+                "to finish, so reload this page in a moment to see the new values.",
+            )
+        return redirect("team:verification_record_detail", pk=pk)
+
+    # Handle weight edit action (PVT only, weight verifications, any status)
+    if (
+        request.method == "POST"
+        and request.POST.get("action") == "update_weight"
+        and can_edit_weight
+        and record.verify_type in ("weight_full", "weight_light")
+    ):
+        from decimal import Decimal, InvalidOperation
+
+        new_weight_str = request.POST.get("weight", "").strip()
+        if new_weight_str:
+            try:
+                new_weight = Decimal(new_weight_str)
+            except InvalidOperation, ValueError:
+                messages.error(request, "Invalid weight value.")
+                return redirect("team:verification_record_detail", pk=pk)
+            if new_weight != record.weight:
+                old_weight = record.weight
+                record.weight = new_weight
+                record.save(update_fields=["weight"])
+                logfire.info(
+                    "Verification record weight edited",
+                    record_id=pk,
+                    verify_type=record.verify_type,
+                    target_user_id=record.user.id,
+                    target_username=record.user.username,
+                    old_weight=str(old_weight) if old_weight is not None else None,
+                    new_weight=str(new_weight),
+                    edited_by_id=request.user.id,
+                    edited_by_username=request.user.username,
+                )
+                messages.success(request, f"Weight updated to {new_weight} kg.")
+        return redirect("team:verification_record_detail", pk=pk)
+
+    # Handle delete action (any record status, requires PVT or app_admin)
+    if request.method == "POST" and request.POST.get("action") == "delete" and can_delete:
+        target_user = record.user
+        logfire.info(
+            "Verification record deleted",
+            record_id=pk,
+            verify_type=record.verify_type,
+            target_user_id=target_user.id,
+            target_username=target_user.username,
+            deleted_by_id=request.user.id,
+            deleted_by_username=request.user.username,
+        )
+        record.delete()
+        # Recalculate and save cached race ready status after deletion
+        target_user.refresh_race_ready()
+        messages.success(request, f"Verification record for {target_user.username} has been deleted.")
+        return redirect("team:verification_records")
+
+    if request.method == "POST" and (can_change_status or (can_review and record.is_pending)):
+        action = request.POST.get("action")
+
+        # Update record_date if reviewer changed it
+        new_record_date = request.POST.get("record_date", "").strip()
+        if new_record_date:
+            from datetime import date as date_cls
+
+            try:
+                parsed_date = date_cls.fromisoformat(new_record_date)
+                if parsed_date != record.record_date:
+                    logfire.info(
+                        "Reviewer updated record_date",
+                        record_id=pk,
+                        old_date=str(record.record_date),
+                        new_date=str(parsed_date),
+                        reviewer_id=request.user.id,
+                    )
+                    record.record_date = parsed_date
+            except ValueError:
+                pass  # ignore malformed date, keep original
+
+        if action == "verify":
+            # Prevent self-approval
+            if record.user == request.user:
+                logfire.warning(
+                    "Self-approval attempt blocked",
+                    user_id=request.user.id,
+                    record_id=pk,
+                    verify_type=record.verify_type,
+                )
+                messages.error(request, "You cannot approve your own verification record.")
+                return redirect("team:verification_record_detail", pk=pk)
+
+            # Capture race ready status before approval
+            was_race_ready = record.user.is_race_ready
+
+            record.status = RaceReadyRecord.Status.VERIFIED
+            record.reviewed_by = request.user
+            record.reviewed_date = timezone.now()
+            review_note = request.POST.get("review_note", "").strip()
+            record.review_note = review_note
+            record.save()
+            logfire.info(
+                "Verification record approved",
+                record_id=pk,
+                verify_type=record.verify_type,
+                target_user_id=record.user.id,
+                target_username=record.user.username,
+                reviewer_id=request.user.id,
+                reviewer_username=request.user.username,
+                review_note=review_note or None,
+            )
+            # Send Discord DM notification
+            if record.user.discord_id:
+                send_verification_notification(
+                    discord_id=record.user.discord_id,
+                    is_verified=True,
+                    verify_type=record.verify_type,
+                    review_note=review_note or None,
+                )
+
+            # refresh_race_ready() returns (is_race_ready, is_extra_verified). Unpack it:
+            # the pair never equals was_race_ready, and being truthy it announced every
+            # review as a GAIN -- so taking the status away handed out the role instead.
+            is_now_race_ready, _ = record.user.refresh_race_ready()
+            if was_race_ready != is_now_race_ready:
+                notify_race_ready_change.enqueue(
+                    user_id=record.user.id,
+                    is_now_race_ready=is_now_race_ready,
+                    changed_by_user_id=request.user.id,
+                    verification_type=record.verify_type,
+                )
+
+            # Notify squad captains about verification
+            notify_captains_verification.enqueue(
+                user_id=record.user.id,
+                record_id=record.id,
+                notification_type="verified",
+            )
+
+            messages.success(request, f"Record for {record.user.username} has been verified.")
+        elif action == "reject":
+            # Capture race ready status before rejection
+            was_race_ready = record.user.is_race_ready
+
+            record.status = RaceReadyRecord.Status.REJECTED
+            record.reviewed_by = request.user
+            record.reviewed_date = timezone.now()
+            review_note = request.POST.get("review_note", "").strip()
+            record.review_note = review_note
+            record.save()
+            logfire.info(
+                "Verification record rejected",
+                record_id=pk,
+                verify_type=record.verify_type,
+                target_user_id=record.user.id,
+                target_username=record.user.username,
+                reviewer_id=request.user.id,
+                reviewer_username=request.user.username,
+                review_note=review_note or None,
+            )
+            # Send Discord DM notification
+            if record.user.discord_id:
+                send_verification_notification(
+                    discord_id=record.user.discord_id,
+                    is_verified=False,
+                    verify_type=record.verify_type,
+                    review_note=review_note or None,
+                )
+
+            # refresh_race_ready() returns (is_race_ready, is_extra_verified). Unpack it:
+            # the pair never equals was_race_ready, and being truthy it announced every
+            # review as a GAIN -- so taking the status away handed out the role instead.
+            is_now_race_ready, _ = record.user.refresh_race_ready()
+            if was_race_ready != is_now_race_ready:
+                notify_race_ready_change.enqueue(
+                    user_id=record.user.id,
+                    is_now_race_ready=is_now_race_ready,
+                    changed_by_user_id=request.user.id,
+                    verification_type=record.verify_type,
+                )
+
+            # Notify squad captains about rejection
+            notify_captains_verification.enqueue(
+                user_id=record.user.id,
+                record_id=record.id,
+                notification_type="rejected",
+            )
+
+            messages.warning(request, f"Record for {record.user.username} has been rejected.")
+        elif action == "reset_pending" and can_change_status:
+            was_race_ready = record.user.is_race_ready
+
+            old_status = record.status
+            record.status = RaceReadyRecord.Status.PENDING
+            record.reviewed_by = None
+            record.reviewed_date = None
+            record.review_note = ""
+            record.save()
+            logfire.info(
+                "Verification record reset to pending",
+                record_id=pk,
+                verify_type=record.verify_type,
+                old_status=old_status,
+                target_user_id=record.user.id,
+                target_username=record.user.username,
+                reset_by_id=request.user.id,
+                reset_by_username=request.user.username,
+            )
+
+            # refresh_race_ready() returns (is_race_ready, is_extra_verified). Unpack it:
+            # the pair never equals was_race_ready, and being truthy it announced every
+            # review as a GAIN -- so taking the status away handed out the role instead.
+            is_now_race_ready, _ = record.user.refresh_race_ready()
+            if was_race_ready != is_now_race_ready:
+                notify_race_ready_change.enqueue(
+                    user_id=record.user.id,
+                    is_now_race_ready=is_now_race_ready,
+                    changed_by_user_id=request.user.id,
+                    verification_type=record.verify_type,
+                )
+
+            messages.info(request, f"Record for {record.user.username} has been reset to pending.")
+        return redirect("team:verification_records")
+
+    # Get ZwiftPower data for the user if they have a zwid
+    zp_rider = None
+    if record.user.zwid:
+        zp_rider = ZPTeamRiders.objects.filter(zwid=record.user.zwid).first()
+
+    # Official Zwift-sourced numbers to check the rider's submission against.
+    zauth = build_zauth_panel(record.user)
+
+    # Load verification checklist for the record's verify type
+    checklist_items = []
+    if can_review and record.is_pending:
+        import json
+
+        from constance import config
+
+        try:
+            checklist_data = json.loads(config.VERIFICATION_CHECK_LIST or "{}")
+            checklist_items = checklist_data.get(record.verify_type, [])
+        except json.JSONDecodeError, TypeError:
+            pass
+
+    # Get other verification records for the same user (excluding current)
+    other_records = (
+        RaceReadyRecord.objects.filter(user=record.user).exclude(pk=pk).order_by("-record_date", "-date_created")
+    )
+
+    # Audit trail: log that this reviewer was served the record, and whether the evidence was
+    # actually rendered for them. Log on the render path rather than on the HTTP verb: every
+    # POST that matches an action branch redirects before this point, so reaching here means
+    # the page really was shown. A POST that matches no branch (a stale Verify click, or a
+    # power record gated by POWER_REQUIRES_PER_VER) also falls through to this render with the
+    # media visible — gating on GET would let that view go unrecorded.
+    media_shown = bool(can_view_media and (record.media_file or record.url))
+    log_record_view(record, request.user, media_shown=media_shown)
+
+    record_views = RecordView.objects.filter(record=record).select_related("user").order_by("-last_viewed_at")
+
+    return render(
+        request,
+        "team/verification_record_detail.html",
+        {
+            "record": record,
+            "can_review": can_review,
+            # Every requirement the record carries (for the banner), and which of them this
+            # reviewer does not meet (for saying why the decision is not theirs).
+            "review_requirements": review_requirements(record),
+            "unmet_requirements": unmet_requirements,
+            "can_view_media": can_view_media,
+            "can_view_values": can_view_values,
+            "can_change_status": can_change_status,
+            "can_delete": can_delete,
+            "can_edit_weight": can_edit_weight,
+            "checklist_items": checklist_items,
+            "zp_rider": zp_rider,
+            "zauth": zauth,
+            "other_records": other_records,
+            "record_views": record_views,
+        },
+    )
+
+
+@login_required
+@team_member_required()
+@require_POST
+def delete_expired_media_view(request: HttpRequest) -> HttpResponse:
+    """Delete media files and URLs from expired verification records.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect to verification records list.
+
+    """
+    if not request.user.can_approve_verification and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized bulk delete expired media attempt",
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to perform this action.")
+        return redirect("team:verification_records")
+
+    # Same sweep the daily purge_expired_media task runs; this is the on-demand path.
+    result = purge_expired_verification_media()
+    deleted_count = result["purged"]
+
+    logfire.info(
+        "Bulk delete expired verification media",
+        user_id=request.user.id,
+        username=request.user.username,
+        expired_records_found=result["considered"],
+        media_deleted_count=deleted_count,
+        failed_count=result["failed"],
+    )
+
+    if deleted_count:
+        messages.success(request, f"Deleted media from {deleted_count} expired record(s).")
+    else:
+        messages.info(request, "No expired records with media found.")
+    if result["failed"]:
+        messages.warning(request, f"Could not delete media from {result['failed']} record(s). See the logs.")
+
+    return redirect("team:verification_records")
+
+
+@login_required
+@team_member_required()
+@require_POST
+def delete_rejected_media_view(request: HttpRequest) -> HttpResponse:
+    """Delete media files and URLs from rejected records older than 30 days.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect to verification records list.
+
+    """
+    if not request.user.can_approve_verification and not request.user.is_superuser:
+        logfire.warning(
+            "Unauthorized bulk delete rejected media attempt",
+            user_id=request.user.id,
+            username=request.user.username,
+        )
+        messages.error(request, "You don't have permission to perform this action.")
+        return redirect("team:verification_records")
+
+    result = purge_rejected_verification_media(older_than_days=REJECTED_MEDIA_GRACE_DAYS)
+    deleted_count = result["purged"]
+
+    logfire.info(
+        "Bulk delete rejected verification media",
+        user_id=request.user.id,
+        username=request.user.username,
+        rejected_records_found=result["considered"],
+        media_deleted_count=deleted_count,
+        failed_count=result["failed"],
+        cutoff_days=REJECTED_MEDIA_GRACE_DAYS,
+    )
+
+    if deleted_count:
+        messages.success(request, f"Deleted media from {deleted_count} rejected record(s).")
+    else:
+        messages.info(
+            request,
+            f"No rejected records older than {REJECTED_MEDIA_GRACE_DAYS} days with media found.",
+        )
+    if result["failed"]:
+        messages.warning(request, f"Could not delete media from {result['failed']} record(s). See the logs.")
+
+    return redirect("team:verification_records")
+
+
+@login_required
+@team_member_required()
+@require_GET
+def team_feed_view(request: HttpRequest) -> HttpResponse:
+    """Display team feed with YouTube and Twitch channels.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered team feed page.
+
+    """
+    from django.db.models import Q
+
+    from apps.accounts.models import User, YouTubeVideo
+
+    users = (
+        User.objects
+        .filter(
+            Q(youtube_channel__isnull=False) & ~Q(youtube_channel="")
+            | Q(twitch_channel__isnull=False) & ~Q(twitch_channel=""),
+        )
+        .distinct()
+        .order_by("first_name", "last_name", "discord_nickname")
+    )
+
+    feed_entries = []
+    for user in users:
+        if user.youtube_channel:
+            feed_entries.append({"user": user, "platform": "youtube", "url": user.youtube_channel})
+        if user.twitch_channel:
+            feed_entries.append({"user": user, "platform": "twitch", "url": user.twitch_channel})
+
+    # Get recent videos from all users
+    recent_videos = YouTubeVideo.objects.select_related("user").order_by("-published_at")[:20]
+
+    return render(
+        request,
+        "team/team_feed.html",
+        {
+            "feed_entries": feed_entries,
+            "recent_videos": recent_videos,
+        },
+    )
+
+
+@login_required
+@discord_permission_required("performance_verification_team", raise_exception=True)
+@require_GET
+def performance_review_view(request: HttpRequest) -> HttpResponse:
+    """Display performance review comparing verification records with ZwiftPower data.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered performance review page.
+
+    """
+    # Get performance data
+    riders = get_performance_review_data()
+
+    # Get filter parameters
+    search_query = request.GET.get("q", "").strip()
+    zp_category_filter = request.GET.get("zp_category", "")
+    gender_filter = request.GET.get("gender", "")
+
+    # Get sort parameters (default: weight_diff descending - largest concerns first)
+    sort_by = request.GET.get("sort", "weight_diff")
+    sort_dir = request.GET.get("dir", "desc")
+
+    # Collect unique values for filter dropdowns (before filtering)
+    zp_divs_present = sorted({r.zp_div for r in riders if r.zp_div})
+    zp_categories = [(div, ZP_DIV_TO_CATEGORY.get(div, str(div))) for div in zp_divs_present]
+
+    # Apply search filter (by name or zwid)
+    if search_query:
+        search_lower = search_query.lower()
+        riders = [r for r in riders if search_lower in r.display_name.lower() or search_query in str(r.zwid)]
+
+    # Apply ZwiftPower category filter
+    if zp_category_filter:
+        try:
+            div_value = int(zp_category_filter)
+            riders = [r for r in riders if r.zp_div == div_value]
+        except ValueError:
+            pass
+
+    # Apply gender filter
+    if gender_filter:
+        riders = [r for r in riders if r.gender == gender_filter]
+
+    # Apply sorting
+    reverse = sort_dir == "desc"
+    sort_keys = {
+        "name": lambda r: r.display_name.lower(),
+        "weight_diff": lambda r: r.weight_diff_abs if r.weight_diff_abs is not None else -1,
+        "weight_light_date": lambda r: r.weight_light_date or timezone.datetime.min.replace(tzinfo=timezone.UTC),
+        "weight_full_date": lambda r: r.weight_full_date or timezone.datetime.min.replace(tzinfo=timezone.UTC),
+        "height_date": lambda r: r.height_date or timezone.datetime.min.replace(tzinfo=timezone.UTC),
+        "zp_result_date": lambda r: r.zp_result_date or timezone.datetime.min.replace(tzinfo=timezone.UTC),
+        "zp_height_date": lambda r: r.zp_height_date or timezone.datetime.min.replace(tzinfo=timezone.UTC),
+        "height_diff": lambda r: abs(r.height_diff) if r.height_diff is not None else -1,
+        "ftp": lambda r: r.ftp_current or 0,
+        "wkg": lambda r: r.wkg or 0,
+    }
+    if sort_by in sort_keys:
+        riders = sorted(riders, key=sort_keys[sort_by], reverse=reverse)
+
+    # Build histogram of weight diff (1kg bins)
+    diff_bins: dict[int, int] = {}
+    for r in riders:
+        diff = r.weight_diff
+        if diff is None:
+            continue
+        diff_f = float(diff)
+        bin_start = int(diff_f) if diff_f >= 0 else int(diff_f) - 1
+        diff_bins[bin_start] = diff_bins.get(bin_start, 0) + 1
+    all_diff_bins = sorted(diff_bins)
+    diff_bin_range = range(all_diff_bins[0], all_diff_bins[-1] + 1) if all_diff_bins else range(0)
+    diff_dist_max = max(
+        [diff_bins.get(b, 0) for b in diff_bin_range],
+        default=0,
+    )
+    diff_distribution = []
+    for b in diff_bin_range:
+        count = diff_bins.get(b, 0)
+        diff_distribution.append({
+            "label": str(b),
+            "count": count,
+            "bar_h": f"{count / diff_dist_max * 3:.2f}" if diff_dist_max else "0",
+            "is_concern": b < -2,
+            "is_severe": b < -5,
+        })
+
+    # Build histogram of height diff (1cm bins)
+    hdiff_bins: dict[int, int] = {}
+    for r in riders:
+        hdiff = r.height_diff
+        if hdiff is None:
+            continue
+        hdiff_bins[hdiff] = hdiff_bins.get(hdiff, 0) + 1
+    all_hdiff_bins = sorted(hdiff_bins)
+    hdiff_bin_range = range(all_hdiff_bins[0], all_hdiff_bins[-1] + 1) if all_hdiff_bins else range(0)
+    hdiff_dist_max = max(
+        [hdiff_bins.get(b, 0) for b in hdiff_bin_range],
+        default=0,
+    )
+    hdiff_distribution = []
+    for b in hdiff_bin_range:
+        count = hdiff_bins.get(b, 0)
+        hdiff_distribution.append({
+            "label": str(b),
+            "count": count,
+            "bar_h": f"{count / hdiff_dist_max * 3:.2f}" if hdiff_dist_max else "0",
+        })
+
+    return render(
+        request,
+        "team/performance_review.html",
+        {
+            "riders": riders,
+            "search_query": search_query,
+            "zp_category_filter": zp_category_filter,
+            "gender_filter": gender_filter,
+            "zp_categories": zp_categories,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+            "diff_distribution": diff_distribution,
+            "diff_dist_max": diff_dist_max,
+            "hdiff_distribution": hdiff_distribution,
+            "hdiff_dist_max": hdiff_dist_max,
+        },
+    )
+
+
+# =============================================================================
+# Membership Application Views
+# =============================================================================
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_GET
+def membership_application_list_view(request: HttpRequest) -> HttpResponse:
+    """Display list of membership applications for admin review.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered membership application list page.
+
+    """
+    from apps.accounts.models import GuildMember
+
+    applications = MembershipApplication.objects.select_related("modified_by").order_by("-date_created")
+
+    # Build set of discord IDs still in the guild (date_left is null)
+    active_guild_ids = set(GuildMember.objects.filter(date_left__isnull=True).values_list("discord_id", flat=True))
+
+    # Get filter parameters
+    search_query = request.GET.get("q", "").strip()
+    status_filter = request.GET.get("status", "")
+    guild_filter = request.GET.get("guild", "")
+
+    # Get sort parameters
+    sort_by = request.GET.get("sort", "date_created")
+    sort_dir = request.GET.get("dir", "desc")
+
+    # Count applications by status (before filtering)
+    status_counts = {}
+    for status_choice in MembershipApplication.Status:
+        status_counts[status_choice.value] = applications.filter(status=status_choice.value).count()
+
+    # Apply search filter
+    if search_query:
+        applications = applications.filter(
+            Q(discord_username__icontains=search_query)
+            | Q(server_nickname__icontains=search_query)
+            | Q(first_name__icontains=search_query)
+            | Q(last_name__icontains=search_query)
+            | Q(discord_id__icontains=search_query)
+        )
+
+    # Apply status filter
+    if status_filter:
+        applications = applications.filter(status=status_filter)
+
+    # Apply guild membership filter
+    if guild_filter == "in":
+        applications = applications.filter(discord_id__in=active_guild_ids)
+    elif guild_filter == "left":
+        applications = applications.exclude(discord_id__in=active_guild_ids)
+
+    # Apply sorting
+    sort_mapping = {
+        "date_created": "date_created",
+        "date_modified": "date_modified",
+        "status": "status",
+        "discord_username": "discord_username",
+    }
+    if sort_by in sort_mapping:
+        order_field = sort_mapping[sort_by]
+        if sort_dir == "desc":
+            order_field = f"-{order_field}"
+        applications = applications.order_by(order_field)
+
+    return render(
+        request,
+        "team/application_list.html",
+        {
+            "applications": applications,
+            "active_guild_ids": active_guild_ids,
+            "search_query": search_query,
+            "status_filter": status_filter,
+            "guild_filter": guild_filter,
+            "status_choices": MembershipApplication.Status.choices,
+            "status_counts": status_counts,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+        },
+    )
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_http_methods(["GET", "POST"])
+def membership_application_admin_view(request: HttpRequest, pk: uuid.UUID) -> HttpResponse:
+    """Display and edit a membership application (admin view).
+
+    Args:
+        request: The HTTP request.
+        pk: UUID of the MembershipApplication.
+
+    Returns:
+        Rendered membership application admin page.
+
+    """
+    from constance import config
+
+    application = get_object_or_404(
+        MembershipApplication.objects.select_related("modified_by"),
+        pk=pk,
+    )
+
+    if request.method == "POST":
+        action = request.POST.get("action")
+
+        # Handle add_message action separately
+        if action == "add_message":
+            message_content = request.POST.get("message", "").strip()
+            if message_content:
+                application.add_message(request.user, message_content)
+                application.modified_by = request.user
+                application.save(update_fields=["messages", "modified_by"])
+                logfire.info(
+                    "Admin message added to application",
+                    application_id=str(pk),
+                    applicant_discord_id=application.discord_id,
+                    admin_id=request.user.id,
+                )
+                messages.success(request, "Message sent to applicant.")
+            else:
+                messages.warning(request, "Message cannot be empty.")
+            return redirect("team:application_admin", pk=pk)
+
+        # Handle regular form submission
+        old_status = application.status
+        old_admin_notes = application.admin_notes
+        form = MembershipApplicationAdminForm(request.POST, instance=application)
+        if form.is_valid():
+            app = form.save(commit=False)
+            app.modified_by = request.user
+            app.save()
+            logfire.info(
+                "Membership application updated by admin",
+                application_id=str(pk),
+                applicant_discord_id=application.discord_id,
+                old_status=old_status,
+                new_status=app.status,
+                admin_id=request.user.id,
+            )
+
+            # Send Discord notification based on what changed
+            admin_display = request.user.discord_nickname or request.user.first_name or request.user.username
+            status_changed = old_status != app.status
+            notes_changed = old_admin_notes != app.admin_notes
+            admin_url = request.build_absolute_uri(reverse("team:application_admin", kwargs={"pk": pk}))
+
+            if status_changed:
+                notify_application_update.enqueue(
+                    application_id=str(pk),
+                    update_type="status_changed",
+                    admin_name=admin_display,
+                    old_status=old_status,
+                    new_status=app.status,
+                    application_url=admin_url,
+                )
+            elif notes_changed:
+                notify_application_update.enqueue(
+                    application_id=str(pk),
+                    update_type="admin_notes",
+                    admin_name=admin_display,
+                    application_url=admin_url,
+                )
+
+            messages.success(request, f"Application for {application.display_name} updated.")
+            return redirect("team:application_list")
+    else:
+        form = MembershipApplicationAdminForm(instance=application)
+
+    return render(
+        request,
+        "team/application_admin.html",
+        {
+            "application": application,
+            "form": form,
+            "application_form_instructions": config.REGISTRATION_FORM_INSTRUCTIONS,
+        },
+    )
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_POST
+def membership_application_delete_view(request: HttpRequest, pk: uuid.UUID) -> HttpResponse:
+    """Delete a membership application.
+
+    Args:
+        request: The HTTP request.
+        pk: UUID of the MembershipApplication.
+
+    Returns:
+        Redirect to application list.
+
+    """
+    application = get_object_or_404(MembershipApplication, pk=pk)
+    display_name = application.display_name
+    # The registration's Zwift link is keyed by its UUID in the zauth service, and nothing
+    # can reach it once this row is gone.
+    links = release_application_zwift_links(MembershipApplication.objects.filter(pk=application.pk))
+    logfire.info(
+        "Membership application deleted",
+        application_id=str(pk),
+        applicant_discord_id=application.discord_id,
+        deleted_by_id=request.user.id,
+        zwift_link_removed=bool(links["removed"]),
+        zwift_link_failed=bool(links["failed"]),
+    )
+    application.delete()
+    messages.success(request, f"Registration for {display_name} has been deleted.")
+    if links["failed"]:
+        messages.warning(request, ZWIFT_LINK_NOT_RELEASED_MESSAGE)
+    return redirect("team:application_list")
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_POST
+def membership_application_bulk_delete_view(request: HttpRequest) -> HttpResponse:
+    """Delete multiple membership applications.
+
+    Args:
+        request: The HTTP request with 'selected' list of UUIDs.
+
+    Returns:
+        Redirect to application list.
+
+    """
+    selected_ids = request.POST.getlist("selected")
+    if not selected_ids:
+        messages.warning(request, "No registrations selected.")
+        return redirect("team:application_list")
+
+    applications = MembershipApplication.objects.filter(pk__in=selected_ids)
+    count = applications.count()
+    # Only the registrations that can hold a Zwift link are asked about (see the helper).
+    links = release_application_zwift_links(applications)
+    logfire.info(
+        "Bulk delete membership applications",
+        count=count,
+        application_ids=selected_ids,
+        deleted_by_id=request.user.id,
+        zwift_links_removed=links["removed"],
+        zwift_links_failed=links["failed"],
+    )
+    applications.delete()
+    messages.success(request, f"Deleted {count} registration{'' if count == 1 else 's'}.")
+    if links["failed"]:
+        messages.warning(request, ZWIFT_LINK_NOT_RELEASED_MESSAGE)
+    return redirect("team:application_list")
+
+
+@require_http_methods(["GET", "POST"])
+def membership_application_public_view(request: HttpRequest, pk: uuid.UUID) -> HttpResponse:
+    """Display and edit a membership application (public applicant view).
+
+    This view does not require login - it's accessed via UUID link sent to
+    the applicant by the Discord bot.
+
+    Args:
+        request: The HTTP request.
+        pk: UUID of the MembershipApplication.
+
+    Returns:
+        Rendered membership application public form page.
+
+    """
+    from constance import config
+
+    application = get_object_or_404(MembershipApplication, pk=pk)
+
+    # Check if application is still editable
+    if not application.is_editable:
+        # Show read-only view for approved/rejected applications
+        return render(
+            request,
+            "team/application_public.html",
+            {
+                "application": application,
+                "form": None,
+                "privacy_policy_url": config.PRIVACY_POLICY_URL,
+                "terms_of_service_url": config.TERMS_OF_SERVICE_URL,
+                "application_form_instructions": config.REGISTRATION_FORM_INSTRUCTIONS,
+            },
+        )
+
+    if request.method == "POST":
+        form = MembershipApplicationApplicantForm(request.POST, instance=application)
+        if form.is_valid():
+            # Capture all fields and identify which changed BEFORE save
+            changed_fields = {}
+            unchanged_fields = {}
+            changed_field_names = set(form.changed_data)
+
+            for field_name in form.fields:
+                # Get the value from cleaned_data
+                value = form.cleaned_data.get(field_name)
+                # Get human-readable label from the form field
+                label = form.fields[field_name].label or field_name.replace("_", " ").title()
+                # Format the value for display
+                display_value = _format_field_value_for_notification(field_name, value)
+
+                if field_name in changed_field_names:
+                    changed_fields[label] = display_value
+                else:
+                    # Only include non-empty unchanged fields
+                    if value not in (None, "", [], False):
+                        unchanged_fields[label] = display_value
+
+            # Add Zwift verification status (not part of form, handled via HTMX)
+            if application.zwift_verified and application.zwift_id:
+                zp_link = f"https://zwiftpower.com/profile.php?z={application.zwift_id}"
+                unchanged_fields["Zwift Account"] = f"Verified ([ZwiftPower]({zp_link}))"
+            elif application.zwift_id:
+                unchanged_fields["Zwift Account"] = f"ID: {application.zwift_id} (not verified)"
+            else:
+                unchanged_fields["Zwift Account"] = "Not linked"
+
+            form.save()
+            logfire.info(
+                "Membership application updated by applicant",
+                application_id=str(pk),
+                applicant_discord_id=application.discord_id,
+                is_complete=application.is_complete,
+                changed_field_count=len(changed_fields),
+            )
+
+            # Send Discord notification for applicant update (only if something changed)
+            if changed_fields:
+                admin_url = request.build_absolute_uri(reverse("team:application_admin", kwargs={"pk": pk}))
+                notify_application_update.enqueue(
+                    application_id=str(pk),
+                    update_type="applicant_updated",
+                    application_url=admin_url,
+                    changed_fields=changed_fields,
+                    unchanged_fields=unchanged_fields,
+                )
+
+            messages.success(request, "Your application has been updated. Thank you!")
+            return redirect("team:application_public", pk=pk)
+    else:
+        form = MembershipApplicationApplicantForm(instance=application)
+
+    # Pick up a Zwift OAuth (zauth) connection completed on the return trip from
+    # the service. Skipped once verified so the public page isn't making a service
+    # call on every load.
+    if not application.zwift_verified:
+        if request.GET.get("status"):
+            # Back from Zwift's consent page: read afresh even if a read failed moments ago.
+            zwift_client.forget_status_failure(str(application.pk))
+        _sync_application_zauth(application)
+
+    return render(
+        request,
+        "team/application_public.html",
+        {
+            "application": application,
+            "form": form,
+            "zauth_configured": zwift_client.is_configured(),
+            "privacy_policy_url": config.PRIVACY_POLICY_URL,
+            "terms_of_service_url": config.TERMS_OF_SERVICE_URL,
+            "application_form_instructions": config.REGISTRATION_FORM_INSTRUCTIONS,
+        },
+    )
+
+
+def _sync_application_zauth(application: MembershipApplication) -> bool:
+    """Stamp an application's Zwift verification from the zauth service.
+
+    The service keys connections by an arbitrary app-side string, so an
+    application uses its own UUID rather than a user PK (it has no User yet).
+    ``reconcile_all`` ignores non-numeric ids, so these never collide with the
+    per-user reconcile.
+
+    Args:
+        application: The application to reconcile.
+
+    Returns:
+        The application's ``zwift_verified`` state after the sync.
+
+    """
+    status = zwift_client.get_connection_status(str(application.pk))
+    if not status or not status.get("connected"):
+        return application.zwift_verified
+
+    # Same rule as the user-side grant: no usable official zwid, no verification.
+    zwid = str(status.get("zwid") or "").strip()
+    if not zwid.isdigit() or int(zwid) <= 0:
+        logfire.warning(
+            "zauth connected but reported no usable zwid for application",
+            application_id=str(application.pk),
+        )
+        return application.zwift_verified
+
+    fields = []
+    if application.zwift_id != zwid:
+        application.zwift_id = zwid
+        fields.append("zwift_id")
+    if not application.zwift_verified:
+        application.zwift_verified = True
+        fields.append("zwift_verified")
+    if fields:
+        application.save(update_fields=fields)
+        logfire.info(
+            "Zwift account verified via zauth for application",
+            application_id=str(application.pk),
+            applicant_discord_id=application.discord_id,
+            zwift_id=zwid,
+        )
+    return application.zwift_verified
+
+
+@require_POST
+def application_zauth_connect(request: HttpRequest, pk: uuid.UUID) -> HttpResponse:
+    """Start the Zwift OAuth connect flow for a membership application.
+
+    No login required — as with the rest of this page, knowing the application
+    UUID is the credential. The service is keyed by that same UUID.
+
+    Args:
+        request: The HTTP request.
+        pk: UUID of the MembershipApplication.
+
+    Returns:
+        A redirect to the Zwift consent URL, or back to the application on error.
+
+    """
+    application = get_object_or_404(MembershipApplication, pk=pk)
+    if not application.is_editable:
+        messages.error(request, "This application is no longer editable.")
+        return redirect("team:application_public", pk=pk)
+
+    return_url = request.build_absolute_uri(reverse("team:application_public", kwargs={"pk": pk}))
+    authorize_url = zwift_client.get_authorize_url(str(application.pk), return_url)
+    if not authorize_url:
+        logfire.error("Could not start Zwift connect for application", application_id=str(pk))
+        messages.error(request, "Could not start the Zwift connection right now. Please try again later.")
+        return redirect("team:application_public", pk=pk)
+    return redirect(authorize_url)
+
+
+def _get_filtered_guild_members(request: HttpRequest) -> dict:
+    """Filter and enrich guild members based on request query parameters.
+
+    Args:
+        request: The HTTP request with filter/sort query params.
+
+    Returns:
+        Dict with members_list and all filter/sort context values.
+
+    """
+    from apps.accounts.models import GuildMember
+    from apps.accounts.services import annotate_never_seen, never_seen_in_guild
+    from apps.team.models import DiscordRole
+
+    # never_seen marks the departed rows the sync wrote for accounts it has never listed, which
+    # are not departures and must not read as "Left" here or in the CSV.
+    members = annotate_never_seen(GuildMember.objects.select_related("user").all())
+
+    all_roles = DiscordRole.objects.all()
+    role_lookup = {role.role_id: role for role in all_roles}
+
+    search_query = request.GET.get("q", "").strip()
+    join_from = request.GET.get("join_from", "").strip()
+    join_to = request.GET.get("join_to", "").strip()
+    left_status = request.GET.get("left_status", "")
+    is_bot_filter = request.GET.get("is_bot", "")
+    role_filters = request.GET.getlist("role")
+    exclude_roles = request.GET.getlist("exclude_roles")
+    account_status = request.GET.get("account_status", "")
+    sort_by = request.GET.get("sort", "joined_at")
+    sort_dir = request.GET.get("dir", "desc")
+
+    if search_query:
+        members = members.filter(
+            Q(username__icontains=search_query)
+            | Q(display_name__icontains=search_query)
+            | Q(nickname__icontains=search_query)
+        )
+
+    if join_from:
+        try:
+            from_date = datetime.strptime(join_from, "%Y-%m-%d").replace(tzinfo=timezone.UTC)
+            members = members.filter(joined_at__gte=from_date)
+        except ValueError:
+            pass
+
+    if join_to:
+        try:
+            to_date = datetime.strptime(join_to, "%Y-%m-%d").replace(tzinfo=timezone.UTC)
+            to_date = to_date.replace(hour=23, minute=59, second=59)
+            members = members.filter(joined_at__lte=to_date)
+        except ValueError:
+            pass
+
+    if left_status == "active":
+        members = members.filter(date_left__isnull=True)
+    elif left_status == "left":
+        members = members.filter(date_left__isnull=False).exclude(never_seen_in_guild())
+    elif left_status == "never_seen":
+        members = members.filter(never_seen_in_guild())
+
+    if is_bot_filter == "yes":
+        members = members.filter(is_bot=True)
+    elif is_bot_filter == "no":
+        members = members.filter(is_bot=False)
+
+    if account_status == "linked":
+        members = members.filter(user__isnull=False)
+    elif account_status == "unlinked":
+        members = members.filter(user__isnull=True)
+
+    if role_filters:
+        role_q = Q()
+        for role_id in role_filters:
+            role_q |= Q(roles__contains=role_id)
+        members = members.filter(role_q)
+
+    if exclude_roles:
+        for excluded_role_id in exclude_roles:
+            members = members.exclude(roles__contains=excluded_role_id)
+
+    sort_mapping = {
+        "username": "username",
+        "nickname": "nickname",
+        "joined_at": "joined_at",
+        "date_left": "date_left",
+        "is_bot": "is_bot",
+    }
+    if sort_by in sort_mapping:
+        order_field = sort_mapping[sort_by]
+        if sort_dir == "desc":
+            order_field = f"-{order_field}"
+        members = members.order_by(order_field)
+
+    members_list = list(members)
+
+    # Build ZP/ZR lookup by zwid for linked users
+    linked_zwids = [m.user.zwid for m in members_list if m.user and m.user.zwid]
+    zp_by_zwid = {}
+    zr_by_zwid = {}
+    if linked_zwids:
+        zp_by_zwid = {zp.zwid: zp for zp in ZPTeamRiders.objects.filter(zwid__in=linked_zwids)}
+        zr_by_zwid = {zr.zwid: zr for zr in ZRRider.objects.filter(zwid__in=linked_zwids)}
+    velo2_by_zwid = velo2_categories_by_zwid((m.user.zwid, m.user.gender) for m in members_list if m.user)
+
+    for member in members_list:
+        role_names = []
+        for role_id in member.roles or []:
+            role = role_lookup.get(str(role_id))
+            if role:
+                role_names.append(role.name)
+            else:
+                role_names.append(f"Unknown ({role_id})")
+        member.role_names_display = ", ".join(role_names) if role_names else "No roles"
+        member.role_count = len(member.roles or [])
+
+        # Enrich linked users with ZP/ZR tooltip data
+        if member.user and member.user.zwid:
+            zwid = member.user.zwid
+            zp = zp_by_zwid.get(zwid)
+            zr = zr_by_zwid.get(zwid)
+            user = member.user
+            member.tooltip_display_name = (
+                user.discord_nickname or user.get_full_name() or user.discord_username or member.username
+            )
+            member.tooltip_user_id = member.user.id
+            member.tooltip_discord_id = member.user.discord_id
+            member.tooltip_discord_avatar_url = member.user.discord_avatar_url
+            member.tooltip_zwid = zwid
+            member.tooltip_is_race_ready = member.user.is_race_ready
+            member.tooltip_is_extra_verified = member.user.is_extra_verified
+            member.tooltip_in_zwiftpower = zp is not None
+            member.tooltip_in_zwiftracing = zr is not None
+            member.tooltip_zp_category = ZP_DIV_TO_CATEGORY.get(zp.div, "") if zp else ""
+            member.tooltip_zp_category_w = ZP_DIV_TO_CATEGORY.get(zp.divw, "") if zp and hasattr(zp, "divw") else ""
+            member.tooltip_zr_category = (zr.race_current_category or "") if zr else ""
+            member.tooltip_zr_v2_category = velo2_by_zwid[zwid].mixed if zwid in velo2_by_zwid else ""
+            member.tooltip_zr_rating = zr.race_current_rating if zr else ""
+            member.tooltip_zr_phenotype = (zr.phenotype_value or "") if zr else ""
+        elif member.user:
+            user = member.user
+            member.tooltip_display_name = (
+                user.discord_nickname or user.get_full_name() or user.discord_username or member.username
+            )
+            member.tooltip_user_id = member.user.id
+            member.tooltip_discord_id = member.user.discord_id
+            member.tooltip_discord_avatar_url = member.user.discord_avatar_url
+            member.tooltip_zwid = None
+            member.tooltip_is_race_ready = member.user.is_race_ready
+            member.tooltip_is_extra_verified = member.user.is_extra_verified
+            member.tooltip_in_zwiftpower = False
+            member.tooltip_in_zwiftracing = False
+            member.tooltip_zp_category = ""
+            member.tooltip_zp_category_w = ""
+            member.tooltip_zr_category = ""
+            member.tooltip_zr_v2_category = ""
+            member.tooltip_zr_rating = ""
+            member.tooltip_zr_phenotype = ""
+
+    if sort_by == "role_count":
+        reverse = sort_dir == "desc"
+        members_list = sorted(members_list, key=lambda m: m.role_count, reverse=reverse)
+
+    return {
+        "members": members_list,
+        "search_query": search_query,
+        "join_from": join_from,
+        "join_to": join_to,
+        "left_status": left_status,
+        "is_bot_filter": is_bot_filter,
+        "account_status": account_status,
+        "role_filters": role_filters,
+        "exclude_roles": exclude_roles,
+        "all_roles": all_roles.order_by("position"),
+        "sort_by": sort_by,
+        "sort_dir": sort_dir,
+    }
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_GET
+def discord_review_view(request: HttpRequest) -> HttpResponse:
+    """Review and audit Discord guild members.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered Discord review page.
+
+    """
+    context = _get_filtered_guild_members(request)
+
+    logfire.debug(
+        "Discord review page loaded",
+        user_id=request.user.id,
+        total_members=len(context["members"]),
+        filters={
+            "search": context["search_query"],
+            "join_from": context["join_from"],
+            "join_to": context["join_to"],
+            "left_status": context["left_status"],
+            "is_bot": context["is_bot_filter"],
+            "account_status": context["account_status"],
+            "roles": context["role_filters"],
+            "exclude_roles": context["exclude_roles"],
+        },
+    )
+
+    return render(request, "team/discord_review.html", context)
+
+
+def _zwift_connections_csv(rows: list[dict]) -> HttpResponse:
+    """Render assembled Zwift-connection rows as a CSV download.
+
+    Takes the rows the page already built, so the file always matches what the filters
+    are showing. Datetimes are written as ISO-8601 UTC rather than the page's localised
+    display strings -- a spreadsheet can parse the former.
+
+    Args:
+        rows: The filtered, sorted rows from :func:`zwift_connections_view`.
+
+    Returns:
+        A ``text/csv`` response with a Content-Disposition attachment.
+
+    """
+    stamp = timezone.now().strftime("%Y%m%d-%H%M")
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = f'attachment; filename="zwift-connections-{stamp}.csv"'
+
+    writer = csv.writer(response)
+    writer.writerow([
+        "Name", "Discord", "Username", "ZWID", "Status", "Verified", "Verified at",
+        "Connected", "Connected at", "Service ZWID", "Zwift name", "Category", "Women's category",
+    ])
+    for row in rows:
+        user = row["user"]
+        writer.writerow([
+            user.get_full_name() or "",
+            user.discord_username or "",
+            user.username,
+            row["zwid"] or "",
+            row["bucket"],
+            "yes" if row["verified"] else "no",
+            row["verified_at"].isoformat() if row["verified_at"] else "",
+            "yes" if row["connected"] else "no",
+            row["connected_at"] or "",
+            row["service_zwid"] or "",
+            row["zwift_name"] or "",
+            row["category"] or "",
+            row["category_women"] or "",
+        ])
+    return response
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_GET
+def zwift_connections_view(request: HttpRequest) -> HttpResponse:
+    """Report how each member verified their Zwift account, and who has not.
+
+    Lists every Discord-linked member with their verification method, joined to
+    the zauth service's live connection list. Drives the migration off the legacy
+    password flow: the "Legacy" and "Not verified" counts are what has to reach
+    zero before ``ZAUTH_VERIFICATION_REQUIRED`` can be turned on.
+
+    Service connections that match no local user (including membership
+    applications, which key on their own UUID) are listed separately rather than
+    dropped, so they stay visible to an admin.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered Zwift verification admin page.
+
+    """
+    configured = zwift_client.is_configured()
+    connections = zwift_client.list_connections() if configured else None
+    service_error = configured and connections is None
+
+    connections = connections or []
+    by_user_id: dict[str, dict] = {}
+    unmatched: list[dict] = []
+    for conn in connections:
+        raw_id = str(conn.get("user_id", ""))
+        if raw_id.isdigit():
+            by_user_id[raw_id] = conn
+        else:
+            unmatched.append(conn)
+
+    members = User.objects.filter(is_active=True).exclude(discord_id="").order_by("first_name", "last_name", "username")
+
+    method_filter = request.GET.get("method", "")
+    connected_filter = request.GET.get("connected", "")
+    search = request.GET.get("q", "").strip()
+
+    counts = {"total": 0, "zauth": 0, "legacy": 0, "admin": 0, "unmethoded": 0, "unverified": 0, "connected": 0}
+    rows = []
+    for user in members:
+        conn = by_user_id.pop(str(user.pk), None)
+        method = user.zwid_verification_method or ""
+        # Verified with no method recorded: the retired self-serve password flow
+        # never stamped one, so these predate (or slipped past) the migration.
+        bucket = method if method else ("unmethoded" if user.zwid_verified else "unverified")
+        counts["total"] += 1
+        counts[bucket] = counts.get(bucket, 0) + 1
+        if conn:
+            counts["connected"] += 1
+
+        if method_filter and bucket != method_filter:
+            continue
+        if connected_filter == "yes" and not conn:
+            continue
+        if connected_filter == "no" and conn:
+            continue
+        if search:
+            haystack = " ".join(
+                filter(None, [user.get_full_name(), user.discord_username, user.username, str(user.zwid or "")])
+            ).lower()
+            if search.lower() not in haystack:
+                continue
+
+        rows.append({
+            "user": user,
+            "bucket": bucket,
+            "method": method,
+            "verified": user.zwid_verified,
+            "verified_at": user.zwid_verified_at,
+            "zwid": user.zwid,
+            "connected": bool(conn),
+            "connected_at": conn.get("connected_at") if conn else None,
+            "service_zwid": conn.get("zwid") if conn else None,
+            "zwift_name": conn.get("zwift_name") if conn else None,
+            "category": conn.get("category") if conn else None,
+            "category_women": conn.get("category_women") if conn else None,
+        })
+
+    # Sorting runs over the assembled rows rather than the queryset: the bucket and
+    # every connection column come from the service, not the database. Keys must
+    # never return None — a null mixed with dates or ints raises TypeError in sorted().
+    sort_by = request.GET.get("sort", "name")
+    sort_dir = request.GET.get("dir", "asc")
+    # Ordered by migration priority so sorting groups "still to do" together rather
+    # than alphabetically, where "admin" and "unverified" would sit side by side.
+    bucket_rank = {"unverified": 0, "unmethoded": 1, "legacy": 2, "admin": 3, "zauth": 4}
+    sort_keys = {
+        "name": lambda r: (r["user"].get_full_name() or r["user"].username).lower(),
+        "discord": lambda r: (r["user"].discord_username or "").lower(),
+        "method": lambda r: bucket_rank.get(r["bucket"], 99),
+        "verified_at": lambda r: r["verified_at"].timestamp() if r["verified_at"] else 0.0,
+        "zwid": lambda r: r["zwid"] or 0,
+        "connected": lambda r: r["connected"],
+        "zwift_name": lambda r: (r["zwift_name"] or "").lower(),
+        "category": lambda r: (r["category"] or "").lower(),
+    }
+    if sort_by in sort_keys:
+        rows.sort(key=sort_keys[sort_by], reverse=sort_dir == "desc")
+
+    # The export deliberately re-uses this very code path rather than a parallel
+    # implementation: it hangs off the same query string, so what downloads is exactly
+    # the rows on screen. A separate view would be free to drift from the filters.
+    if request.GET.get("export") == "csv":
+        logfire.info(
+            "Zwift verification report exported",
+            user_id=request.user.id,
+            rows=len(rows),
+            filters={"q": search, "method": method_filter, "connected": connected_filter},
+        )
+        return _zwift_connections_csv(rows)
+
+    # Anything left in by_user_id is a numeric id with no matching active member
+    # (deactivated, or the user was deleted); surface those alongside the UUIDs.
+    orphans = unmatched + list(by_user_id.values())
+
+    # Lets the sort links carry the active filters instead of resetting them.
+    active_filters = {"q": search, "method": method_filter, "connected": connected_filter}
+    filter_qs = urlencode({k: v for k, v in active_filters.items() if v})
+
+    # Built from the live query string, not just the filters, so the download honours
+    # the current sort too and cannot fall out of step with the sort links.
+    export_params = request.GET.copy()
+    export_params["export"] = "csv"
+    export_qs = export_params.urlencode()
+
+    logfire.info(
+        "Zwift verification report viewed",
+        user_id=request.user.id,
+        shown=len(rows),
+        total=counts["total"],
+        zauth=counts["zauth"],
+        legacy=counts["legacy"],
+        unverified=counts["unverified"],
+    )
+    return render(
+        request,
+        "team/zwift_connections.html",
+        {
+            "configured": configured,
+            "service_error": service_error,
+            "rows": rows,
+            "orphans": orphans,
+            "counts": counts,
+            "method_filter": method_filter,
+            "connected_filter": connected_filter,
+            "search_query": search,
+            "sort_by": sort_by,
+            "sort_dir": sort_dir,
+            "filter_qs": filter_qs,
+            "export_qs": export_qs,
+            # Column order here drives the table header; keys must match sort_keys.
+            "sortable_columns": [
+                ("name", "Member"),
+                ("discord", "Discord"),
+                ("method", "Verification"),
+                ("verified_at", "Verified on"),
+                ("zwid", "Zwift ID"),
+                ("connected", "Connected"),
+                ("zwift_name", "Zwift name"),
+                ("category", "Category"),
+            ],
+            "method_choices": [
+                ("zauth", "Zwift OAuth (zauth)"),
+                ("legacy", "Legacy (Sauce mod)"),
+                ("admin", "Admin (manual)"),
+                ("unmethoded", "Verified, no method"),
+                ("unverified", "Not verified"),
+            ],
+        },
+    )
+
+
+@login_required
+@discord_permission_required("membership_admin", raise_exception=True)
+@require_GET
+def discord_review_export_csv(request: HttpRequest) -> HttpResponse:
+    """Export filtered Discord guild members as CSV.
+
+    Args:
+        request: The HTTP request with filter/sort query params.
+
+    Returns:
+        CSV file response.
+
+    """
+    import csv
+
+    context = _get_filtered_guild_members(request)
+    members_list = context["members"]
+
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = 'attachment; filename="discord_review.csv"'
+
+    writer = csv.writer(response)
+    writer.writerow([
+        "Username",
+        "Display Name",
+        "Nickname",
+        "Discord ID",
+        "Joined",
+        "Status",
+        "Date Left",
+        "Type",
+        "Roles",
+        "Account",
+        "ZWID",
+        "Race Verified",
+        "ZP Category",
+        "ZP Category (W)",
+        "ZR Category",
+        "ZR Rating",
+        "ZR Phenotype",
+    ])
+
+    for member in members_list:
+        if member.never_seen:
+            status = "Never seen in the server"
+        elif member.date_left:
+            status = "Left"
+        else:
+            status = "Active"
+        member_type = "Bot" if member.is_bot else "User"
+        account_name = getattr(member, "tooltip_display_name", "") if member.user else ""
+        zwid = getattr(member, "tooltip_zwid", "") or ""
+        race_verified = ""
+        if member.user:
+            if getattr(member, "tooltip_is_extra_verified", False):
+                race_verified = "Extra"
+            elif getattr(member, "tooltip_is_race_ready", False):
+                race_verified = "Yes"
+            else:
+                race_verified = "No"
+
+        writer.writerow([
+            csv_safe(member.username),
+            csv_safe(member.display_name),
+            csv_safe(member.nickname),
+            member.discord_id,
+            member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "",
+            status,
+            member.date_left.strftime("%Y-%m-%d") if member.date_left else "",
+            member_type,
+            csv_safe(member.role_names_display),
+            csv_safe(account_name),
+            zwid,
+            race_verified,
+            getattr(member, "tooltip_zp_category", ""),
+            getattr(member, "tooltip_zp_category_w", ""),
+            getattr(member, "tooltip_zr_category", ""),
+            getattr(member, "tooltip_zr_rating", ""),
+            getattr(member, "tooltip_zr_phenotype", ""),
+        ])
+
+    logfire.info(
+        "Discord review CSV exported",
+        user_id=request.user.id,
+        row_count=len(members_list),
+    )
+
+    return response
+
+
+@require_POST
+def application_unverify_zwift(request: HttpRequest, pk: uuid.UUID) -> HttpResponse:
+    """Remove Zwift verification from a membership application.
+
+    Severs the registration's zauth link first: the public page re-reads the service on
+    every load while the registration is unverified, so clearing the local fields alone
+    would be undone the next time the page opened.
+
+    The local fields are only cleared once the service has confirmed there is no link
+    left. They are what tells a later deletion that this registration may hold one, so
+    clearing them while the link survived would leave it behind when the row goes.
+
+    Args:
+        request: The HTTP request.
+        pk: UUID of the MembershipApplication.
+
+    Returns:
+        Rendered Zwift status partial for HTMX requests.
+
+    """
+    application = get_object_or_404(MembershipApplication, pk=pk)
+
+    # Only allow modification if application is editable
+    if not application.is_editable:
+        return render(
+            request,
+            "team/partials/application_zwift_status.html",
+            {"application": application},
+        )
+
+    link = zwift_client.disconnect_link(str(application.pk))
+    if link not in (zwift_client.DisconnectOutcome.REMOVED, zwift_client.DisconnectOutcome.NO_LINK):
+        logfire.warning(
+            "Zwift removal refused for application: the link could not be confirmed removed",
+            application_id=str(pk),
+            applicant_discord_id=application.discord_id,
+            zwift_link_outcome=str(link),
+        )
+        return render(
+            request,
+            "team/partials/application_zwift_status.html",
+            {
+                "application": application,
+                "zwift_remove_error": "We couldn't reach Zwift to disconnect your account. Please try again later.",
+            },
+        )
+
+    old_zwift_id = application.zwift_id
+    application.zwift_id = ""
+    application.zwift_verified = False
+    application.save(update_fields=["zwift_id", "zwift_verified"])
+    logfire.info(
+        "Zwift verification removed from application",
+        application_id=str(pk),
+        applicant_discord_id=application.discord_id,
+        old_zwift_id=old_zwift_id,
+        zwift_link_removed=link is zwift_client.DisconnectOutcome.REMOVED,
+    )
+
+    return render(
+        request,
+        "team/partials/application_zwift_status.html",
+        {"application": application},
+    )
+
+
+@login_required
+@team_member_required()
+@require_GET
+def squad_expiring_modal_view(request: HttpRequest) -> HttpResponse:
+    """List the squad-mates behind the captain banner, grouped by squad.
+
+    Loaded on click rather than rendered into every page: the banner needs a count, this
+    needs names, days and links, and a captain who never opens it should not pay for it.
+
+    No extra permission gate beyond team membership, because the query itself is the gate --
+    ``squad_expiring_summary`` only ever returns squads where THIS user is a captain or
+    vice-captain. A member of no such squad gets an empty list, not someone else's roster.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        The rendered modal body partial.
+
+    """
+    summary = squad_expiring_summary(request.user)
+    # Seed the banner's cache with the count we just computed. Rendering this partial runs the
+    # squad_expiring_verifications context processor, which on a miss would compute the very
+    # same summary a second time -- doubling a cold modal open. Same key, same payload shape
+    # and same sentinel (``False`` means "computed, nothing to remind about").
+    count = summary["rider_count"]
+    cache.set(
+        f"{SQUAD_EXPIRING_CACHE_PREFIX}:{request.user.pk}",
+        {"count": count} if count else False,
+        SQUAD_EXPIRING_CACHE_TIMEOUT,
+    )
+    logfire.info(
+        "Squad expiring verification modal viewed",
+        user_id=request.user.id,
+        squads=len(summary["squads"]),
+        riders=count,
+    )
+    return render(request, "team/partials/_squad_expiring_modal.html", summary)

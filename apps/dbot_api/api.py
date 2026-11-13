@@ -1,0 +1,1330 @@
+"""Discord Bot API endpoints."""
+
+import hmac
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import logfire
+from constance import config as constance_config
+from django.db.models import Q
+from django.http import HttpRequest  # noqa: TC002  # Django Ninja resolves endpoint annotations at runtime
+from django.urls import reverse
+from django.utils import timezone
+from ninja import NinjaAPI, Schema
+from ninja.security import APIKeyHeader
+
+from apps.accounts.models import User, YouTubeVideo
+from apps.dbot_api.models import BotStats
+from apps.magic_links.models import MagicLink
+from apps.team.models import DiscordChannel, DiscordRole, MembershipApplication, RosterFilter
+from apps.zwiftpower.models import ZPTeamRiders
+from apps.zwiftpower.tasks import update_team_results, update_team_riders
+from apps.zwiftracing.models import ZRRider
+
+
+def _get_verification_status(user: User) -> dict:
+    """Get weight/height/power verification status for a user.
+
+    Args:
+        user: The user to check verification for.
+
+    Returns:
+        Dict with verification status for each type.
+
+    """
+    result = {}
+    for verify_type in ["weight_full", "weight_light", "height", "power"]:
+        # Get the most recent verified record
+        verified_record = user.race_ready_records.filter(
+            verify_type=verify_type, status="verified"
+        ).first()
+
+        # Check if there's a pending record
+        pending_record = user.race_ready_records.filter(
+            verify_type=verify_type, status="pending"
+        ).first()
+
+        if verified_record:
+            verified_date = (
+                verified_record.reviewed_date.isoformat() if verified_record.reviewed_date else None
+            )
+            # If verified record is expired AND there's a pending record, show pending
+            if verified_record.is_expired and pending_record:
+                result[verify_type] = {
+                    "verified": False,
+                    "verified_date": verified_date,
+                    "days_remaining": verified_record.days_remaining,
+                    "is_expired": True,
+                    "status": "Pending (expired)",
+                    "has_pending": True,
+                    "pending_date": pending_record.date_created.isoformat(),
+                }
+            else:
+                # Normal verified record (valid or expired without pending)
+                result[verify_type] = {
+                    "verified": True,
+                    "verified_date": verified_date,
+                    "days_remaining": verified_record.days_remaining,
+                    "is_expired": verified_record.is_expired,
+                    "status": verified_record.validity_status,
+                    "has_pending": pending_record is not None,
+                }
+        elif pending_record:
+            # No verified record but has pending
+            result[verify_type] = {
+                "verified": False,
+                "verified_date": None,
+                "days_remaining": None,
+                "is_expired": False,
+                "status": "Pending",
+                "has_pending": True,
+                "pending_date": pending_record.date_created.isoformat(),
+            }
+        else:
+            # No records at all
+            result[verify_type] = {
+                "verified": False,
+                "verified_date": None,
+                "days_remaining": None,
+                "is_expired": False,
+                "status": "No record",
+                "has_pending": False,
+            }
+    return result
+
+
+class DiscordRoleSchema(Schema):
+    """Schema for a Discord role from the bot."""
+
+    id: str
+    name: str
+    color: int = 0
+    position: int = 0
+    managed: bool = False
+    mentionable: bool = False
+
+
+class SyncGuildRolesRequest(Schema):
+    """Request schema for syncing all guild roles."""
+
+    roles: list[DiscordRoleSchema]
+
+
+class SyncUserRolesRequest(Schema):
+    """Request schema for syncing a user's roles."""
+
+    role_ids: list[str]
+
+
+class GuildMemberSchema(Schema):
+    """Schema for a Discord guild member from the bot."""
+
+    discord_id: str
+    username: str
+    display_name: str = ""
+    nickname: str = ""
+    avatar_hash: str = ""
+    roles: list[str] = []  # noqa: RUF012
+    joined_at: str | None = None  # ISO format datetime
+    is_bot: bool = False
+
+
+class SyncGuildMembersRequest(Schema):
+    """Request schema for syncing all guild members.
+
+    ``observed_at`` is optional: an ISO-8601 UTC timestamp of when the bot read the member
+    list. Typed loosely on purpose -- a missing or unreadable value falls back to the
+    platform's own clock rather than refusing the whole push.
+    """
+
+    members: list[GuildMemberSchema]
+    observed_at: Any = None
+
+
+class MemberLeftRequest(Schema):
+    """Request schema for the bot's report that a member left the guild.
+
+    Every field is optional (``{}`` is a valid body): they only fill in a ``GuildMember`` row
+    when the platform has none for that Discord id. ``null`` reads as blank.
+    """
+
+    username: str | None = None
+    display_name: str | None = None
+    avatar_hash: str | None = None
+    is_bot: bool | None = None
+
+
+class CreateRosterFilterRequest(Schema):
+    """Request schema for creating a filtered roster link."""
+
+    discord_ids: list[str]
+    channel_name: str = ""
+
+
+class MembershipApplicationCreateSchema(Schema):
+    """Schema for creating a membership application."""
+
+    discord_id: str
+    discord_username: str
+    server_nickname: str = ""
+    avatar_url: str = ""
+    guild_avatar_url: str = ""
+    discord_user_data: dict = {}  # noqa: RUF012
+    discord_member_data: dict = {}  # noqa: RUF012
+    modal_form_data: dict = {}  # noqa: RUF012
+    first_name: str = ""
+    last_name: str = ""
+    applicant_notes: str = ""
+
+
+class DiscordChannelSchema(Schema):
+    """Schema for a Discord channel from the bot."""
+
+    id: str
+    name: str
+    type: int = 0
+    position: int = 0
+    category_id: str = ""
+    category_name: str = ""
+
+
+class SyncGuildChannelsRequest(Schema):
+    """Request schema for syncing all guild channels."""
+
+    channels: list[DiscordChannelSchema]
+
+
+class DBotAuth(APIKeyHeader):
+    r"""API key authentication via X-API-Key, X-Guild-Id, and X-Discord-User-Id headers.
+
+    Required headers::
+
+        X-API-Key: <DBOT_AUTH_KEY value>
+        X-Guild-Id: <Discord guild/server ID>
+        X-Discord-User-Id: <Discord user ID who triggered the command>
+
+    Example:
+        curl -H "X-API-Key: your-secret-key" \
+             -H "X-Guild-Id: 123456789012345678" \
+             -H "X-Discord-User-Id: 987654321098765432" \
+             http://localhost:8000/api/dbot/zwiftpower_profile/12345
+
+    """
+
+    param_name = "X-API-Key"
+
+    def authenticate(self, request: HttpRequest, key: str | None) -> dict | None:
+        """Authenticate request using API key, guild ID, and Discord user ID.
+
+        Args:
+            request: The HTTP request.
+            key: The API key from the header.
+
+        Returns:
+            Dict with auth info if valid, None otherwise.
+
+        """
+        # Verify API key. Constant-time: a plain `!=` returns as soon as two bytes
+        # differ, which leaks the shared secret a character at a time to anyone who
+        # can time the responses. The empty-key refusal stays -- an unconfigured
+        # DBOT_AUTH_KEY must not authenticate a caller who also sends nothing.
+        expected_key = constance_config.DBOT_AUTH_KEY
+        if not expected_key or not key or not hmac.compare_digest(key.encode(), expected_key.encode()):
+            logfire.warning(
+                "Discord bot API auth failed: invalid API key",
+                path=request.path,
+            )
+            return None
+
+        # Verify guild_id header matches configured GUILD_ID
+        guild_id = request.headers.get("X-Guild-Id")
+        if not guild_id:
+            logfire.warning(
+                "Discord bot API auth failed: missing guild ID",
+                path=request.path,
+            )
+            return None
+
+        # Get Discord user ID (required for logging)
+        discord_user_id = request.headers.get("X-Discord-User-Id")
+        if not discord_user_id:
+            logfire.warning(
+                "Discord bot API auth failed: missing Discord user ID",
+                path=request.path,
+            )
+            return None
+
+        try:
+            # Verify guild_id matches the configured guild
+            if int(guild_id) != constance_config.GUILD_ID:
+                logfire.warning(
+                    "Discord bot API auth failed: guild ID mismatch",
+                    path=request.path,
+                    provided_guild_id=guild_id,
+                )
+                return None
+
+            # Log the API request
+            BotStats.objects.create(
+                discord_id=discord_user_id,
+                discord_guild_id=guild_id,
+                api=request.path,
+            )
+
+            return {
+                "api_key": key,
+                "guild_id": guild_id,
+                "discord_user_id": discord_user_id,
+            }
+        except ValueError:
+            logfire.warning(
+                "Discord bot API auth failed: invalid guild ID format",
+                path=request.path,
+                guild_id=guild_id,
+            )
+            return None
+
+
+api = NinjaAPI(auth=DBotAuth(), urls_namespace="dbot_api")
+
+
+@api.get("/bot_config")
+def get_bot_config(request: HttpRequest) -> dict:
+    """Get bot configuration settings from constance.
+
+    Returns configuration values the Discord bot needs to operate.
+    The bot should fetch this on startup and periodically (every hour).
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object with bot configuration settings.
+
+    """
+    return {
+        "upgrade_channel": str(constance_config.UPGRADE_CHANNEL) if constance_config.UPGRADE_CHANNEL else None,
+        "new_arrivals_channel_id": (
+            str(constance_config.NEW_ARRIVALS_CHANNEL_ID) if constance_config.NEW_ARRIVALS_CHANNEL_ID else None
+        ),
+        "team_member_role_id": (
+            str(constance_config.TEAM_MEMBER_ROLE_ID) if constance_config.TEAM_MEMBER_ROLE_ID else None
+        ),
+        "race_ready_role_id": (
+            str(constance_config.RACE_READY_ROLE_ID) if constance_config.RACE_READY_ROLE_ID else None
+        ),
+        "new_arrival_message_public": constance_config.NEW_ARRIVAL_MESSAGE_PUBLIC or None,
+        "new_arrival_message_private": constance_config.NEW_ARRIVAL_MESSAGE_PRIVATE or None,
+        "send_new_arrival_dm": constance_config.SEND_NEW_ARRIVAL_DM,
+        "help_message": constance_config.HELP_MESSAGE or None,
+    }
+
+
+@api.get("/zwiftpower_profile/{zwid}")
+def get_zwiftpower_profile(request: HttpRequest, zwid: int) -> dict:
+    """Get ZwiftPower profile for a rider by zwid.
+
+    Args:
+        request: The HTTP request.
+        zwid: The Zwift ID to look up.
+
+    Returns:
+        JSON object with rider data or error message.
+
+    """
+    try:
+        rider = ZPTeamRiders.objects.get(zwid=zwid)
+        return {
+            "zwid": rider.zwid,
+            "aid": rider.aid,
+            "name": rider.name,
+            "flag": rider.flag,
+            "age": rider.age,
+            "div": rider.div,
+            "divw": rider.divw,
+            "r": rider.r,
+            "rank": float(rider.rank) if rider.rank else None,
+            "ftp": rider.ftp,
+            "weight": float(rider.weight) if rider.weight else None,
+            "skill": rider.skill,
+            "skill_race": rider.skill_race,
+            "skill_seg": rider.skill_seg,
+            "skill_power": rider.skill_power,
+            "distance": rider.distance,
+            "climbed": rider.climbed,
+            "energy": rider.energy,
+            "time": rider.time,
+            "h_1200_watts": rider.h_1200_watts,
+            "h_1200_wkg": float(rider.h_1200_wkg) if rider.h_1200_wkg else None,
+            "h_15_watts": rider.h_15_watts,
+            "h_15_wkg": float(rider.h_15_wkg) if rider.h_15_wkg else None,
+            "status": rider.status,
+            "reg": rider.reg,
+            "zada": rider.zada,
+            "date_created": rider.date_created.isoformat() if rider.date_created else None,
+            "date_modified": rider.date_modified.isoformat() if rider.date_modified else None,
+            "date_left": rider.date_left.isoformat() if rider.date_left else None,
+        }
+    except ZPTeamRiders.DoesNotExist:
+        return api.create_response(request, {"error": "Rider not found"}, status=404)  # ty:ignore[invalid-return-type]
+
+
+@api.get("/team_links")
+def get_team_links_magic_link(request: HttpRequest) -> dict:
+    """Generate a magic link to the team links page for the Discord user.
+
+    Uses the X-Discord-User-Id header to identify the user.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object with magic link URL or error message.
+
+    """
+    discord_user_id = request.auth["discord_user_id"]  # ty:ignore[unresolved-attribute]
+
+    try:
+        user = User.objects.get(discord_id=discord_user_id)
+
+        # Create a magic link pointing to team links page
+        redirect_url = reverse("team:links")
+        magic_link = MagicLink.create_for_user(user=user, redirect_url=redirect_url)
+
+        # Build absolute URL
+        magic_link_url = request.build_absolute_uri(magic_link.get_absolute_url())
+
+        return {
+            "magic_link_url": magic_link_url,
+            "expires_in_seconds": MagicLink.EXPIRY_SECONDS,
+            "redirect_to": redirect_url,
+        }
+    except User.DoesNotExist:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {
+                "error": "User not found",
+                "message": "No account found for this Discord user. Please create an account first.",
+            },
+            status=404,
+        )
+
+
+@api.get("/recent_videos")
+def get_recent_videos(request: HttpRequest) -> dict:
+    """Get the 5 most recent YouTube videos from team members.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object with recent videos and team feed URL.
+
+    """
+    videos = YouTubeVideo.objects.select_related("user").order_by("-published_at")[:5]
+
+    video_list = []
+    for video in videos:
+        user = video.user
+        user_name = f"{user.first_name} {user.last_name}".strip() or user.discord_nickname or user.discord_username
+        video_list.append({
+            "title": video.title,
+            "url": video.url,
+            "user_name": user_name,
+            "published_at": video.published_at.isoformat() if video.published_at else None,
+        })
+
+    team_feed_url = request.build_absolute_uri(reverse("team:team_feed"))
+
+    return {
+        "videos": video_list,
+        "team_feed_url": team_feed_url,
+    }
+
+
+@api.post("/sync_guild_roles")
+def sync_guild_roles(request: HttpRequest, payload: SyncGuildRolesRequest) -> dict:
+    """Sync all guild roles from Discord bot.
+
+    The bot should call this endpoint with all roles from the guild.
+    Roles not in the payload will be deleted from the database.
+
+    Args:
+        request: The HTTP request.
+        payload: The request body with list of roles.
+
+    Returns:
+        JSON object with sync results.
+
+    """
+    received_role_ids = {role.id for role in payload.roles}
+    existing_role_ids = set(DiscordRole.objects.values_list("role_id", flat=True))
+
+    created = 0
+    updated = 0
+    deleted = 0
+
+    # Create or update roles
+    for role_data in payload.roles:
+        _, was_created = DiscordRole.objects.update_or_create(
+            role_id=role_data.id,
+            defaults={
+                "name": role_data.name,
+                "color": role_data.color,
+                "position": role_data.position,
+                "managed": role_data.managed,
+                "mentionable": role_data.mentionable,
+            },
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    # Delete roles that no longer exist in Discord
+    roles_to_delete = existing_role_ids - received_role_ids
+    if roles_to_delete:
+        deleted, _ = DiscordRole.objects.filter(role_id__in=roles_to_delete).delete()
+
+    logfire.info(
+        "Guild roles synced",
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        total_received=len(payload.roles),
+        discord_user_id=request.auth["discord_user_id"],  # ty:ignore[unresolved-attribute]
+    )
+
+    return {
+        "created": created,
+        "updated": updated,
+        "deleted": deleted,
+        "total": len(payload.roles),
+    }
+
+
+@api.post("/sync_guild_channels")
+def sync_guild_channels(request: HttpRequest, payload: SyncGuildChannelsRequest) -> dict:
+    """Sync all guild channels from Discord bot.
+
+    The bot should call this endpoint with all channels from the guild.
+    Channels not in the payload will be deleted from the database.
+
+    Args:
+        request: The HTTP request.
+        payload: The request body with list of channels.
+
+    Returns:
+        JSON object with sync results.
+
+    """
+    received_channel_ids = {ch.id for ch in payload.channels}
+    existing_channel_ids = set(DiscordChannel.objects.values_list("channel_id", flat=True))
+
+    created = 0
+    updated = 0
+    deleted = 0
+
+    for ch_data in payload.channels:
+        _, was_created = DiscordChannel.objects.update_or_create(
+            channel_id=ch_data.id,
+            defaults={
+                "name": ch_data.name,
+                "channel_type": ch_data.type,
+                "position": ch_data.position,
+                "category_id": ch_data.category_id,
+                "category_name": ch_data.category_name,
+            },
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    channels_to_delete = existing_channel_ids - received_channel_ids
+    if channels_to_delete:
+        deleted, _ = DiscordChannel.objects.filter(channel_id__in=channels_to_delete).delete()
+
+    logfire.info(
+        "Guild channels synced",
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        total_received=len(payload.channels),
+        discord_user_id=request.auth["discord_user_id"],  # ty:ignore[unresolved-attribute]
+    )
+
+    return {
+        "created": created,
+        "updated": updated,
+        "deleted": deleted,
+        "total": len(payload.channels),
+    }
+
+
+@api.post("/sync_user_roles/{discord_id}")
+def sync_user_roles(request: HttpRequest, discord_id: str, payload: SyncUserRolesRequest) -> dict:
+    """Sync a user's Discord roles.
+
+    Updates the user's discord_roles field with {role_id: role_name} mapping.
+
+    Args:
+        request: The HTTP request.
+        discord_id: The Discord user ID.
+        payload: The request body with list of role IDs.
+
+    Returns:
+        JSON object with sync results or error.
+
+    """
+    try:
+        user = User.objects.get(discord_id=discord_id)
+    except User.DoesNotExist:
+        logfire.debug(
+            "User roles sync failed: user not found",
+            target_discord_id=discord_id,
+        )
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {"error": "User not found", "discord_id": discord_id},
+            status=404,
+        )
+
+    # Build role mapping from DiscordRole table
+    role_ids = payload.role_ids
+    roles = DiscordRole.objects.filter(role_id__in=role_ids)
+    role_map = {role.role_id: role.name for role in roles}
+
+    # Include any role IDs not in our database (with placeholder name)
+    for role_id in role_ids:
+        if role_id not in role_map:
+            role_map[role_id] = f"Unknown Role ({role_id})"
+
+    user.discord_roles = role_map
+    user.save(update_fields=["discord_roles"])
+
+    logfire.info(
+        "User roles synced",
+        target_discord_id=discord_id,
+        user_id=user.id,
+        roles_synced=len(role_map),
+        is_race_ready=user.is_race_ready,
+    )
+
+    return {
+        "discord_id": discord_id,
+        "roles_synced": len(role_map),
+        "roles": role_map,
+        "is_race_ready": user.is_race_ready,
+        "race_ready_role_id": str(constance_config.RACE_READY_ROLE_ID) if constance_config.RACE_READY_ROLE_ID else None,
+    }
+
+
+@api.post("/sync_guild_members")
+def sync_guild_members(request: HttpRequest, payload: SyncGuildMembersRequest) -> dict:
+    """Sync all guild members from the Discord bot's webhook push.
+
+    Most of the work is delegated to :func:`apps.accounts.services.apply_guild_member_sync`;
+    the platform drives the full reconciliation itself via the ``sync_guild_members``
+    background task. This push only refreshes the members it lists (and clears the
+    departure stamp of any who are back); it never marks anybody as left or records
+    accounts it has not listed, so ``left`` is always 0 and ``departures_evaluated`` is
+    false. The payload comes from the bot's gateway cache, which can be missing member
+    chunks after a restart, and a departure signs the rider out -- so only the paginated
+    REST fetch, which fails rather than return a list missing a page, may decide that.
+    ``departures_refused`` and ``departures_skipped`` stay in the response for the bot
+    and are always empty here.
+
+    The optional ``observed_at`` says when the bot read the list. A departure stamped at or
+    after it -- the bot reported the member leaving (``member_left``) after reading the list --
+    is not cleared, and is counted in ``rejoin_deferred``. Missing or unreadable, the
+    platform's own clock is used; a time in the future is clamped to now.
+
+    NOTE: This only affects GuildMember records and links to User accounts
+    that have a discord_id. Regular Django accounts (staff, admin) without
+    Discord OAuth are NOT modified or disabled by this sync.
+
+    Args:
+        request: The HTTP request.
+        payload: The request body with list of guild members.
+
+    Returns:
+        JSON object with sync results.
+
+    """
+    from apps.accounts.services import apply_guild_member_sync
+
+    members = [
+        {
+            "discord_id": m.discord_id,
+            "username": m.username,
+            "display_name": m.display_name or "",
+            "nickname": m.nickname or "",
+            "avatar_hash": m.avatar_hash or "",
+            "roles": m.roles,
+            "joined_at": m.joined_at,
+            "is_bot": m.is_bot,
+        }
+        for m in payload.members
+    ]
+    result = apply_guild_member_sync(
+        members,
+        source="bot_webhook",
+        authoritative=False,
+        observed_at=_push_observed_at(payload.observed_at),
+    )
+    logfire.debug(
+        "Bot-driven guild_members sync completed",
+        discord_user_id=request.auth["discord_user_id"],  # ty:ignore[unresolved-attribute]
+        **result,
+    )
+    return {
+        "created": result["created"],
+        "updated": result["updated"],
+        "rejoined": result["rejoined"],
+        "rejoin_deferred": result["rejoin_deferred"],
+        "left": result["left"],
+        "linked": result["linked"],
+        "departures_evaluated": result["departures_evaluated"],
+        "departures_refused": result["departures_refused"],
+        "departures_skipped": result["departures_skipped"],
+        "total_received": result["total_received"],
+        "total_active": result["total_active"],
+    }
+
+
+def _push_observed_at(raw: object) -> datetime:
+    """Read the bot's ``observed_at`` for a member push.
+
+    Args:
+        raw: The body's ``observed_at``: an ISO-8601 timestamp, or anything else.
+
+    Returns:
+        That time in UTC (a naive value is taken as UTC), no later than now; now when it is
+        missing or cannot be read.
+
+    """
+    now = timezone.now()
+    if raw is None or raw == "":
+        return now
+    if not isinstance(raw, str):
+        logfire.warning("Bot guild member push sent a non-string observed_at; using now", value_type=type(raw).__name__)
+        return now
+    try:
+        parsed = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        logfire.warning("Bot guild member push sent an unreadable observed_at; using now")
+        return now
+    if timezone.is_naive(parsed):
+        parsed = parsed.replace(tzinfo=UTC)
+    return min(parsed, now)
+
+
+@api.post("/member_left/{discord_id}")
+def member_left(request: HttpRequest, discord_id: str, payload: MemberLeftRequest) -> dict:
+    """Record that a member has just left the guild, as the Discord bot saw it happen.
+
+    The bot calls this from its member-remove event, with its own user id as
+    ``X-Discord-User-Id`` (no person triggered it). The departure is stamped at once, so a
+    non-staff rider is signed out on their next request and their API keys stop working,
+    instead of waiting for the scheduled guild sync. Delegates to
+    :func:`apps.accounts.services.record_member_departure`. An active row is stamped and a
+    member-left ticket filed. A row already departed stays departed, with its stamp moved up
+    to now and no ticket. A missing row is created from the body (every field optional) and
+    stamped, with a ticket only when an account holds the id. Safe to repeat: the answer is
+    ``already_departed`` and only the stamp moves.
+
+    Args:
+        request: The HTTP request.
+        discord_id: The departed member's Discord id: 1-20 ASCII digits, else 400.
+        payload: Optional ``username``, ``display_name``, ``avatar_hash``, ``is_bot``.
+
+    Returns:
+        ``{"status": "departed" | "already_departed", "created": bool, "ticket_created": bool}``,
+        or a 400 error for an id that is not a Discord id.
+
+    """
+    from apps.accounts.services import is_discord_snowflake, record_member_departure
+
+    bot_user_id = request.auth["discord_user_id"]  # ty:ignore[unresolved-attribute]
+    if not is_discord_snowflake(discord_id):
+        logfire.warning("Member-left report refused: not a Discord id", discord_user_id=bot_user_id)
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {"error": "discord_id must be a Discord user id (ASCII digits only)"},
+            status=400,
+        )
+
+    result = record_member_departure(discord_id, payload.model_dump(), source="bot_event")
+    logfire.debug(
+        "Bot-reported member departure handled",
+        discord_user_id=bot_user_id,
+        target_discord_id=discord_id,
+        **result,
+    )
+    return {
+        "status": result["status"],
+        "created": result["created"],
+        "ticket_created": result["ticket_created"],
+    }
+
+
+@api.post("/update_zp_team")
+def trigger_update_zp_team(request: HttpRequest) -> dict:
+    """Trigger the update_team_riders background task.
+
+    Enqueues the task to fetch team riders from ZwiftPower and update the database.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object confirming the task was enqueued.
+
+    """
+    update_team_riders.enqueue()
+    logfire.info(
+        "ZwiftPower team update task queued",
+        discord_user_id=request.auth["discord_user_id"],  # ty:ignore[unresolved-attribute]
+    )
+    return {
+        "status": "queued",
+        "message": "ZwiftPower team update task has been queued.",
+    }
+
+
+@api.post("/update_zp_results")
+def trigger_update_zp_results(request: HttpRequest) -> dict:
+    """Trigger the update_team_results background task.
+
+    Enqueues the task to fetch team results from ZwiftPower and update the database.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object confirming the task was enqueued.
+
+    """
+    update_team_results.enqueue()
+    logfire.info(
+        "ZwiftPower results update task queued",
+        discord_user_id=request.auth["discord_user_id"],  # ty:ignore[unresolved-attribute]
+    )
+    return {
+        "status": "queued",
+        "message": "ZwiftPower team results update task has been queued.",
+    }
+
+
+@api.get("/my_profile")
+def get_my_profile(request: HttpRequest) -> dict:
+    """Get combined ZwiftPower and Zwift Racing profile for the requesting Discord user.
+
+    Uses X-Discord-User-Id header to identify the user, looks up their linked Zwift ID,
+    and returns combined profile data from ZPTeamRiders and ZRRider models.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        JSON object with combined profile data or error message.
+
+    """
+    discord_user_id = request.auth["discord_user_id"]  # ty:ignore[unresolved-attribute]
+
+    # Look up user by Discord ID
+    try:
+        user = User.objects.get(discord_id=discord_user_id)
+    except User.DoesNotExist:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {
+                "error": "User not found",
+                "message": "No account found for this Discord user. Please create an account first.",
+            },
+            status=404,
+        )
+
+    # Check if user has linked Zwift ID
+    if not user.zwid:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {
+                "error": "Zwift ID not linked",
+                "message": "Your account does not have a linked Zwift ID. Please link your Zwift account first.",
+            },
+            status=404,
+        )
+
+    zwid = user.zwid
+
+    # Build profile response
+    profile: dict = {
+        "zwid": zwid,
+        "discord_username": user.discord_username,
+        # Policy-aware so the bot agrees with the roster and the profile banner once
+        # ZAUTH_VERIFICATION_REQUIRED is on. is_race_ready below is deliberately the
+        # raw value: race readiness never consulted zwid_verified, so the cutover
+        # must not move anyone's race-ready Discord role.
+        "zwid_verified": user.has_accepted_zwid_verification,
+        "verification": _get_verification_status(user),
+        "is_race_ready": user.is_race_ready,
+        "race_ready_role_id": str(constance_config.RACE_READY_ROLE_ID) if constance_config.RACE_READY_ROLE_ID else None,
+        "zwiftpower": None,
+        "zwiftracing": None,
+    }
+
+    # Get ZwiftPower data
+    try:
+        zp_rider = ZPTeamRiders.objects.get(zwid=zwid)
+        profile["zwiftpower"] = {
+            "name": zp_rider.name,
+            "flag": zp_rider.flag,
+            "age": zp_rider.age,
+            "div": zp_rider.div,
+            "divw": zp_rider.divw,
+            "r": zp_rider.r,
+            "rank": float(zp_rider.rank) if zp_rider.rank else None,
+            "ftp": zp_rider.ftp,
+            "weight": float(zp_rider.weight) if zp_rider.weight else None,
+            "skill": zp_rider.skill,
+            "skill_race": zp_rider.skill_race,
+            "skill_seg": zp_rider.skill_seg,
+            "skill_power": zp_rider.skill_power,
+            "h_15_watts": zp_rider.h_15_watts,
+            "h_15_wkg": float(zp_rider.h_15_wkg) if zp_rider.h_15_wkg else None,
+            "h_1200_watts": zp_rider.h_1200_watts,
+            "h_1200_wkg": float(zp_rider.h_1200_wkg) if zp_rider.h_1200_wkg else None,
+            "distance_km": round(zp_rider.distance / 1000, 1) if zp_rider.distance else 0,
+            "climbed_m": zp_rider.climbed,
+            "time_hours": round(zp_rider.time / 3600, 1) if zp_rider.time else 0,
+        }
+    except ZPTeamRiders.DoesNotExist:
+        pass  # zwiftpower remains None
+
+    # Get Zwift Racing data
+    try:
+        zr_rider = ZRRider.objects.get(zwid=zwid)
+        profile["zwiftracing"] = {
+            "name": zr_rider.name,
+            "country": zr_rider.country,
+            "gender": zr_rider.gender,
+            "height": zr_rider.height,
+            "weight": float(zr_rider.weight) if zr_rider.weight else None,
+            "zp_category": zr_rider.zp_category,
+            "zp_ftp": zr_rider.zp_ftp,
+            # Critical Power
+            "power_cp": float(zr_rider.power_cp) if zr_rider.power_cp else None,
+            # Race ratings
+            "race_current_rating": float(zr_rider.race_current_rating) if zr_rider.race_current_rating else None,
+            "race_current_category": zr_rider.race_current_category,
+            "race_max30_rating": float(zr_rider.race_max30_rating) if zr_rider.race_max30_rating else None,
+            "race_max30_category": zr_rider.race_max30_category,
+            "race_max90_rating": float(zr_rider.race_max90_rating) if zr_rider.race_max90_rating else None,
+            "race_max90_category": zr_rider.race_max90_category,
+            # Race stats
+            "race_finishes": zr_rider.race_finishes,
+            "race_wins": zr_rider.race_wins,
+            "race_podiums": zr_rider.race_podiums,
+            "race_dnfs": zr_rider.race_dnfs,
+            # Phenotype
+            "phenotype_value": zr_rider.phenotype_value,
+            "phenotype_sprinter": float(zr_rider.phenotype_sprinter) if zr_rider.phenotype_sprinter else None,
+            "phenotype_puncheur": float(zr_rider.phenotype_puncheur) if zr_rider.phenotype_puncheur else None,
+            "phenotype_pursuiter": float(zr_rider.phenotype_pursuiter) if zr_rider.phenotype_pursuiter else None,
+            "phenotype_climber": float(zr_rider.phenotype_climber) if zr_rider.phenotype_climber else None,
+            "phenotype_tt": float(zr_rider.phenotype_tt) if zr_rider.phenotype_tt else None,
+            # Power curve (w/kg)
+            "power_wkg5": float(zr_rider.power_wkg5) if zr_rider.power_wkg5 else None,
+            "power_wkg15": float(zr_rider.power_wkg15) if zr_rider.power_wkg15 else None,
+            "power_wkg60": float(zr_rider.power_wkg60) if zr_rider.power_wkg60 else None,
+            "power_wkg300": float(zr_rider.power_wkg300) if zr_rider.power_wkg300 else None,
+            "power_wkg1200": float(zr_rider.power_wkg1200) if zr_rider.power_wkg1200 else None,
+        }
+    except ZRRider.DoesNotExist:
+        pass  # zwiftracing remains None
+
+    # Check if we found any data
+    if profile["zwiftpower"] is None and profile["zwiftracing"] is None:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {
+                "error": "No profile data found",
+                "message": f"No ZwiftPower or Zwift Racing data found for Zwift ID {zwid}.",
+                "zwid": zwid,
+            },
+            status=404,
+        )
+
+    return profile
+
+
+@api.get("/search_teammates")
+def search_teammates(request: HttpRequest, q: str = "") -> dict:
+    """Search for teammates by any name they are known by, for autocomplete.
+
+    Matches the ZwiftPower profile name, the Zwift Racing name, and the rider's Discord
+    and real names -- people look each other up by whichever name they know, and only
+    the first of those used to be searchable. Results are still limited to active team
+    riders, and always carry a ``zwid`` because that is what the profile lookup takes.
+
+    When a rider is found by a name other than their ZwiftPower one, ``alias`` carries
+    the name that actually matched, so the suggestion explains why it appeared.
+
+    Args:
+        request: The HTTP request.
+        q: Search query string (partial, case-insensitive, matched against each name).
+
+    Returns:
+        JSON object with list of matching teammates (max 25 for Discord autocomplete limit).
+
+    """
+    if not q or len(q) < 2:
+        return {"results": []}
+
+    zp_zwids = set(
+        ZPTeamRiders.objects
+        .filter(name__icontains=q, date_left__isnull=True)
+        .values_list("zwid", flat=True)
+    )
+
+    # Names from elsewhere are resolved to a zwid here; the final query below is what
+    # restricts them to active team riders, so nothing off-roster can leak in.
+    alias_by_zwid: dict[int, str] = {}
+    for zwid, name in (
+        ZRRider.objects.filter(name__icontains=q).values_list("zwid", "name")[:100]
+    ):
+        if zwid and name:
+            alias_by_zwid.setdefault(zwid, name)
+
+    discord_matches = (
+        User.objects
+        .filter(zwid__isnull=False)
+        .filter(
+            Q(discord_username__icontains=q)
+            | Q(discord_nickname__icontains=q)
+            | Q(first_name__icontains=q)
+            | Q(last_name__icontains=q)
+        )
+        .values_list("zwid", "discord_nickname", "discord_username", "first_name", "last_name")[:100]
+    )
+    for zwid, nickname, username, first, last in discord_matches:
+        label = nickname or username or f"{first} {last}".strip()
+        if zwid and label:
+            alias_by_zwid.setdefault(zwid, label)
+
+    matched = zp_zwids | set(alias_by_zwid)
+    if not matched:
+        return {"results": []}
+
+    rows = (
+        ZPTeamRiders.objects
+        .filter(zwid__in=matched, date_left__isnull=True)
+        .values("zwid", "name", "flag")
+        .order_by("name")[:25]
+    )
+
+    results = [
+        {
+            "zwid": m["zwid"],
+            "name": m["name"],
+            "flag": m["flag"],
+            # Only when the ZwiftPower name is not itself the match -- otherwise the
+            # suggestion would repeat what the rider already typed.
+            "alias": None if m["zwid"] in zp_zwids else alias_by_zwid.get(m["zwid"]),
+        }
+        for m in rows
+    ]
+
+    return {"results": results}
+
+
+@api.get("/teammate_profile/{zwid}")
+def get_teammate_profile(request: HttpRequest, zwid: int) -> dict:
+    """Get combined ZwiftPower and Zwift Racing profile for a teammate by Zwift ID.
+
+    Args:
+        request: The HTTP request.
+        zwid: The Zwift ID to look up.
+
+    Returns:
+        JSON object with combined profile data or error message.
+
+    """
+    # Build profile response
+    profile: dict = {
+        "zwid": zwid,
+        "account": None,
+        "verification": None,
+        "zwiftpower": None,
+        "zwiftracing": None,
+    }
+
+    # Check if user has a linked account
+    try:
+        user = User.objects.get(zwid=zwid)
+        profile["account"] = {
+            "discord_username": user.discord_username,
+            "discord_nickname": user.discord_nickname,
+            "zwid_verified": user.has_accepted_zwid_verification,  # same policy as /my_profile
+        }
+        profile["verification"] = _get_verification_status(user)
+    except User.DoesNotExist:
+        pass  # account and verification remain None
+
+    # Get ZwiftPower data
+    try:
+        zp_rider = ZPTeamRiders.objects.get(zwid=zwid)
+        profile["zwiftpower"] = {
+            "name": zp_rider.name,
+            "flag": zp_rider.flag,
+            "age": zp_rider.age,
+            "div": zp_rider.div,
+            "divw": zp_rider.divw,
+            "r": zp_rider.r,
+            "rank": float(zp_rider.rank) if zp_rider.rank else None,
+            "ftp": zp_rider.ftp,
+            "weight": float(zp_rider.weight) if zp_rider.weight else None,
+            "skill": zp_rider.skill,
+            "skill_race": zp_rider.skill_race,
+            "skill_seg": zp_rider.skill_seg,
+            "skill_power": zp_rider.skill_power,
+            "h_15_watts": zp_rider.h_15_watts,
+            "h_15_wkg": float(zp_rider.h_15_wkg) if zp_rider.h_15_wkg else None,
+            "h_1200_watts": zp_rider.h_1200_watts,
+            "h_1200_wkg": float(zp_rider.h_1200_wkg) if zp_rider.h_1200_wkg else None,
+            "distance_km": round(zp_rider.distance / 1000, 1) if zp_rider.distance else 0,
+            "climbed_m": zp_rider.climbed,
+            "time_hours": round(zp_rider.time / 3600, 1) if zp_rider.time else 0,
+        }
+    except ZPTeamRiders.DoesNotExist:
+        pass  # zwiftpower remains None
+
+    # Get Zwift Racing data
+    try:
+        zr_rider = ZRRider.objects.get(zwid=zwid)
+        profile["zwiftracing"] = {
+            "name": zr_rider.name,
+            "country": zr_rider.country,
+            "gender": zr_rider.gender,
+            "height": zr_rider.height,
+            "weight": float(zr_rider.weight) if zr_rider.weight else None,
+            "zp_category": zr_rider.zp_category,
+            "zp_ftp": zr_rider.zp_ftp,
+            # Critical Power
+            "power_cp": float(zr_rider.power_cp) if zr_rider.power_cp else None,
+            # Race ratings
+            "race_current_rating": float(zr_rider.race_current_rating) if zr_rider.race_current_rating else None,
+            "race_current_category": zr_rider.race_current_category,
+            "race_max30_rating": float(zr_rider.race_max30_rating) if zr_rider.race_max30_rating else None,
+            "race_max30_category": zr_rider.race_max30_category,
+            "race_max90_rating": float(zr_rider.race_max90_rating) if zr_rider.race_max90_rating else None,
+            "race_max90_category": zr_rider.race_max90_category,
+            # Race stats
+            "race_finishes": zr_rider.race_finishes,
+            "race_wins": zr_rider.race_wins,
+            "race_podiums": zr_rider.race_podiums,
+            "race_dnfs": zr_rider.race_dnfs,
+            # Phenotype
+            "phenotype_value": zr_rider.phenotype_value,
+            "phenotype_sprinter": float(zr_rider.phenotype_sprinter) if zr_rider.phenotype_sprinter else None,
+            "phenotype_puncheur": float(zr_rider.phenotype_puncheur) if zr_rider.phenotype_puncheur else None,
+            "phenotype_pursuiter": float(zr_rider.phenotype_pursuiter) if zr_rider.phenotype_pursuiter else None,
+            "phenotype_climber": float(zr_rider.phenotype_climber) if zr_rider.phenotype_climber else None,
+            "phenotype_tt": float(zr_rider.phenotype_tt) if zr_rider.phenotype_tt else None,
+            # Power curve (w/kg)
+            "power_wkg5": float(zr_rider.power_wkg5) if zr_rider.power_wkg5 else None,
+            "power_wkg15": float(zr_rider.power_wkg15) if zr_rider.power_wkg15 else None,
+            "power_wkg60": float(zr_rider.power_wkg60) if zr_rider.power_wkg60 else None,
+            "power_wkg300": float(zr_rider.power_wkg300) if zr_rider.power_wkg300 else None,
+            "power_wkg1200": float(zr_rider.power_wkg1200) if zr_rider.power_wkg1200 else None,
+        }
+    except ZRRider.DoesNotExist:
+        pass  # zwiftracing remains None
+
+    # Check if we found any data
+    if profile["zwiftpower"] is None and profile["zwiftracing"] is None:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {
+                "error": "Teammate not found",
+                "message": f"No profile data found for Zwift ID {zwid}.",
+                "zwid": zwid,
+            },
+            status=404,
+        )
+
+    return profile
+
+
+@api.post("/roster_filter")
+def create_roster_filter(request: HttpRequest, payload: CreateRosterFilterRequest) -> dict:
+    """Create a filtered roster link from a list of Discord IDs.
+
+    Creates a temporary RosterFilter record with 5-minute expiration.
+    Used by the Discord bot /in_channel command.
+
+    Args:
+        request: The HTTP request.
+        payload: The request body with list of Discord IDs and channel name.
+
+    Returns:
+        JSON object with filter ID, URL, and expiration info.
+
+    """
+    discord_user_id = request.auth["discord_user_id"]  # ty:ignore[unresolved-attribute]
+
+    # Create filter with 5-minute expiration
+    expires_at = timezone.now() + timedelta(minutes=5)
+
+    roster_filter = RosterFilter.objects.create(
+        discord_ids=payload.discord_ids,
+        channel_name=payload.channel_name,
+        created_by_discord_id=discord_user_id,
+        expires_at=expires_at,
+    )
+
+    # Build absolute URL for the filtered roster
+    filter_url = request.build_absolute_uri(
+        reverse("team:filtered_roster", kwargs={"filter_id": roster_filter.id})
+    )
+
+    logfire.info(
+        "Roster filter created",
+        filter_id=str(roster_filter.id),
+        channel_name=payload.channel_name,
+        member_count=len(payload.discord_ids),
+        created_by_discord_id=discord_user_id,
+    )
+
+    return {
+        "filter_id": str(roster_filter.id),
+        "url": filter_url,
+        "expires_in_seconds": 300,
+        "member_count": len(payload.discord_ids),
+        "channel_name": payload.channel_name,
+    }
+
+
+@api.post("/membership_application")
+def create_membership_application(request: HttpRequest, payload: MembershipApplicationCreateSchema) -> dict:
+    """Create a new membership application from Discord modal.
+
+    Called by the Discord bot when a user submits the join_the_coalition modal.
+    If an application already exists for the Discord ID, returns the existing one.
+
+    Args:
+        request: The HTTP request.
+        payload: The application data from the Discord modal.
+
+    Returns:
+        JSON object with application ID, URL, and status.
+
+    """
+    # Check if application already exists for this discord_id
+    existing = MembershipApplication.objects.filter(discord_id=payload.discord_id).first()
+    if existing:
+        logfire.info(
+            "Membership application lookup: existing found",
+            application_id=str(existing.id),
+            applicant_discord_id=existing.discord_id,
+            status=existing.status,
+        )
+        # Build absolute URL for the application
+        application_url = request.build_absolute_uri(
+            reverse("team:application_public", kwargs={"pk": existing.id})
+        )
+        return {
+            "id": str(existing.id),
+            "discord_id": existing.discord_id,
+            "discord_username": existing.discord_username,
+            "status": existing.status,
+            "application_url": application_url,
+            "is_complete": existing.is_complete,
+            "date_created": existing.date_created.isoformat(),
+            "already_exists": True,
+        }
+
+    # Create new application
+    application = MembershipApplication.objects.create(
+        discord_id=payload.discord_id,
+        discord_username=payload.discord_username,
+        server_nickname=payload.server_nickname,
+        avatar_url=payload.avatar_url,
+        guild_avatar_url=payload.guild_avatar_url,
+        discord_user_data=payload.discord_user_data,
+        discord_member_data=payload.discord_member_data,
+        modal_form_data=payload.modal_form_data,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        applicant_notes=payload.applicant_notes,
+    )
+
+    logfire.info(
+        "Membership application created",
+        application_id=str(application.id),
+        applicant_discord_id=application.discord_id,
+        applicant_discord_username=application.discord_username,
+    )
+
+    # Build absolute URL for the application (public form for applicant)
+    application_url = request.build_absolute_uri(
+        reverse("team:application_public", kwargs={"pk": application.id})
+    )
+
+    return {
+        "id": str(application.id),
+        "discord_id": application.discord_id,
+        "discord_username": application.discord_username,
+        "status": application.status,
+        "application_url": application_url,
+        "is_complete": application.is_complete,
+        "date_created": application.date_created.isoformat(),
+        "already_exists": False,
+    }
+
+
+@api.get("/membership_application/{discord_id}")
+def get_membership_application(request: HttpRequest, discord_id: str) -> dict:
+    """Get membership application by Discord ID.
+
+    Args:
+        request: The HTTP request.
+        discord_id: The Discord user ID to look up.
+
+    Returns:
+        JSON object with application data or error if not found.
+
+    """
+    try:
+        application = MembershipApplication.objects.get(discord_id=discord_id)
+
+        # Build absolute URL for the application
+        application_url = request.build_absolute_uri(
+            reverse("team:application_public", kwargs={"pk": application.id})
+        )
+
+        return {
+            "id": str(application.id),
+            "discord_id": application.discord_id,
+            "discord_username": application.discord_username,
+            "server_nickname": application.server_nickname,
+            "first_name": application.first_name,
+            "last_name": application.last_name,
+            "status": application.status,
+            "status_display": application.get_status_display(),
+            "application_url": application_url,
+            "is_complete": application.is_complete,
+            "is_editable": application.is_editable,
+            "agree_privacy": application.agree_privacy,
+            "agree_tos": application.agree_tos,
+            "date_created": application.date_created.isoformat(),
+            "date_modified": application.date_modified.isoformat(),
+        }
+    except MembershipApplication.DoesNotExist:
+        return api.create_response(  # ty:ignore[invalid-return-type]
+            request,
+            {"error": "Application not found", "discord_id": discord_id},
+            status=404,
+        )

@@ -1,0 +1,663 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} - {{ event.title }}{% endblock %}
+
+{% block content %}
+<style>
+/* Django renders CheckboxSelectMultiple as nested <div>s, one per rider. Tailwind
+   utilities can't reach them (no rebuild in this repo's normal flow), so the row
+   layout lives here. */
+.captain-picker label{display:flex;align-items:center;gap:.5rem;padding:.2rem .35rem;
+  border-radius:.35rem;font-size:.875rem;cursor:pointer}
+.captain-picker label:hover{background:var(--color-base-200)}
+.captain-picker input[type=checkbox]{width:.95rem;height:.95rem;flex-shrink:0;
+  accent-color:var(--color-primary);cursor:pointer}
+</style>
+<div class="max-w-3xl mx-auto">
+  <a href="{% url 'events:squad_manage' event.pk %}" class="btn btn-ghost btn-sm mb-4">&larr; Back to Manage Squads</a>
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <a href="{% url 'events:event_detail' event.pk %}" class="text-sm font-semibold uppercase tracking-wide text-primary hover:underline">{{ event.title }}</a>
+      <h2 class="card-title text-2xl mb-4">{{ page_title }}</h2>
+
+      <form method="post" class="space-y-4">
+        {% csrf_token %}
+
+        <!-- Name -->
+        <div class="form-control w-full">
+          <label class="label" for="id_name">
+            <span class="label-text">Squad Name <span class="text-error">*</span></span>
+          </label>
+          {{ form.name }}
+          {% if form.name.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.name.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Tags: chosen from the event's squad tags, which are the only source -->
+        <fieldset class="form-control w-full"{% if form.tags.field.disabled %} disabled{% endif %} aria-describedby="squad-tags-help{% if form.tags.errors %} squad-tags-error{% endif %}">
+          <legend class="label">
+            <span class="label-text">{{ form.tags.label }}</span>
+          </legend>
+          {% if form.tags.field.choices %}
+          <div class="flex flex-wrap gap-x-4 gap-y-1">
+            {% for checkbox in form.tags %}
+            <label class="label cursor-pointer justify-start gap-2" for="{{ checkbox.id_for_label }}">
+              {{ checkbox.tag }}
+              <span class="label-text">{{ checkbox.choice_label }}</span>
+            </label>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if form.tags.errors %}
+          <p id="squad-tags-error" class="flex items-start gap-2 text-sm mt-1">
+            <span class="badge badge-error badge-sm shrink-0">Error</span>
+            <span>{{ form.tags.errors.0 }}</span>
+          </p>
+          {% endif %}
+          <p id="squad-tags-help" class="label whitespace-normal">
+            {% if form.tags.field.disabled %}
+            This event has no squad tags yet. An event admin can add them on the event&rsquo;s edit page.
+            {% else %}
+            Optional. Tags come from the event&rsquo;s squad tags, set by an event admin on the event&rsquo;s edit page.
+            {% endif %}
+          </p>
+        </fieldset>
+
+        <!-- Captains / Vice-captains -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label">
+              <span class="label-text">Captains</span>
+            </label>
+            {% if form.captains.field.queryset.exists %}
+            <div class="captain-picker border border-base-300 rounded-lg max-h-48 overflow-y-auto p-2 bg-base-100">
+              {{ form.captains }}
+            </div>
+            {% else %}
+            <p class="text-sm text-base-content/50 border border-base-300 rounded-lg p-3">
+              No riders have registered for this event yet.
+            </p>
+            {% endif %}
+            <label class="label cursor-pointer justify-start gap-2 pt-1">
+              {{ form.captains_add_as_members }}
+              <span class="label-text-alt">{{ form.captains_add_as_members.label }}</span>
+            </label>
+            {% if form.captains.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.captains.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <label class="label">
+              <span class="label-text">Vice-captains</span>
+            </label>
+            {% if form.vice_captains.field.queryset.exists %}
+            <div class="captain-picker border border-base-300 rounded-lg max-h-48 overflow-y-auto p-2 bg-base-100">
+              {{ form.vice_captains }}
+            </div>
+            {% else %}
+            <p class="text-sm text-base-content/50 border border-base-300 rounded-lg p-3">
+              No riders have registered for this event yet.
+            </p>
+            {% endif %}
+            <label class="label cursor-pointer justify-start gap-2 pt-1">
+              {{ form.vice_captains_add_as_members }}
+              <span class="label-text-alt">{{ form.vice_captains_add_as_members.label }}</span>
+            </label>
+            {% if form.vice_captains.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.vice_captains.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <p class="text-xs text-base-content/60 -mt-2">
+          Chosen from riders registered for this event.
+          Everyone picked gets the squad&rsquo;s Captain Discord Role; tick the box to add them to the
+          squad roster as well &mdash; leading a squad and racing for it are separate.
+          Squad limits don&rsquo;t block a captain, but you&rsquo;ll be warned if one falls outside them.
+        </p>
+
+        <!-- Captain Notifications -->
+        <div class="form-control w-full">
+          <label class="label cursor-pointer justify-start gap-3">
+            {{ form.captain_notifications }}
+            <span class="label-text">Captain Notifications</span>
+          </label>
+          <label class="label pt-0">
+            <span class="label-text-alt">Notify captain/vice-captain when squad members' verification records change</span>
+          </label>
+          {% if form.captain_notifications.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.captain_notifications.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Notify Captain of expiring Verification -->
+        <div class="form-control w-full">
+          <label class="label cursor-pointer justify-start gap-3">
+            {{ form.notify_captain_expiring_verification }}
+            <span class="label-text">Notify Captain of expiring Verification</span>
+          </label>
+          <label class="label pt-0">
+            <span class="label-text-alt">
+              Shows this squad&rsquo;s captains and vice-captains a banner listing members whose
+              Race Verified status is expiring or has already lapsed, until the event&rsquo;s
+              end date passes.
+            </span>
+          </label>
+          {% if form.notify_captain_expiring_verification.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.notify_captain_expiring_verification.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Zwift Racing Category Range -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label" for="id_min_zwift_racing_category">
+              <span class="label-text">Min ZR Category</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zwift_racing_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.min_zwift_racing_category }}
+            {% if form.min_zwift_racing_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zwift_racing_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <div class="form-control w-full">
+            <label class="label" for="id_max_zwift_racing_category">
+              <span class="label-text">Max ZR Category</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zwift_racing_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.max_zwift_racing_category }}
+            {% if form.max_zwift_racing_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zwift_racing_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Zwift Category Range -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label" for="id_min_zwift_category">
+              <span class="label-text">Min Zwift Category</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zwift_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.min_zwift_category }}
+            {% if form.min_zwift_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zwift_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <div class="form-control w-full">
+            <label class="label" for="id_max_zwift_category">
+              <span class="label-text">Max Zwift Category</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zwift_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.max_zwift_category }}
+            {% if form.max_zwift_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zwift_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <p class="text-xs text-base-content/60 -mt-2">
+          When enforced, a rider's overall ZwiftPower category (A high &rarr; E low) must fall within these bounds to join.
+          Riders without a Zwift category aren't affected.
+        </p>
+
+        <!-- Women's Zwift Category Range -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label" for="id_min_womens_zwift_category">
+              <span class="label-text">Min womens Zwift Cat.</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_womens_zwift_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.min_womens_zwift_category }}
+            {% if form.min_womens_zwift_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_womens_zwift_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+
+          <div class="form-control w-full">
+            <label class="label" for="id_max_womens_zwift_category">
+              <span class="label-text">Max womens Zwift Cat.</span>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_womens_zwift_category }}
+                <span>Enforce</span>
+              </label>
+            </label>
+            {{ form.max_womens_zwift_category }}
+            {% if form.max_womens_zwift_category.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_womens_zwift_category.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <p class="text-xs text-base-content/60 -mt-2">
+          When enforced, a woman's ZwiftPower category (A high &rarr; E low) must fall within these bounds to join.
+          Riders without a women's category aren't affected.
+        </p>
+
+        <!-- Zwift connection requirement -->
+        <div class="form-control w-full">
+          <label class="label cursor-pointer justify-start gap-2">
+            {{ form.require_zauth }}
+            <span class="label-text">Require a connected Zwift account (zauth)</span>
+          </label>
+          {% if form.require_zauth.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.require_zauth.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <p class="text-xs text-base-content/60">
+            Riders must have verified through Zwift&rsquo;s own OAuth. A legacy or admin-granted
+            verification does not count. This is also what supplies zFTP/zMAP, so turn it on for any
+            squad using the power limits below &mdash; riders get a clearer message about connecting
+            than about a missing number.
+          </p>
+        </div>
+
+        <!-- zFTP / zMAP Limits -->
+        <p class="text-sm font-semibold mt-2">zFTP</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_min_zftp_wkg">Min zFTP W/kg</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zftp_wkg }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.min_zftp_wkg }}
+            {% if form.min_zftp_wkg.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zftp_wkg.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_max_zftp_wkg">Max zFTP W/kg</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zftp_wkg }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.max_zftp_wkg }}
+            {% if form.max_zftp_wkg.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zftp_wkg.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_min_zftp_w">Min zFTP watts</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zftp_w }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.min_zftp_w }}
+            {% if form.min_zftp_w.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zftp_w.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_max_zftp_w">Max zFTP watts</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zftp_w }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.max_zftp_w }}
+            {% if form.max_zftp_w.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zftp_w.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <p class="text-sm font-semibold mt-2">zMAP</p>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_min_zmap_wkg">Min zMAP W/kg</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zmap_wkg }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.min_zmap_wkg }}
+            {% if form.min_zmap_wkg.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zmap_wkg.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_max_zmap_wkg">Max zMAP W/kg</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zmap_wkg }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.max_zmap_wkg }}
+            {% if form.max_zmap_wkg.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zmap_wkg.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_min_zmap_w">Min zMAP watts</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_min_zmap_w }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.min_zmap_w }}
+            {% if form.min_zmap_w.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.min_zmap_w.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+          <div class="form-control w-full">
+            <div class="label">
+              <label class="label-text" for="id_max_zmap_w">Max zMAP watts</label>
+              <label class="label-text-alt cursor-pointer flex items-center gap-1">
+                {{ form.enforce_max_zmap_w }}
+                <span>Enforce</span>
+              </label>
+            </div>
+            {{ form.max_zmap_w }}
+            {% if form.max_zmap_w.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.max_zmap_w.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+        <p class="text-xs text-base-content/60 -mt-2">
+          Both units are offered because ZRL divisions combine them &mdash; e.g. B DEV is
+          &ldquo;zFTP &lt; 3.74&nbsp;W/kg <strong>and</strong> &ge;&nbsp;200W&rdquo;. W/kg uses the weight Zwift held when
+          it computed the metric, so it matches the category Zwift assigned the rider.
+          Unlike the category limits, a rider with no zFTP/zMAP on file is <strong>blocked</strong> by an
+          enforced bound &mdash; these numbers only exist for riders who have connected Zwift.
+        </p>
+
+        <!-- Timezone -->
+        <div class="form-control w-full">
+          <label class="label" for="id_squad_timezone">
+            <span class="label-text">Timezone</span>
+          </label>
+          {{ form.squad_timezone }}
+          {% if form.squad_timezone.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.squad_timezone.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Gender -->
+        <div class="form-control w-full">
+          <label class="label" for="id_gender">
+            <span class="label-text">Squad Gender <span class="text-error">*</span></span>
+            <label class="label-text-alt cursor-pointer flex items-center gap-1">
+              {{ form.enforce_gender }}
+              <span>Enforce</span>
+            </label>
+          </label>
+          {{ form.gender }}
+          {% if form.gender.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.gender.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">
+              When <strong>Enforce</strong> is checked, a Male squad requires riders with gender Male,
+              Female requires Female, and COED allows any gender.
+            </span>
+          </label>
+        </div>
+
+        <!-- URL -->
+        <div class="form-control w-full">
+          <label class="label" for="id_url">
+            <span class="label-text">URL</span>
+          </label>
+          {{ form.url }}
+          {% if form.url.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.url.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Invite URL -->
+        <div class="form-control w-full">
+          <label class="label" for="id_invite_url">
+            <span class="label-text">Invite URL</span>
+          </label>
+          {{ form.invite_url }}
+          {% if form.invite_url.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.invite_url.errors.0 }}</span>
+          </label>
+          {% endif %}
+        </div>
+
+        <!-- Captain Discord Role -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div class="form-control w-full">
+            <label class="label" for="id_discord_captain_role">
+              <span class="label-text">Captain Discord Role</span>
+            </label>
+            {{ form.discord_captain_role }}
+            <label class="label pt-0">
+              <span class="label-text-alt">Granted automatically to this squad's captains and vice-captains.</span>
+            </label>
+            {% if form.discord_captain_role.errors %}
+            <label class="label">
+              <span class="label-text-alt text-error">{{ form.discord_captain_role.errors.0 }}</span>
+            </label>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Discord Channel -->
+        <div class="form-control w-full" data-channel-field>
+          <label class="label" for="id_discord_channel_id">
+            <span class="label-text">Discord Channel</span>
+          </label>
+          <div data-channel-select>
+            {{ form.discord_channel_id }}
+          </div>
+          <div data-channel-manual class="hidden">
+            <input type="text" class="input input-bordered w-full"
+                   placeholder="Enter Discord channel ID" inputmode="numeric" pattern="[0-9]*">
+          </div>
+          {% if form.discord_channel_id.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.discord_channel_id.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">
+              <button type="button" data-channel-toggle class="link link-primary text-xs">or enter ID manually</button>
+            </span>
+          </label>
+        </div>
+
+        <!-- Audio Channel -->
+        <div class="form-control w-full">
+          <label class="label" for="id_audio_channel_id">
+            <span class="label-text">Audio Channel</span>
+          </label>
+          {{ form.audio_channel_id }}
+          {% if form.audio_channel_id.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.audio_channel_id.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Discord voice/stage channel for squad comms</span>
+          </label>
+        </div>
+
+        <!-- Team Discord Role -->
+        <div class="form-control w-full">
+          <label class="label" for="id_team_discord_role">
+            <span class="label-text">Discord Role ID</span>
+          </label>
+          {{ form.team_discord_role }}
+          {% if form.team_discord_role.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.team_discord_role.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Discord role for squad members (0 = none)</span>
+          </label>
+        </div>
+
+        <!-- Regional Coordinator -->
+        <div class="form-control w-full">
+          <label class="label" for="id_regional_coordinator_role">
+            <span class="label-text">Regional Coordinator</span>
+          </label>
+          {{ form.regional_coordinator_role }}
+          {% if form.regional_coordinator_role.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.regional_coordinator_role.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Optional. Choose from the event's Regional/Group Coordinator roles (set on the Role Setup page).</span>
+          </label>
+        </div>
+
+        <!-- Region Role -->
+        <div class="form-control w-full">
+          <label class="label" for="id_region_role">
+            <span class="label-text">Region Role</span>
+          </label>
+          {{ form.region_role }}
+          {% if form.region_role.errors %}
+          <label class="label">
+            <span class="label-text-alt text-error">{{ form.region_role.errors.0 }}</span>
+          </label>
+          {% endif %}
+          <label class="label">
+            <span class="label-text-alt">Optional. Added to a rider when assigned to this squad and removed when they leave — unless another squad they're in has the same region role (0 = none).</span>
+          </label>
+        </div>
+
+        {% if form.non_field_errors %}
+        <div class="alert alert-error">
+          {% for error in form.non_field_errors %}
+          <span>{{ error }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <div class="form-control mt-6">
+          <button type="submit" class="btn btn-primary">
+            {{ submit_label }}
+          </button>
+        </div>
+      </form>
+
+      {% if squad %}
+      <div class="divider"></div>
+      <div class="flex justify-between items-center">
+        <a href="{% url 'events:squad_manage' event.pk %}" class="link link-primary">Back to Manage Squads</a>
+        <form method="post" action="{% url 'events:squad_delete' event.pk squad.pk %}"
+              onsubmit="return confirm('Are you sure you want to delete this squad? This cannot be undone.');">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-error btn-sm btn-outline">Delete Squad</button>
+        </form>
+      </div>
+      {% else %}
+      <div class="divider"></div>
+      <div class="text-center">
+        <a href="{% url 'events:squad_manage' event.pk %}" class="link link-primary">Back to Manage Squads</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  document.querySelectorAll('[data-channel-field]').forEach(function(field) {
+    var selectWrap = field.querySelector('[data-channel-select]');
+    var manualWrap = field.querySelector('[data-channel-manual]');
+    var toggle = field.querySelector('[data-channel-toggle]');
+    var select = selectWrap.querySelector('select');
+    var manualInput = manualWrap.querySelector('input');
+    var isManual = false;
+
+    toggle.addEventListener('click', function() {
+      isManual = !isManual;
+      if (isManual) {
+        selectWrap.classList.add('hidden');
+        manualWrap.classList.remove('hidden');
+        select.removeAttribute('name');
+        manualInput.setAttribute('name', 'discord_channel_id');
+        manualInput.value = select.value !== '0' ? select.value : '';
+        manualInput.focus();
+        toggle.textContent = 'or select from list';
+      } else {
+        manualWrap.classList.add('hidden');
+        selectWrap.classList.remove('hidden');
+        manualInput.removeAttribute('name');
+        select.setAttribute('name', 'discord_channel_id');
+        toggle.textContent = 'or enter ID manually';
+      }
+    });
+  });
+})();
+</script>
+{% include "events/_filter_select_script.html" %}
+{% endblock %}

@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+
+{% block title %}Zwift Verification{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+
+  <div>
+    <h1 class="text-2xl font-bold">Zwift Verification</h1>
+    <p class="text-sm text-base-content/60">
+      How each member verified their Zwift account, and who still needs to connect via Zwift Link.
+    </p>
+  </div>
+
+  {% if not configured %}
+    <div class="alert alert-warning">
+      <span>The Zwift API service isn't configured, so live connection data is unavailable. Verification methods below still reflect what is stored locally.</span>
+    </div>
+  {% elif service_error %}
+    <div class="alert alert-error">
+      <span>Couldn't reach the Zwift service, so the Connected column is not reliable right now. Verification methods below still reflect what is stored locally.</span>
+    </div>
+  {% endif %}
+
+  {# Summary across all members, independent of the filters below. #}
+  <div class="flex flex-wrap gap-2">
+    <a href="?sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if not method_filter %}badge-neutral{% else %}badge-ghost{% endif %}">
+      {{ counts.total }} members
+    </a>
+    <a href="?method=zauth&amp;sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if method_filter == 'zauth' %}badge-success{% else %}badge-ghost{% endif %}">
+      {{ counts.zauth }} Zwift OAuth
+    </a>
+    <a href="?method=legacy&amp;sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if method_filter == 'legacy' %}badge-warning{% else %}badge-ghost{% endif %}">
+      {{ counts.legacy }} legacy
+    </a>
+    <a href="?method=admin&amp;sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if method_filter == 'admin' %}badge-info{% else %}badge-ghost{% endif %}">
+      {{ counts.admin }} admin
+    </a>
+    {% if counts.unmethoded %}
+    <a href="?method=unmethoded&amp;sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if method_filter == 'unmethoded' %}badge-warning{% else %}badge-ghost{% endif %}">
+      {{ counts.unmethoded }} no method
+    </a>
+    {% endif %}
+    <a href="?method=unverified&amp;sort={{ sort_by }}&amp;dir={{ sort_dir }}" class="badge badge-lg {% if method_filter == 'unverified' %}badge-error{% else %}badge-ghost{% endif %}">
+      {{ counts.unverified }} not verified
+    </a>
+    <span class="badge badge-lg badge-outline">{{ counts.connected }} connected now</span>
+  </div>
+
+  <form method="get" class="flex flex-wrap items-end gap-3">
+    {# Carry the active sort through a filter submit, which would otherwise reset it. #}
+    <input type="hidden" name="sort" value="{{ sort_by }}">
+    <input type="hidden" name="dir" value="{{ sort_dir }}">
+    <label class="form-control">
+      <span class="label-text text-xs mb-1">Search</span>
+      <input type="search" name="q" value="{{ search_query }}" placeholder="Name, Discord, or Zwift ID"
+             class="input input-bordered input-sm w-64">
+    </label>
+    <label class="form-control">
+      <span class="label-text text-xs mb-1">Verification</span>
+      <select name="method" class="select select-bordered select-sm">
+        <option value="">Any</option>
+        {% for value, label in method_choices %}
+          <option value="{{ value }}" {% if method_filter == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="form-control">
+      <span class="label-text text-xs mb-1">Connected to Zwift</span>
+      <select name="connected" class="select select-bordered select-sm">
+        <option value="">Any</option>
+        <option value="yes" {% if connected_filter == 'yes' %}selected{% endif %}>Connected</option>
+        <option value="no" {% if connected_filter == 'no' %}selected{% endif %}>Not connected</option>
+      </select>
+    </label>
+    <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+    <a href="?" class="btn btn-ghost btn-sm">Reset</a>
+    {# Carries the live query string, so the download is the rows currently listed. #}
+    <a href="?{{ export_qs }}" class="btn btn-outline btn-sm gap-1">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+      </svg>
+      Export CSV
+    </a>
+  </form>
+
+  <div class="card bg-base-100 border border-base-300">
+    <div class="card-body p-0 overflow-x-auto">
+      <table class="table table-zebra table-sm table-pin-col" style="--pin-col-bg:var(--color-base-100)">
+        <thead>
+          <tr>
+            {% comment %}
+            Each header toggles direction when it is already the active sort, and
+            carries filter_qs so sorting never silently resets the filters.
+            {% endcomment %}
+            {% for key, label in sortable_columns %}
+              <th>
+                <a href="?{{ filter_qs }}{% if filter_qs %}&amp;{% endif %}sort={{ key }}&amp;dir={% if sort_by == key and sort_dir == 'asc' %}desc{% else %}asc{% endif %}"
+                   class="flex items-center gap-1 hover:text-primary whitespace-nowrap">
+                  {{ label }}
+                  {% if sort_by == key %}
+                    <span class="text-primary">{% if sort_dir == "asc" %}&#9650;{% else %}&#9660;{% endif %}</span>
+                  {% endif %}
+                </a>
+              </th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            <td class="font-medium whitespace-nowrap">
+              <a href="{% url 'accounts:public_profile' user_id=row.user.pk %}" class="link link-hover">
+                {{ row.user.get_full_name|default:row.user.discord_username|default:row.user.username }}
+              </a>
+            </td>
+            <td class="text-sm">{{ row.user.discord_username|default:"—" }}</td>
+            <td class="whitespace-nowrap">
+              {% if row.bucket == 'zauth' %}
+                <span class="badge badge-sm badge-success">Zwift OAuth</span>
+              {% elif row.bucket == 'legacy' %}
+                <span class="badge badge-sm badge-warning">Legacy</span>
+              {% elif row.bucket == 'admin' %}
+                <span class="badge badge-sm badge-info">Admin</span>
+              {% elif row.bucket == 'unmethoded' %}
+                <span class="badge badge-sm badge-warning" title="Verified before the method was recorded">No method</span>
+              {% else %}
+                <span class="badge badge-sm badge-error">Not verified</span>
+              {% endif %}
+            </td>
+            <td class="text-sm whitespace-nowrap">{{ row.verified_at|date:"Y-m-d"|default:"—" }}</td>
+            <td class="font-mono text-sm">
+              {% if row.zwid %}{{ row.zwid }}
+              {% elif row.service_zwid %}
+                <span class="text-base-content/50" title="Reported by the Zwift service; not stored on the profile yet">{{ row.service_zwid }}</span>
+              {% else %}—{% endif %}
+            </td>
+            <td class="text-sm whitespace-nowrap">
+              {% if row.connected %}
+                <span class="text-success">✓</span>
+                <span class="text-base-content/50">{{ row.connected_at|default:""|slice:":10" }}</span>
+                {% if row.service_zwid and row.zwid and row.service_zwid|stringformat:"s" != row.zwid|stringformat:"s" %}
+                  <span class="badge badge-xs badge-error ml-1" title="The service reports a different Zwift ID">mismatch</span>
+                {% endif %}
+              {% else %}
+                <span class="text-base-content/30">—</span>
+              {% endif %}
+            </td>
+            <td class="text-sm">{{ row.zwift_name|default:"—" }}</td>
+            <td class="text-sm">
+              {% if row.category %}{{ row.category }}{% endif %}{% if row.category_women %} / {{ row.category_women }}{% endif %}{% if not row.category and not row.category_women %}—{% endif %}
+            </td>
+          </tr>
+          {% empty %}
+          <tr><td colspan="8" class="text-center text-base-content/60 py-8">No members match these filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {% if orphans %}
+  <div class="card bg-base-100 border border-base-300">
+    <div class="card-body">
+      <h2 class="card-title text-base">Connections without a matching member ({{ orphans|length }})</h2>
+      <p class="text-sm text-base-content/60">
+        Zwift accounts connected under an id that isn't an active member — membership applications
+        (which connect under their own application id before the account exists), or members who have
+        since been deactivated.
+      </p>
+      <div class="overflow-x-auto">
+        <table class="table table-zebra table-sm table-pin-col" style="--pin-col-bg:var(--color-base-100)">
+          <thead>
+            <tr><th>Service id</th><th>Zwift ID</th><th>Zwift name</th><th>Connected</th></tr>
+          </thead>
+          <tbody>
+            {% for conn in orphans %}
+            <tr>
+              <td class="font-mono text-xs">{{ conn.user_id }}</td>
+              <td class="font-mono text-sm">{{ conn.zwid|default:"—" }}</td>
+              <td class="text-sm">{{ conn.zwift_name|default:"—" }}</td>
+              <td class="text-sm whitespace-nowrap">{{ conn.connected_at|default:""|slice:":10"|default:"—" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}

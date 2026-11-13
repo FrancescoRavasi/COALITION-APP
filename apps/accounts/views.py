@@ -1,0 +1,2587 @@
+"""Views for accounts app."""
+
+import json
+from collections import Counter
+from datetime import timedelta
+from urllib.parse import urlsplit
+
+import logfire
+from constance import config
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import logout
+from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
+from django.http import Http404, HttpRequest, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.templatetags.static import static
+from django.urls import reverse
+from django.utils import timezone
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
+from django_countries.fields import Country
+from django_htmx.http import HttpResponseClientRedirect
+
+from apps.accounts.decorators import team_member_required
+from apps.accounts.forms import ProfileForm
+from apps.accounts.models import BlockedDiscordId, User
+from apps.accounts.services import ZWIFT_LINK_KEY, delete_user_account
+from apps.rider_data.models import RiderProfile
+from apps.rider_data.tasks import refresh_zwift_profile, request_profile_refresh
+from apps.team.forms import RaceReadyRecordForm
+from apps.team.services import (
+    build_verify_type_options,
+    delete_verification_records,
+    get_user_required_verification_types,
+    get_user_verification_types,
+    media_access_summary,
+    media_retention_rules,
+    record_view_trail,
+)
+from apps.zwift import client as zwift_client
+from apps.zwift import profile_fields
+from gotta_bike_platform.log_utils import log_id
+
+# How recently the Zwift Racing data must have been fetched before the profile
+# refresh button is offered / honored. Mirrors the once-per-hour client guard.
+ZR_REFRESH_MIN_AGE = timedelta(hours=1)
+
+
+def zr_rating_tiers(zr_rider) -> list[dict]:
+    """Build the current / 30-day / 90-day rating rows for a profile.
+
+    The API reports all three, and they answer different questions: current is form today,
+    the two maxima are what a rider is seeded against. Showing only "current" made a rider
+    who has not raced recently look unrated.
+
+    Args:
+        zr_rider: The ZRRider row, or None.
+
+    Returns:
+        One row per tier, each with ``label``, ``rating``, ``category`` and ``date``.
+        Rows whose rating is null are kept, so the gap is visible rather than silent.
+
+    """
+    if zr_rider is None:
+        return []
+    return [
+        {
+            "label": label,
+            "rating": getattr(zr_rider, f"race_{key}_rating"),
+            "category": getattr(zr_rider, f"race_{key}_category"),
+            "date": getattr(zr_rider, f"race_{key}_date"),
+        }
+        for label, key in (("Current", "current"), ("30-day max", "max30"), ("90-day max", "max90"))
+    ]
+
+
+def _build_zwift_status_context(user: User, *, zr_refresh_error: bool = False) -> dict:
+    """Build the context for the ``accounts/partials/zwift_status.html`` partial.
+
+    Shared by ``profile_view`` (full page) and ``refresh_zr`` (HTMX swap) so the
+    ZwiftPower / Zwift Racing cards render identically. ``zr_last_updated`` and
+    ``zr_can_refresh`` drive the Zwift Racing refresh control on the own-profile
+    page (refresh is offered when the data is missing or at least
+    ``ZR_REFRESH_MIN_AGE`` old).
+
+    Args:
+        user: The profile owner (the requesting user).
+        zr_refresh_error: True to surface a "refresh failed" hint in the partial.
+
+    Returns:
+        Template context dict for the Zwift status partial.
+
+    """
+    from apps.team.services import ZP_DIV_TO_CATEGORY
+    from apps.zwiftpower.models import ZPTeamRiders
+    from apps.zwiftracing.models import ZRRider
+
+    zp_data = None
+    zr_data = None
+    zr_last_updated = None
+    zr_can_refresh = False
+    if user.has_accepted_zwid_verification and user.zwid:
+        zp_rider = ZPTeamRiders.objects.filter(zwid=user.zwid).first()
+        if zp_rider:
+            # Use divw for females, div for everyone else
+            div = zp_rider.divw if user.gender == "female" else zp_rider.div
+            zp_data = {
+                "category": ZP_DIV_TO_CATEGORY.get(div, ""),
+                "rank": zp_rider.rank,
+                "ftp": zp_rider.ftp,
+                "updated": zp_rider.date_modified,
+            }
+            # Include women's category for female riders
+            if user.gender == "female" and zp_rider.div:
+                zp_data["category_mixed"] = ZP_DIV_TO_CATEGORY.get(zp_rider.div, "")
+
+        zr_rider = ZRRider.objects.filter(zwid=user.zwid).first()
+        if zr_rider:
+            zr_data = {
+                "category": zr_rider.race_current_category,
+                "rating": zr_rider.race_current_rating,
+                "updated": zr_rider.date_modified,
+                "tiers": zr_rating_tiers(zr_rider),
+                # All three tiers go null once someone stops racing, so history is the
+                # only record that they ever had a rating.
+                "best_seen": zr_rider.best_rating_seen(),
+            }
+            zr_last_updated = zr_rider.date_modified
+            zr_can_refresh = (timezone.now() - zr_rider.date_modified) >= ZR_REFRESH_MIN_AGE
+        else:
+            # No record yet — allow an initial fetch.
+            zr_can_refresh = True
+
+    return {
+        "user": user,
+        "zp_data": zp_data,
+        "zr_data": zr_data,
+        "zr_last_updated": zr_last_updated,
+        "zr_can_refresh": zr_can_refresh,
+        "zr_refresh_error": zr_refresh_error,
+        **_zauth_status_context(user),
+    }
+
+
+def _zauth_status_context(user: User) -> dict:
+    """Build the Zwift Link (zauth) part of the ``zwift_status.html`` context.
+
+    Split out so the profile edit page can show the connection without also taking the
+    ZwiftPower / Zwift Racing cards, which it has never shown (its "Your Racing Data" card
+    covers them).
+
+    Args:
+        user: The profile owner (the requesting user).
+
+    Returns:
+        The ``zauth_*`` context keys.
+
+    """
+    # The live service view of the Zwift OAuth (zauth) connection, which is what verification
+    # is now made from. Read separately because the stored flag can lag it by up to an hour.
+    zauth_configured = zwift_client.is_configured()
+    zauth = zwift_client.get_connection_status(str(user.pk)) if zauth_configured else None
+    zauth_uuid = (zauth or {}).get("zwift_user_id") or ""
+    return {
+        "zauth_configured": zauth_configured,
+        # A failed read is not "not connected": the block says it could not check instead.
+        "zauth_status_unknown": zauth_configured and zauth is None,
+        "zauth_connected": bool(zauth and zauth.get("connected")),
+        "zauth_zwid": (zauth or {}).get("zwid"),
+        "zauth_connected_at": (zauth or {}).get("connected_at"),
+        "zauth_uuid_tail": zauth_uuid.split("-")[-1] if zauth_uuid else None,
+    }
+
+
+def _rider_profile_for(profile_user):
+    """Return the cached RiderProfile backing the rider data cards, or None.
+
+    Gated on the SAME verification state the ZwiftPower and ZwiftRacing cards used (read
+    through the cutover policy), and deliberately not on anything in the profile itself.
+    RiderProfile carries no verification state by design, and
+    ``payload["zwift_connection"]["status"]`` is not a stand-in for it:
+    it reports whether a Zwift account exists service-wide, not whether this rider is linked
+    to us. Reading it here would show a card for someone who had disconnected.
+
+    Note this is narrower than the live racing-profile call it replaces, which resolved the
+    connection service-side and so worked for a connected rider with no local ``zwid``. The
+    cache is keyed on ``zwid`` and only ever fetches riders who have one, so those riders get
+    no card until they are verified here.
+
+    Args:
+        profile_user: The user whose profile is being viewed.
+
+    Returns:
+        The RiderProfile row, or None if the rider is unverified, has no zwid, or has not
+        been synced yet.
+
+    """
+    if not (profile_user.has_accepted_zwid_verification and profile_user.zwid):
+        return None
+    return RiderProfile.objects.filter(zwid=profile_user.zwid).first()
+
+
+# How many times the cards come back for a fresh copy of themselves after an update is
+# requested, and how far apart. A self-terminating chain carried in the URL rather than a
+# server-side "in progress" flag: the cache is per-process (LocMem) so a flag would be
+# invisible to the other web workers, and a chain needs no cleanup when the rider closes the
+# tab halfway through.
+RIDER_CARD_RECHECKS = 3
+RIDER_CARD_RECHECK_SECONDS = 45
+
+# What to call each zauth source in front of a rider.
+_SOURCE_LABELS = {"zwiftpower": "ZwiftPower", "zwiftracing": "ZwiftRacing"}
+
+
+def _rider_card_context(profile_user: User, *, check: int = 0, message: str = "", level: str = "") -> dict:
+    """Build the context for one render of the rider data cards.
+
+    Args:
+        profile_user: The rider the cards describe.
+        check: Which re-check this render is; 0 for the first response after the button.
+        message: Status line to show beside the Update button, if any.
+        level: DaisyUI alert modifier for that line ("info", "error").
+
+    Returns:
+        Template context, including the next re-check step when one is still due.
+
+    """
+    return {
+        "profile_user": profile_user,
+        "rider_profile": _rider_profile_for(profile_user),
+        "refresh_message": message,
+        "refresh_level": level,
+        # An error is the end of the road -- there is nothing in flight to come back for.
+        "recheck_in": 0 if level == "error" else (check + 1 if check < RIDER_CARD_RECHECKS else 0),
+        "recheck_seconds": RIDER_CARD_RECHECK_SECONDS,
+    }
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def refresh_rider_data(request: HttpRequest, user_id: int) -> HttpResponse:
+    """Ask zauth to re-check a rider at ZwiftPower and ZwiftRacing, and re-render their cards.
+
+    POST triggers; GET is the cards fetching a fresh copy of themselves while the service works,
+    so the rider sees the new numbers without reloading. Both return the same partial, which
+    is why the two methods share a view -- the swap target and the markup must not drift.
+
+    Any team member may refresh any rider, and riders may always refresh themselves. The data
+    is public racing data either way, and the expensive half is throttled per source by zauth
+    rather than here, so a second click costs a skipped-status response.
+
+    Args:
+        request: The HTTP request.
+        user_id: The rider whose cards are being refreshed.
+
+    Returns:
+        The rendered rider data cards partial.
+
+    Raises:
+        PermissionDenied: When viewing someone else without team_member.
+
+    """
+    profile_user = get_object_or_404(User, id=user_id)
+    if profile_user != request.user and not request.user.has_permission("team_member"):
+        raise PermissionDenied
+
+    check = 0
+    try:
+        check = max(0, int(request.GET.get("check") or 0))
+    except ValueError:
+        check = 0
+
+    if request.method == "GET":
+        context = _rider_card_context(profile_user, check=check)
+        return render(request, "accounts/partials/rider_data_cards.html", context)
+
+    if not (profile_user.has_accepted_zwid_verification and profile_user.zwid):
+        # No button is rendered in this state, so this is a tampered or stale POST. Say so
+        # plainly rather than triggering a refresh for a zwid nobody has confirmed.
+        return render(
+            request,
+            "accounts/partials/rider_data_cards.html",
+            _rider_card_context(
+                profile_user,
+                message="This rider has no verified Zwift account to update.",
+                level="error",
+            ),
+        )
+
+    outcome = request_profile_refresh(profile_user.zwid)
+    logfire.info(
+        "Rider profile refresh requested from profile",
+        requested_by=request.user.id,
+        profile_user_id=profile_user.id,
+        zwid=profile_user.zwid,
+        reached=outcome["reached"],
+        queued=outcome["queued"],
+    )
+
+    if not outcome["reached"]:
+        message, level = "Could not reach the rider data service. Try again in a few minutes.", "error"
+    elif outcome["queued"]:
+        names = " and ".join(_SOURCE_LABELS[source] for source in sorted(outcome["queued"]))
+        message, level = f"Checking {names} for new data. This usually takes about a minute.", "info"
+    else:
+        # Every source was refreshed too recently upstream to check again. The pull still
+        # runs, so this is not a no-op -- our copy can be older than the service's.
+        message, level = "Both sources were checked very recently. Pulling the latest into this profile.", "info"
+
+    return render(
+        request,
+        "accounts/partials/rider_data_cards.html",
+        _rider_card_context(profile_user, message=message, level=level),
+    )
+
+
+def _fetch_racing_profile(user: User) -> dict | None:
+    """Fetch a user's official Zwift racing profile from the zauth service.
+
+    Returns the service's racing-profile dict enriched with a ``weight_kg``
+    convenience field, or None when unconfigured / not connected / on error. Kept
+    resilient so a slow or down service never breaks a profile page render.
+
+    Args:
+        user: The profile owner.
+
+    Returns:
+        The racing-profile context dict, or None.
+
+    """
+    from apps.zwift import client as zwift_client
+
+    profile = zwift_client.get_racing_profile(str(user.pk))
+    if not profile:
+        return None
+    grams = profile.get("weight_in_grams")
+    profile["weight_kg"] = round(grams / 1000, 1) if grams else None
+
+    # Zwift reports gender as a boolean `male` on the raw DTO, so it is resolved to a
+    # display string here rather than in the template: `{% if %}` on the bool itself
+    # cannot tell False (female) from absent, and would silently hide every woman.
+    zwift_gender = profile_fields.zwift_gender(profile)
+    profile["gender"] = dict(User.Gender.choices).get(zwift_gender) if zwift_gender else None
+
+    zwift_country = profile_fields.zwift_country(profile)
+    profile["country"] = Country(zwift_country).name if zwift_country else None
+
+    # A mismatch is only meaningful when the rider has answered for themselves; a blank
+    # profile field is not a disagreement, and would have been filled on connect anyway.
+    # "Other" gender does count as a mismatch -- Zwift cannot express it, but the team
+    # wants to see every divergence from what the rider races under.
+    profile["country_mismatch"] = bool(
+        zwift_country and user.country and user.country.code != zwift_country
+    )
+    profile["gender_mismatch"] = bool(zwift_gender and user.gender and user.gender != zwift_gender)
+    return profile
+
+
+def _fmt_hm(seconds: float | None) -> str | None:
+    """Format a duration in seconds as ``Hh MMm`` (or ``Mm`` under an hour).
+
+    Args:
+        seconds: Duration in seconds, or None.
+
+    Returns:
+        A short human string, or None when there is no duration.
+
+    """
+    if not seconds:
+        return None
+    total = round(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _fetch_activity_window(user: User) -> dict | None:
+    """Fetch a user's recent Zwift activities + 30-day stats from the zauth service.
+
+    Returns a template-friendly dict (distances in km, durations pre-formatted),
+    or None when unconfigured / not connected / on error. Kept resilient so a
+    slow or down service never breaks a profile page render.
+
+    Args:
+        user: The profile owner.
+
+    Returns:
+        The processed activity-window context, or None.
+
+    """
+    from apps.zwift import client as zwift_client
+
+    data = zwift_client.get_activity_stats(str(user.pk))
+    if not data:
+        return None
+
+    activities = []
+    for row in data.get("activities", []):
+        distance_m = row.get("distance_m")
+        activities.append(
+            {
+                "date": row.get("start_date_time"),
+                "name": row.get("name"),
+                "sport": row.get("sport"),
+                "distance_km": round(distance_m / 1000, 1) if distance_m else None,
+                "duration": _fmt_hm(row.get("duration_s")),
+            }
+        )
+
+    stats = data.get("stats") or {}
+    total_distance_m = stats.get("total_distance_m") or 0
+    return {
+        "days": stats.get("days", 30),
+        "count": stats.get("count", 0),
+        "sports": stats.get("sports") or {},
+        "total_distance_km": round(total_distance_m / 1000, 1),
+        "total_duration": _fmt_hm(stats.get("total_duration_s")),
+        "activities": activities,
+    }
+
+
+@login_required
+@require_GET
+def profile_view(request: HttpRequest) -> HttpResponse:
+    """Display user profile page.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered profile page.
+
+    """
+    from apps.team.models import RaceReadyRecord
+    from apps.team.services import get_user_required_verification_types
+
+    form = ProfileForm(instance=request.user)
+
+    # Build required verification summary with status
+    required_types = get_user_required_verification_types(request.user)
+    type_labels = {
+        "weight_full": "Weight (Full)",
+        "weight_light": "Weight (Light)",
+        "height": "Height",
+        "power": "Power",
+    }
+    verified_records = request.user.race_ready_records.filter(status=RaceReadyRecord.Status.VERIFIED)
+    pending_records = request.user.race_ready_records.filter(status=RaceReadyRecord.Status.PENDING)
+    latest_verified = {}
+    for record in verified_records:
+        if record.verify_type not in latest_verified:
+            latest_verified[record.verify_type] = record
+    required_summary = []
+    for vtype in required_types:
+        record = latest_verified.get(vtype)
+        if record and not record.is_expired:
+            status = "valid"
+        elif record and record.is_expired:
+            status = "expired"
+        elif pending_records.filter(verify_type=vtype).exists():
+            status = "pending"
+        else:
+            status = "missing"
+        required_summary.append({"type": vtype, "label": type_labels.get(vtype, vtype), "status": status})
+
+    context = _build_zwift_status_context(request.user)
+    context["form"] = form
+    context["required_summary"] = required_summary
+    context["racing_profile"] = _fetch_racing_profile(request.user)
+    return render(request, "accounts/profile.html", context)
+
+
+@login_required
+@require_POST
+def refresh_zr(request: HttpRequest) -> HttpResponse:
+    """Refresh the requesting user's Zwift Racing data (own profile only).
+
+    Rate-limited to once per ``ZR_REFRESH_MIN_AGE``: if the ``ZRRider`` record
+    was updated more recently the fetch is skipped (defends the upstream API
+    even if the client button is tampered with). Re-renders the Zwift status
+    partial for an HTMX swap.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered Zwift status partial.
+
+    """
+    from apps.zwiftracing.models import ZRRider
+    from apps.zwiftracing.tasks import refresh_rider_sync
+
+    user = request.user
+    refresh_error = False
+    if user.has_accepted_zwid_verification and user.zwid:
+        zr_rider = ZRRider.objects.filter(zwid=user.zwid).first()
+        recently_updated = zr_rider is not None and (timezone.now() - zr_rider.date_modified) < ZR_REFRESH_MIN_AGE
+        if not recently_updated:
+            status_code, rider = refresh_rider_sync(user.zwid)
+            refresh_error = rider is None
+            logfire.info(
+                "Profile ZR refresh requested",
+                user_id=user.id,
+                zwid=user.zwid,
+                status_code=status_code,
+                success=not refresh_error,
+            )
+
+    return render(
+        request,
+        "accounts/partials/zwift_status.html",
+        _build_zwift_status_context(user, zr_refresh_error=refresh_error),
+    )
+
+
+@login_required
+@require_GET
+def verification_view(request: HttpRequest) -> HttpResponse:
+    """Display user's verification records and submission form.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered verification page.
+
+    """
+    # Get allowed verification types based on user's ZwiftPower category
+    allowed_types = get_user_verification_types(request.user)
+    race_ready_form = RaceReadyRecordForm(
+        allowed_types=allowed_types,
+        unit_preference=request.user.unit_preference,
+    )
+
+    # Get all race ready records for the user
+    race_ready_records = request.user.race_ready_records.all()
+
+    # Get the most recent record for each verify_type
+    latest_by_type = {}
+    for verify_type in ["weight_full", "weight_light", "height", "power"]:
+        record = race_ready_records.filter(verify_type=verify_type).first()
+        if record:
+            latest_by_type[verify_type] = record
+
+    # Build required verification summary with status for each type
+    # Use latest *verified* record per type (not latest overall, which could be rejected)
+    from apps.team.models import RaceReadyRecord
+
+    verified_records = race_ready_records.filter(status=RaceReadyRecord.Status.VERIFIED)
+    latest_verified = {}
+    for record in verified_records:
+        if record.verify_type not in latest_verified:
+            latest_verified[record.verify_type] = record
+
+    required_types = get_user_required_verification_types(request.user)
+
+    # Which records are genuinely holding up a status right now, so the page only warns
+    # about deletions that would actually cost the rider something. A record is
+    # load-bearing when it is the *last* non-expired verified record of its type and that
+    # type is one the rider's status depends on -- a duplicate of the same type, or a type
+    # nothing needs, costs nothing to delete.
+    live_types = Counter(r.verify_type for r in verified_records if not r.is_expired)
+    weight_types = {"weight_light", "weight_full"}
+    weight_required = weight_types & set(required_types)
+    extra_types = {"weight_full", "height", "power"}
+
+    def _load_bearing(verify_type: str) -> bool:
+        if live_types[verify_type] > 1:
+            return False
+        # Categories 40/50 list both weight types and either one satisfies the
+        # requirement, so a weight record only matters when it is the last of *any* kind.
+        if len(weight_required) > 1 and verify_type in weight_required:
+            races = sum(live_types[t] for t in weight_required) == 1
+        else:
+            races = verify_type in required_types
+        # Extra Verified is a separate tier that always wants weight_full + height + power.
+        extra = request.user.is_extra_verified and verify_type in extra_types
+        return (races and request.user.is_race_ready) or extra
+
+    supporting_ids = {
+        record.pk for record in verified_records if not record.is_expired and _load_bearing(record.verify_type)
+    }
+
+    type_labels = {
+        "weight_full": "Weight (Full)",
+        "weight_light": "Weight (Light)",
+        "height": "Height",
+        "power": "Power",
+    }
+    required_summary = []
+    for vtype in required_types:
+        record = latest_verified.get(vtype)
+        if record and not record.is_expired:
+            status = "valid"
+        elif record and record.is_expired:
+            status = "expired"
+        elif race_ready_records.filter(verify_type=vtype, status=RaceReadyRecord.Status.PENDING).exists():
+            status = "pending"
+        else:
+            status = "missing"
+        required_summary.append({"type": vtype, "label": type_labels.get(vtype, vtype), "status": status})
+
+    # Each card answers three questions a rider could not previously ask of their own record:
+    # what happens to the evidence and when, how many people can open it, and who actually
+    # has. The last is the gap the audit named -- RecordView has always logged access, but
+    # only reviewers could see it.
+    annotated_records = []
+    for record in race_ready_records:
+        has_media = bool(record.media_file or record.url)
+        annotated_records.append(
+            {
+                "record": record,
+                "has_media": has_media,
+                "retention_rules": media_retention_rules(record) if has_media else [],
+                "access": media_access_summary(record) if has_media else None,
+                "views": record_view_trail(record) if has_media else [],
+            }
+        )
+    return render(
+        request,
+        "accounts/verification.html",
+        {
+            "race_ready_form": race_ready_form,
+            "race_ready_records": annotated_records,
+            "latest_by_type": latest_by_type,
+            "verify_type_options": build_verify_type_options(request.user),
+            "required_summary": required_summary,
+            "supporting_record_ids": supporting_ids,
+            "verification_form_message": config.VERIFICATION_FORM_MESSAGE,
+            "weight_instructions_url": config.WEIGHT_INSTRUCTIONS_URL,
+            "height_instructions_url": config.HEIGHT_INSTRUCTIONS_URL,
+            "unit_preference": request.user.unit_preference,
+        },
+    )
+
+
+@login_required
+@require_POST
+def verification_delete(request: HttpRequest) -> HttpResponse:
+    """Delete verification records the rider selected on their own verification page.
+
+    Only the requesting user's records can be reached: the ids are filtered through their
+    own related manager, so an id belonging to someone else matches nothing rather than
+    raising -- there is no probing signal either way.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect back to the verification page with a result message.
+
+    """
+    # isdigit() is not a safe guard here: "\u00b2" passes it but int() raises, and "\u0663"
+    # (Arabic-Indic three) passes it and int() silently yields 3 -- which would delete a
+    # record the rider never selected. Require plain ASCII decimals, and bound the value so
+    # an oversized id cannot overflow the primary key column either.
+    record_ids = []
+    for raw in request.POST.getlist("record_ids"):
+        if not (raw.isascii() and raw.isdecimal()):
+            continue
+        value = int(raw)
+        if 0 < value <= 9223372036854775807:
+            record_ids.append(value)
+
+    if not record_ids:
+        messages.info(request, "No records were selected.")
+        return redirect("accounts:verification")
+
+    result = delete_verification_records(request.user, record_ids)
+    if not result["deleted"]:
+        messages.info(request, "No records were selected.")
+        return redirect("accounts:verification")
+
+    deleted = result["deleted"]
+    noun = "record" if deleted == 1 else "records"
+    if result["was_race_ready"] and not result["is_race_ready"]:
+        messages.warning(
+            request,
+            f"Deleted {deleted} verification {noun}. You are no longer Race Verified — "
+            "submit a new verification to regain it.",
+        )
+    else:
+        messages.success(request, f"Deleted {deleted} verification {noun}.")
+
+    # Extra Verified is a separate tier, and losing it used to happen silently.
+    if result["was_extra_verified"] and not result["is_extra_verified"]:
+        messages.warning(
+            request,
+            "You are no longer Extra Verified — that needs valid weight, height and power records.",
+        )
+
+    if result["failed_media"]:
+        messages.warning(
+            request,
+            "Some evidence files could not be removed from storage. They have been logged for cleanup.",
+        )
+
+    return redirect("accounts:verification")
+
+
+@login_required
+@team_member_required()
+@require_GET
+def public_profile_by_zwid(request: HttpRequest, zwid: int) -> HttpResponse:
+    """Reach a rider's profile by Zwift id instead of by our own user id.
+
+    The zwid is the join key across ZwiftPower, ZwiftRacing, zauth and the roster, so it is
+    usually the identifier in hand -- from a result row, a Discord message, or a link someone
+    pasted -- while our user id is known only to this app.
+
+    Redirects rather than rendering, so the profile page stays the single place that decides
+    what a viewer may see. It also keeps one canonical URL per rider instead of two that can
+    drift apart.
+
+    ``zwid`` is indexed but not unique on User, so two accounts claiming one id is possible
+    in the schema even though it should not happen in practice. This raises rather than
+    picking a winner: quietly resolving it would send a viewer to one of two people with no
+    sign anything was wrong, and would hide the duplicate for as long as nobody noticed.
+
+    Args:
+        request: The HTTP request.
+        zwid: The rider's Zwift id.
+
+    Returns:
+        Redirect to the canonical profile URL.
+
+    Raises:
+        Http404: If no account claims that zwid.
+        MultipleObjectsReturned: If more than one does, which is a data problem to fix.
+
+    """
+    try:
+        rider = User.objects.get(zwid=zwid)
+    except User.DoesNotExist as exc:
+        raise Http404(f"No member with Zwift id {zwid}") from exc
+    except User.MultipleObjectsReturned:
+        logfire.error(
+            "Multiple accounts claim one Zwift id",
+            zwid=zwid,
+            user_ids=list(User.objects.filter(zwid=zwid).values_list("pk", flat=True)),
+        )
+        raise
+
+    return redirect("accounts:public_profile", user_id=rider.pk)
+
+
+@login_required
+@team_member_required()
+@require_GET
+def public_profile_view(request: HttpRequest, user_id: int) -> HttpResponse:
+    """Display a user's public profile for team members.
+
+    Shows public information only (no birth_year, email, or emergency contact).
+    Requires team_member permission to view.
+
+    Args:
+        request: The HTTP request.
+        user_id: The ID of the user whose profile to display.
+
+    Returns:
+        Rendered public profile page.
+
+    """
+    from django.shortcuts import get_object_or_404
+
+    from apps.zwiftpower.models import ZPRiderResults
+
+    profile_user = get_object_or_404(User, id=user_id)
+
+    # Check if viewing own profile
+    is_own_profile = profile_user == request.user
+
+    # Recent results still come from ZwiftPower: they are race records, not rider attributes,
+    # so the RiderProfile cards cannot supply them and this query stays.
+    recent_results = []
+    if profile_user.has_accepted_zwid_verification and profile_user.zwid:
+        recent_results = ZPRiderResults.objects.filter(zwid=profile_user.zwid).select_related("event")[:5]
+
+    # Get YouTube videos from database (synced via background task)
+    youtube_videos = profile_user.youtube_videos.all()[:5]
+
+    # Get verification records for this user
+    from apps.team.models import RaceReadyRecord
+
+    verified_records = RaceReadyRecord.objects.filter(
+        user=profile_user,
+        status=RaceReadyRecord.Status.VERIFIED,
+    ).order_by("-reviewed_date")
+    pending_records = RaceReadyRecord.objects.filter(
+        user=profile_user,
+        status=RaceReadyRecord.Status.PENDING,
+    ).order_by("-date_created")
+
+    # Build verification summary: latest verified record per type
+    verification_summary = {}
+    for record in verified_records:
+        if record.verify_type not in verification_summary:
+            verification_summary[record.verify_type] = record
+
+    return render(
+        request,
+        "accounts/public_profile.html",
+        {
+            "profile_user": profile_user,
+            "rider_profile": _rider_profile_for(profile_user),
+            "activity_window": _fetch_activity_window(profile_user),
+            "is_own_profile": is_own_profile,
+            "recent_results": recent_results,
+            "youtube_videos": youtube_videos,
+            "verification_summary": verification_summary,
+            "pending_records": pending_records,
+        },
+    )
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def profile_edit(request: HttpRequest) -> HttpResponse:
+    """Edit user profile with HTMX support.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered profile form (partial for HTMX, full page otherwise).
+
+    """
+    from apps.accounts.services import get_approved_application, get_importable_fields
+
+    if request.method == "POST":
+        form = ProfileForm(request.POST, instance=request.user)
+        if form.is_valid():
+            form.save()
+            # Refresh user from database to get updated is_profile_complete
+            request.user.refresh_from_db()
+
+            # Get missing banner fields for the success message
+            missing_fields = []
+            field_labels = {
+                "first_name": "First Name",
+                "last_name": "Last Name",
+                "birth_year": "Birth Year",
+                "gender": "Gender",
+                "timezone": "Timezone",
+                "country": "Country",
+                "trainer": "Trainer",
+                "heartrate_monitor": "Heart Rate Monitor",
+                "zwid_verified": "Zwift Verification",
+            }
+            completion_status = request.user.profile_completion_status
+            for field, is_complete in completion_status.items():
+                if not is_complete:
+                    missing_fields.append(field_labels.get(field, field))
+
+            if request.headers.get("HX-Request"):
+                # Return success message partial for HTMX
+                return render(
+                    request,
+                    "accounts/partials/profile_form.html",
+                    {"form": form, "success": True, "missing_fields": missing_fields},
+                )
+            if missing_fields:
+                messages.success(
+                    request,
+                    f"Profile updated successfully. Still missing: {', '.join(missing_fields)}",
+                )
+            else:
+                messages.success(request, "Profile updated successfully. Your profile is complete!")
+            # Only redirect to profile if complete, otherwise stay on edit page
+            if request.user.is_profile_complete:
+                return redirect("accounts:profile")
+            return redirect("accounts:profile_edit")
+    else:
+        form = ProfileForm(instance=request.user)
+
+    # Check for approved MembershipApplication to import. The banner only shows while the
+    # import would still change something -- a blank field to fill, or a Zwift link to move
+    # to a member who is not yet zauth-verified -- so it does not stay up for good.
+    pending_application = None
+    importable_fields = None
+    if request.user.discord_id:
+        pending_application = get_approved_application(request.user.discord_id)
+        if pending_application:
+            importable_fields = get_importable_fields(pending_application, request.user)
+            if not importable_fields:
+                pending_application = None
+
+    context = {
+        "form": form,
+        "pending_application": pending_application,
+        "importable_fields": importable_fields,
+        **_carry_over_flags(importable_fields),
+        # The same cached row the public profile shows, so a rider can see what the rest of
+        # the team sees about them. Read-only: nothing on this page edits it, and the sync
+        # would overwrite an edit on its next run anyway.
+        "rider_profile": _rider_profile_for(request.user),
+    }
+
+    if request.headers.get("HX-Request"):
+        template = "accounts/partials/profile_form.html"
+    else:
+        template = "accounts/profile_edit.html"
+        # The full page includes the Zwift status partial. It gets the Zwift Link block the
+        # "Remove" swap renders too, but not the rating cards, which this page never showed.
+        context = {**_zauth_status_context(request.user), **context}
+    return render(request, template, context)
+
+
+def _carry_over_flags(importable_fields: dict | None) -> dict:
+    """Say whether an import would move the registration's Zwift link, and whether that is all.
+
+    The import banner and the confirmation page word themselves by this: "auto-fill your
+    profile" is wrong when the Zwift link is the only thing left to import.
+
+    Args:
+        importable_fields: The :func:`get_importable_fields` result, or None.
+
+    Returns:
+        ``offers_zwift_carry_over`` and ``offers_only_zwift_carry_over``.
+
+    """
+    offers = bool(importable_fields and ZWIFT_LINK_KEY in importable_fields)
+    return {
+        "offers_zwift_carry_over": offers,
+        "offers_only_zwift_carry_over": offers and len(importable_fields) == 1,
+    }
+
+
+@login_required
+@require_GET
+def profile_delete_confirm(request: HttpRequest) -> HttpResponse:
+    """Show delete account confirmation page.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered delete confirmation page.
+
+    """
+    return render(request, "accounts/profile_delete.html")
+
+
+@login_required
+@require_POST
+def profile_delete(request: HttpRequest) -> HttpResponse:
+    """Delete user account.
+
+    Requires user to type "Delete" (case-insensitive) to confirm.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect to home page after deletion, or back to confirmation if invalid.
+
+    """
+    confirmation = request.POST.get("confirmation", "").strip()
+    if confirmation.lower() != "delete":
+        logfire.info(
+            "Account deletion not confirmed",
+            user_id=request.user.pk,
+            discord_id=request.user.discord_id,
+        )
+        messages.error(request, "Please type 'Delete' to confirm account deletion.")
+        return redirect("accounts:profile_delete_confirm")
+
+    user = request.user
+    # logout() before the delete: the session row is keyed to the user, and the request
+    # still needs a valid session to carry the success message to the next page.
+    logout(request)
+    result = delete_user_account(user)
+    if result["complete"]:
+        messages.success(request, "Your account has been deleted.")
+    else:
+        messages.warning(
+            request,
+            "Your account has been deleted, but some of your data could not be removed "
+            "automatically. This has been flagged for an administrator to finish by hand.",
+        )
+    return redirect("/")
+
+
+@login_required
+@require_http_methods(["GET", "POST"])
+def import_application_view(request: HttpRequest, application_id: str) -> HttpResponse:
+    """Import data from approved MembershipApplication to user profile.
+
+    GET: Show confirmation page with fields to import.
+    POST: Perform import and redirect to profile_edit.
+
+    Args:
+        request: The HTTP request.
+        application_id: UUID of the MembershipApplication.
+
+    Returns:
+        Rendered confirmation page or redirect after import.
+
+    Raises:
+        PermissionDenied: If application doesn't belong to this user.
+
+    """
+    import uuid
+
+    from django.shortcuts import get_object_or_404
+
+    from apps.accounts.services import carry_over_zwift_link, get_importable_fields, import_application_to_user
+    from apps.team.models import MembershipApplication
+
+    # Parse UUID
+    try:
+        app_uuid = uuid.UUID(str(application_id))
+    except ValueError:
+        logfire.warning(
+            "Invalid application UUID in import request",
+            user_id=request.user.id,
+            application_id=str(application_id),
+        )
+        messages.error(request, "Invalid application ID.")
+        return redirect("accounts:profile_edit")
+
+    # Get the application
+    application = get_object_or_404(MembershipApplication, pk=app_uuid)
+
+    # Security check: verify application belongs to this user. A blank discord_id on both
+    # sides (an account without Discord, a registration added in the admin) is not a match.
+    if not request.user.discord_id or application.discord_id != request.user.discord_id:
+        logfire.warning(
+            "User attempted to import application belonging to another user",
+            user_id=request.user.id,
+            user_discord_id=request.user.discord_id,
+            application_discord_id=application.discord_id,
+            application_id=str(application_id),
+        )
+        raise PermissionDenied("You don't have permission to import this application.")
+
+    # Verify application is approved
+    if application.status != MembershipApplication.Status.APPROVED:
+        logfire.warning(
+            "User attempted to import non-approved application",
+            user_id=request.user.id,
+            application_id=str(application_id),
+            application_status=application.status,
+        )
+        messages.error(request, "Only approved registrations can be imported.")
+        return redirect("accounts:profile_edit")
+
+    # Get importable fields
+    importable_fields = get_importable_fields(application, request.user)
+
+    if not importable_fields:
+        messages.info(request, "No new data to import from your registration.")
+        return redirect("accounts:profile_edit")
+
+    carry_over = _carry_over_flags(importable_fields)
+
+    if request.method == "POST":
+        # Perform the import
+        imported_fields = import_application_to_user(request.user, application)
+        # The offer was decided a moment ago by get_importable_fields, which asked the service;
+        # passing it on saves asking again while the member waits.
+        zwift = carry_over_zwift_link(request.user, application, offered=carry_over["offers_zwift_carry_over"])
+
+        if imported_fields:
+            field_list = ", ".join(imported_fields)
+            messages.success(request, f"Successfully imported: {field_list}")
+        elif zwift.outcome == "skipped":
+            messages.info(request, "No new data was imported (fields already filled).")
+
+        zwift_message = _ZWIFT_CARRY_OVER_MESSAGES.get(zwift.outcome)
+        if zwift.verified and zwift.outcome in _VERIFIED_MEANS_MOVED:
+            # Said from where the member ended up, not from the relink's answer: a response lost
+            # after the service moved the link, or a second submit finding it already gone,
+            # reads as a failure but leaves the member verified.
+            messages.success(request, f"Your Zwift account (Zwift ID {zwift.zwid}) is now linked to your profile.")
+        elif zwift_message:
+            level, text = zwift_message
+            messages.add_message(request, level, text)
+
+        return redirect("accounts:profile_edit")
+
+    # GET: Show confirmation page
+    return render(
+        request,
+        "accounts/import_application.html",
+        {
+            "application": application,
+            "importable_fields": importable_fields,
+            **carry_over,
+        },
+    )
+
+
+# The relink outcomes after which a verified member got there through the registration's link.
+# A conflict is not one of them: the member was verified by their own, different, account.
+_VERIFIED_MEANS_MOVED = frozenset({"moved", "not_found", "error"})
+
+# What the member is told after the import tried to move their registration's Zwift link, when
+# they did not end up verified by it; that case names the zwid and is written in the view.
+_ZWIFT_CARRY_OVER_MESSAGES = {
+    "moved": (
+        messages.INFO,
+        "Your registration's Zwift connection was moved to your account. "
+        "Your profile will show it as verified once the Zwift service confirms it.",
+    ),
+    "conflict": (
+        messages.WARNING,
+        "Your account is already linked to a different Zwift account, "
+        "so the Zwift connection on your registration was not used.",
+    ),
+    # The offer was only made after the service confirmed the link, so this is either a race
+    # or a zauth deploy that predates the relink endpoint (which answers 404 too). The member's
+    # way forward is the same for both.
+    "not_found": (
+        messages.WARNING,
+        "We couldn't find the Zwift connection on your registration to move. Please connect Zwift from your profile.",
+    ),
+    "error": (
+        messages.WARNING,
+        "We couldn't move the Zwift connection from your registration. Please connect Zwift from your profile.",
+    ),
+    "unconfigured": (
+        messages.WARNING,
+        "We couldn't move the Zwift connection from your registration. Please connect Zwift from your profile.",
+    ),
+}
+
+
+ZAUTH_BANNER_DISMISSED_KEY = "zauth_banner_dismissed"
+
+
+@login_required
+@require_POST
+def dismiss_zauth_banner(request: HttpRequest) -> HttpResponse:
+    """Hide the Zwift OAuth banner for the rest of this browser session.
+
+    Session-scoped on purpose: the prompt is an invitation rather than an error,
+    so it should not nag on every page load, but it should come back next session
+    until the account is actually connected. No model field, no migration.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        An empty 200 so htmx can swap the banner away.
+
+    """
+    request.session[ZAUTH_BANNER_DISMISSED_KEY] = True
+    return HttpResponse("")
+
+
+@login_required
+@require_POST
+def unverify_zwift(request: HttpRequest) -> HttpResponse:
+    """Remove Zwift verification from user's account.
+
+    Severs the zauth connection first. Verification now only comes from that connection,
+    and the hourly reconcile (and every ``/user/zauth/`` visit) re-grants it to anyone the
+    service still reports as connected, so clearing the local fields alone would not stick.
+
+    So nothing is cleared unless the service has confirmed there is no link left: when it
+    could not be reached -- or is not configured here and the verification came from a
+    link -- the rider is told to try again and keeps the verification. Clearing it anyway
+    would show them "removed" while the link, and the reconcile re-granting from it, stayed.
+    The registration's own "Remove" (``application_unverify_zwift``) refuses the same way.
+
+    Clears the provenance (``zwid_verification_method`` / ``zwid_verified_at``) along
+    with the flag: they describe a verification that no longer exists, and the Zwift
+    connections report shows "verified on" next to the method, so a stale timestamp reads
+    as a verification the rider has actually removed.
+
+    Dropping the ZWID also changes which verifications race-ready requires, so the cached
+    flag is recomputed and the Discord role moved with it.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Rendered Zwift status partial for HTMX requests.
+
+    """
+    # Read the live value, not the cached column: a verification that expired since the last
+    # refresh_all_race_ready sweep would otherwise make this look like the cause of a status
+    # loss it had nothing to do with.
+    was_race_ready = request.user.calculate_race_ready()
+    old_zwid = request.user.zwid
+    # A boolean rather than the method itself: production Logfire scrubs any value containing
+    # "auth", which is the one method this log exists to count.
+    verified_by_zwift_link = request.user.zwid_verification_method == User.VerificationMethod.ZAUTH
+
+    link = zwift_client.disconnect_link(str(request.user.pk))
+    link_unconfirmed = link is zwift_client.DisconnectOutcome.FAILED or (
+        link is zwift_client.DisconnectOutcome.UNCONFIGURED and verified_by_zwift_link
+    )
+    if link_unconfirmed:
+        logfire.warning(
+            "Zwift verification removal refused: the Zwift link could not be confirmed removed",
+            user_id=request.user.pk,
+            zwift_link_outcome=str(link),
+            verified_by_zwift_link=verified_by_zwift_link,
+        )
+        context = _zwift_status_swap_context(request)
+        context["zwift_remove_error"] = (
+            "We couldn't reach Zwift to disconnect your account, so your verification has not "
+            "been removed. Please try again later."
+        )
+        return render(request, "accounts/partials/zwift_status.html", context)
+
+    request.user.zwid = None
+    request.user.zwid_verified = False
+    request.user.zwid_verification_method = ""
+    request.user.zwid_verified_at = None
+    request.user.save(update_fields=["zwid", "zwid_verified", "zwid_verification_method", "zwid_verified_at"])
+    # Required verification types are keyed on zwid (ZPTeamRiders -> ZP category), so dropping
+    # it falls back to the default requirements. is_race_ready is a cache with no signal behind
+    # it, so refresh it rather than leaving it wrong until the next sweep.
+    is_race_ready, _ = request.user.refresh_race_ready()
+
+    if is_race_ready != was_race_ready:
+        # Move the Discord race-ready role now rather than leaving the rider wearing (or
+        # missing) it until the 6-hourly sync_race_ready_roles sweep notices. Unlike deleting
+        # records, this can go either way: losing the ZP category can as easily drop a rider
+        # into the default requirements they already meet as out of ones they did.
+        from apps.team.tasks import notify_race_ready_change
+
+        notify_race_ready_change.enqueue(
+            user_id=request.user.pk,
+            is_now_race_ready=is_race_ready,
+            changed_by_user_id=request.user.pk,
+        )
+
+    logfire.info(
+        "Rider removed their own Zwift verification",
+        user_id=request.user.pk,
+        discord_id=request.user.discord_id,
+        old_zwid=old_zwid,
+        verified_by_zwift_link=verified_by_zwift_link,
+        zwift_link_removed=link is zwift_client.DisconnectOutcome.REMOVED,
+        zwift_link_outcome=str(link),
+        was_race_ready=was_race_ready,
+        is_race_ready=is_race_ready,
+    )
+
+    context = _zwift_status_swap_context(request)
+    # The swap replaces the button that had focus, so say what happened (role="status").
+    context["zwift_removed"] = True
+    return render(request, "accounts/partials/zwift_status.html", context)
+
+
+def _zwift_status_swap_context(request: HttpRequest) -> dict:
+    """Build the context for re-rendering ``zwift_status.html`` in place after a "Remove".
+
+    The partial is on two pages. The profile shows the ZwiftPower / Zwift Racing cards in it;
+    the edit page never has (its "Your Racing Data" card covers them), so a swap there gets the
+    Zwift Link block only, as the edit page itself does.
+
+    Args:
+        request: The HTMX request; its ``HX-Current-URL`` says which page it came from.
+
+    Returns:
+        The partial's context.
+
+    """
+    current_path = urlsplit(getattr(getattr(request, "htmx", None), "current_url_abs_path", None) or "").path
+    if current_path == reverse("accounts:profile_edit"):
+        return {"user": request.user, **_zauth_status_context(request.user)}
+    return _build_zwift_status_context(request.user)
+
+
+@login_required
+@require_POST
+def submit_race_ready(request: HttpRequest) -> HttpResponse:
+    """Submit a race ready verification record.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect to profile or rendered partial for HTMX.
+
+    """
+    if not request.user.has_accepted_zwid_verification:
+        # The page hides the form in this state, so this is a stale tab or a hand-made POST.
+        # The records are evidence about a Zwift account, and there is none confirmed yet.
+        logfire.warning("Race ready submission refused: Zwift account not verified", user_id=request.user.id)
+        messages.error(request, "Connect your Zwift account before submitting a verification record.")
+        if request.headers.get("HX-Request"):
+            return HttpResponseClientRedirect(reverse("accounts:verification"))
+        return redirect("accounts:verification")
+
+    # Get allowed verification types to validate and filter form choices
+    allowed_types = get_user_verification_types(request.user)
+    logfire.info(
+        "Race ready form submission attempt",
+        user_id=request.user.id,
+        verify_type=request.POST.get("verify_type"),
+        has_media_file=bool(request.FILES.get("media_file")),
+        has_url=bool(request.POST.get("url")),
+    )
+    form = RaceReadyRecordForm(
+        request.POST,
+        request.FILES,
+        allowed_types=allowed_types,
+        unit_preference=request.user.unit_preference,
+    )
+
+    if form.is_valid():
+        record = form.save(commit=False)
+        record.user = request.user
+        record.save()
+        logfire.info(
+            "Race ready record created",
+            user_id=request.user.id,
+            record_id=record.id,
+            verify_type=record.verify_type,
+        )
+        messages.success(request, "Race ready record submitted successfully.")
+
+        # Notify squad captains about new submission
+        from apps.team.tasks import notify_captains_verification
+
+        notify_captains_verification.enqueue(
+            user_id=request.user.id,
+            record_id=record.id,
+            notification_type="submitted",
+        )
+
+        # Re-read the rider's Zwift weight and height now, so the reviewer compares the claim
+        # with what is set in Zwift at submission rather than at the last scheduled read.
+        if record.is_body_measurement:
+            refresh_zwift_profile.enqueue(user_id=request.user.id)
+
+        # Notify the performance verification team when a power record is submitted
+        if record.verify_type == "power":
+            from apps.team.tasks import notify_pvt_power_submission
+
+            notify_pvt_power_submission.enqueue(record_id=record.id)
+
+        if request.headers.get("HX-Request"):
+            # Return updated race ready section
+            race_ready_records = request.user.race_ready_records.all()
+            latest_by_type = {}
+            for verify_type in ["weight_full", "weight_light", "height", "power"]:
+                rec = race_ready_records.filter(verify_type=verify_type).first()
+                if rec:
+                    latest_by_type[verify_type] = rec
+            return render(
+                request,
+                "accounts/partials/race_ready_form.html",
+                {
+                    "race_ready_form": RaceReadyRecordForm(
+                        allowed_types=allowed_types,
+                        unit_preference=request.user.unit_preference,
+                    ),
+                    "race_ready_records": race_ready_records,
+                    "latest_by_type": latest_by_type,
+                    "verify_type_options": build_verify_type_options(request.user),
+                    "success": True,
+                    "weight_instructions_url": config.WEIGHT_INSTRUCTIONS_URL,
+                    "height_instructions_url": config.HEIGHT_INSTRUCTIONS_URL,
+                    "unit_preference": request.user.unit_preference,
+                },
+            )
+        return redirect("accounts:verification")
+    logfire.warning(
+        "Race ready form validation failed",
+        user_id=request.user.id,
+        verify_type=request.POST.get("verify_type"),
+        # Codes, not messages: a message can quote what the rider sent, such as a file name.
+        form_errors={field: [e.code or "invalid" for e in errors.as_data()] for field, errors in form.errors.items()},
+    )
+    if request.headers.get("HX-Request"):
+        return render(
+            request,
+            "accounts/partials/race_ready_form.html",
+            {
+                "race_ready_form": form,
+                "verify_type_options": build_verify_type_options(request.user),
+                "weight_instructions_url": config.WEIGHT_INSTRUCTIONS_URL,
+                "height_instructions_url": config.HEIGHT_INSTRUCTIONS_URL,
+                "unit_preference": request.user.unit_preference,
+            },
+        )
+    messages.error(request, "Please correct the errors below.")
+    return redirect("accounts:verification")
+
+
+def _get_config_sections() -> dict:
+    """Build configuration sections from CONSTANCE_CONFIG_FIELDSETS.
+
+    Returns:
+        Dictionary with section keys, names, and setting details.
+
+    """
+    constance_config = settings.CONSTANCE_CONFIG
+    fieldsets = settings.CONSTANCE_CONFIG_FIELDSETS
+
+    sections = {}
+    for section_name, setting_keys in fieldsets.items():
+        section_key = section_name.lower().replace(" ", "_")
+        section_settings = []
+
+        for key in setting_keys:
+            if key in constance_config:
+                setting_def = constance_config[key]
+                default_value, description, field_type = setting_def[0], setting_def[1], setting_def[2]
+
+                # Determine the input type
+                if field_type == "password_field":
+                    input_type = "password"
+                elif field_type == "json_list_field":
+                    input_type = "json_list"
+                elif field_type == "string_list_field":
+                    input_type = "string_list"
+                elif field_type == "json_field":
+                    input_type = "json"
+                elif field_type == "textarea_field":
+                    input_type = "textarea"
+                elif field_type is bool:
+                    input_type = "boolean"
+                elif field_type is int:
+                    input_type = "number"
+                else:
+                    input_type = "text"
+
+                # Get current value from constance
+                current_value = getattr(config, key, default_value)
+
+                section_settings.append({
+                    "key": key,
+                    "description": description,
+                    "input_type": input_type,
+                    "default_value": default_value,
+                    "current_value": current_value,
+                })
+
+        if section_key == "scheduler":
+            section_settings = _group_scheduler_settings(section_settings)
+
+        sections[section_key] = {
+            "name": section_name,
+            "key": section_key,
+            "settings": section_settings,
+        }
+
+    return sections
+
+
+def _group_scheduler_settings(section_settings: list[dict]) -> list[dict]:
+    """Order cadence settings by the service their task contacts, and label the boundaries.
+
+    The same grouping the background-tasks page uses, for the same reason: when something is
+    misbehaving the question is usually which service it talks to, and a flat list of
+    twenty-eight intervals does not answer it.
+
+    The mapping is derived from the task registry rather than written out again here, so a task
+    registered with a group and a cadence lands in the right place with no second list to keep
+    in step. Settings that drive no task -- a fallback value that happens to sit among the
+    cadences -- collect under their own heading rather than being silently dropped or, worse,
+    filed under whichever group they happen to sort next to.
+
+    Args:
+        section_settings: The scheduler section's settings, in fieldset order.
+
+    Returns:
+        The same settings, reordered, each carrying ``group_label`` and a ``group_start`` flag
+        marking the first entry of its group.
+
+    """
+    from gotta_bike_platform.task_registry import (
+        TASK_GROUP_ORDER,
+        group_rank,
+        scheduler_setting_anchors,
+        scheduler_setting_groups,
+    )
+
+    groups = scheduler_setting_groups()
+    anchors = scheduler_setting_anchors()
+    ungrouped = "Not a task cadence"
+
+    def sort_key(setting: dict) -> tuple[int, str, str, int]:
+        key = setting["key"]
+        label = groups.get(key, ungrouped)
+        # Settings driving no task sort last whatever they are called.
+        rank = len(TASK_GROUP_ORDER) + 1 if label == ungrouped else group_rank(label)
+        # Within a group, order by cadence -- a companion sorts under its cadence's key and
+        # then after it, so a threshold stays beside the interval it is compared against
+        # instead of drifting off alphabetically.
+        return (rank, label, anchors.get(key, key), 1 if key in anchors else 0)
+
+    ordered = sorted(section_settings, key=sort_key)
+    seen: set[str] = set()
+    for setting in ordered:
+        label = groups.get(setting["key"], ungrouped)
+        setting["group_label"] = label
+        setting["group_start"] = label not in seen
+        seen.add(label)
+    return ordered
+
+
+@login_required
+@require_POST
+def compliance_block_add(request: HttpRequest) -> HttpResponse:
+    """Bar a Discord account from signing in.
+
+    Args:
+        request: The HTTP request, carrying ``discord_id`` and an optional ``note``.
+
+    Returns:
+        Redirect back to the Compliance section.
+
+    Raises:
+        PermissionDenied: If the user lacks app_admin and is not a superuser.
+
+    """
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    discord_id = request.POST.get("discord_id", "").strip()
+    if not (discord_id.isascii() and discord_id.isdecimal()):
+        messages.error(request, "Enter a Discord ID: digits only, no username.")
+        return redirect("config_section_page", section_key="compliance")
+
+    if request.user.discord_id == discord_id:
+        # Cheap guard against the most annoying possible mistake.
+        messages.error(request, "That is your own Discord account.")
+        return redirect("config_section_page", section_key="compliance")
+
+    _, created = BlockedDiscordId.objects.get_or_create(
+        discord_id=discord_id,
+        defaults={"note": request.POST.get("note", "").strip(), "blocked_by": request.user},
+    )
+
+    # The block only bites at the next login, and sessions last two weeks by default — so
+    # end any session they already hold. Rotating the (unusable) password changes the
+    # session auth hash, which is what AuthenticationMiddleware checks on every request.
+    signed_out = False
+    if created:
+        blocked_user = User.objects.filter(discord_id=discord_id).first()
+        if blocked_user:
+            blocked_user.set_unusable_password()
+            blocked_user.save(update_fields=["password"])
+            signed_out = True
+
+    logfire.info(
+        "Discord login block added" if created else "Discord login block already existed",
+        discord_id=discord_id,
+        admin_user_id=request.user.pk,
+        sessions_invalidated=signed_out,
+    )
+    if created:
+        tail = " They have been signed out of any active session." if signed_out else ""
+        messages.success(request, f"{discord_id} can no longer sign in.{tail}")
+    else:
+        messages.info(request, f"{discord_id} was already blocked.")
+    return redirect("config_section_page", section_key="compliance")
+
+
+@login_required
+@require_POST
+def compliance_block_remove(request: HttpRequest) -> HttpResponse:
+    """Lift a login block.
+
+    Args:
+        request: The HTTP request, carrying ``block_id``.
+
+    Returns:
+        Redirect back to the Compliance section.
+
+    Raises:
+        PermissionDenied: If the user lacks app_admin and is not a superuser.
+
+    """
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    block = get_object_or_404(BlockedDiscordId, pk=request.POST.get("block_id") or 0)
+    discord_id = block.discord_id
+    block.delete()
+    logfire.info("Discord login block removed", discord_id=discord_id, admin_user_id=request.user.pk)
+    messages.success(request, f"{discord_id} can sign in again.")
+    return redirect("config_section_page", section_key="compliance")
+
+
+@login_required
+@require_GET
+def compliance_delete_confirm(request: HttpRequest) -> HttpResponse:
+    """Show what deleting a chosen member's account would do, before it is done.
+
+    Deliberately a separate page rather than a modal on the picker: choosing the wrong
+    person from a long list is the likeliest way this goes wrong, so the account is named
+    on its own screen alongside the same effects the rider would see themselves.
+
+    Args:
+        request: The HTTP request, carrying ``user_id``.
+
+    Returns:
+        The confirmation page.
+
+    Raises:
+        PermissionDenied: If the user lacks app_admin and is not a superuser.
+
+    """
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    target = get_object_or_404(User, pk=request.GET.get("user_id") or 0)
+    return render(
+        request,
+        "accounts/config_compliance_confirm.html",
+        {"target": target, "sections": _get_config_sections(), "current_section_key": "compliance"},
+    )
+
+
+@login_required
+@require_POST
+def compliance_delete_user(request: HttpRequest) -> HttpResponse:
+    """Delete another member's account, as if they had done it themselves.
+
+    Runs the same ``delete_user_account`` service the rider's own page uses, so an erasure
+    carried out on someone's behalf reaches exactly what theirs would.
+
+    Confirmation is the target's username rather than the word "Delete" used on the
+    self-serve page. The risk here is different: the rider deleting their own account
+    cannot pick the wrong person, and an admin working from a list of hundreds can.
+
+    Args:
+        request: The HTTP request, carrying ``user_id`` and ``confirmation``.
+
+    Returns:
+        Redirect back to the Compliance section.
+
+    Raises:
+        PermissionDenied: If the user lacks app_admin and is not a superuser.
+
+    """
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    target = get_object_or_404(User, pk=request.POST.get("user_id") or 0)
+
+    if request.POST.get("confirmation", "").strip() != target.username:
+        logfire.info(
+            "Admin account deletion not confirmed",
+            target_user_id=target.pk,
+            admin_user_id=request.user.pk,
+        )
+        messages.error(request, f"Type the username {target.username} exactly to confirm.")
+        return redirect(f"{reverse('compliance_delete_confirm')}?user_id={target.pk}")
+
+    if target.pk == request.user.pk:
+        # Not forbidden as such, but the self-serve page logs the actor out afterwards and
+        # this one does not -- so send them there rather than leave a dead session behind.
+        messages.error(request, "Use your own profile page to delete your own account.")
+        return redirect("accounts:profile_delete_confirm")
+
+    label = target.get_full_name() or target.username
+    result = delete_user_account(target, deleted_by=request.user)
+    if result["complete"]:
+        messages.success(request, f"Deleted the account for {label}.")
+    else:
+        messages.warning(
+            request,
+            f"Deleted the account for {label}, but the erasure did not finish: "
+            f"{'; '.join(result['incomplete_reasons'])}. This needs finishing by hand. "
+            f"{_erasure_follow_up(result)}",
+        )
+    return redirect("config_section_page", section_key="compliance")
+
+
+# The Logfire entry delete_user_account writes when an erasure did not finish.
+_UNFINISHED_ERASURE_LOG = "User account deleted, but the erasure did not finish"
+
+
+def _erasure_follow_up(result: dict) -> str:
+    """Say what to look up to finish an unfinished erasure, reason by reason.
+
+    A single fixed pointer ("the file paths are in the deletion log entry") was wrong for
+    everything but the files: a Zwift link left in the service is found by an id, not a path.
+
+    Args:
+        result: The :func:`delete_user_account` audit.
+
+    Returns:
+        A sentence naming, for each thing left behind, what identifies it and where.
+
+    """
+    where = []
+    if result.get("media_purge_failed"):
+        where.append("the file paths are under orphaned_media_files")
+    if result.get("account_zwift_link_failed"):
+        where.append(f"the account's Zwift link is held in the Zwift service under user id {result['user_id']}")
+    if result.get("application_zwift_links_failed"):
+        ids = ", ".join(result.get("membership_application_ids") or []) or "(see membership_application_ids)"
+        where.append(f"the registration's Zwift link is held in the Zwift service under registration id {ids}")
+    details = "; ".join(where) or "the details are there"
+    return f'The Logfire error "{_UNFINISHED_ERASURE_LOG}" records it: {details}.'
+
+
+@login_required
+@require_GET
+def config_settings(request: HttpRequest) -> HttpResponse:
+    """Redirect to first configuration section.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Redirect to first section page.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    # Check permissions: app_admin OR superuser
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    sections = _get_config_sections()
+    first_section_key = next(iter(sections.keys()))
+    return redirect("config_section_page", section_key=first_section_key)
+
+
+@login_required
+@require_GET
+def config_section_page(request: HttpRequest, section_key: str) -> HttpResponse:
+    """Display a single configuration section with sidebar navigation.
+
+    Args:
+        request: The HTTP request.
+        section_key: The section key to display.
+
+    Returns:
+        Rendered configuration section page.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    # Check permissions: app_admin OR superuser -- except the team kit section, which is also
+    # open to membership admins. That widens ONE section, not /site/config/: every other
+    # section still requires app_admin, because they hold credentials and the permission
+    # mappings. (This gate is repeated in five sibling views, all still app-admin only.)
+    if section_key == "team_kit":
+        from apps.team.kits import can_manage_team_kit
+
+        if not can_manage_team_kit(request.user):
+            raise PermissionDenied("You don't have permission to access this page.")
+    elif not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    sections = _get_config_sections()
+
+    # Handle special "site_images" section
+    if section_key == "site_images":
+        from gotta_bike_platform.models import SiteSettings
+
+        site_settings_obj = SiteSettings.get_settings()
+        return render(
+            request,
+            "accounts/config_section_page.html",
+            {
+                "sections": sections,
+                "current_section_key": section_key,
+                "current_section": {"name": "Site Images", "key": "site_images"},
+                "is_site_images": True,
+                "site_settings_obj": site_settings_obj,
+                "zp_emoji_items": _build_zp_emoji_items(site_settings_obj),
+                "zr_emoji_items": _build_zr_emoji_items(site_settings_obj),
+                "phenotype_emoji_items": _build_phenotype_emoji_items(site_settings_obj),
+                "age_emoji_items": _build_age_emoji_items(site_settings_obj),
+                "kit_emoji_item": _build_kit_emoji_item(site_settings_obj),
+                "available_roles": [],
+            },
+        )
+
+    # Handle special "compliance" section
+    if section_key == "compliance":
+        return render(
+            request,
+            "accounts/config_section_page.html",
+            {
+                "sections": sections,
+                "current_section_key": section_key,
+                # The real fieldset-backed section, so the retention windows and policy
+                # URLs render as an editable form on this page at all -- the template decides
+                # where, and puts them below the tools. Falls back to a
+                # bare section rather than raising: this page is how an erasure request gets
+                # honoured, so it has to stay reachable even if the fieldset is ever renamed.
+                "current_section": sections.get(
+                    section_key, {"name": "Compliance", "key": "compliance", "settings": []}
+                ),
+                "is_compliance": True,
+                # Everyone with an account, so an erasure request can be honoured for
+                # someone who has already lost their team role.
+                "deletable_users": User.objects.order_by("first_name", "last_name", "username"),
+                "blocked_logins": BlockedDiscordId.objects.select_related("blocked_by"),
+                "available_roles": [],
+            },
+        )
+
+    # Handle special "team_kit" section -- kits are rows, not Constance settings, so like the
+    # other special sections it renders its own partial and posts to its own routes.
+    if section_key == "team_kit":
+        from django.utils.http import urlencode
+
+        from apps.team.kit_csv import KIT_COLUMN_PREFIX, MAX_IMPORT_BYTES
+        from apps.team.kits import BADGE_CLASSES, kit_member_rows, kit_status_counts, member_filters, team_members
+        from apps.team.models import KitStatus, TeamKit
+
+        kits = list(TeamKit.objects.all())
+        counts = kit_status_counts(kits)
+        entries = [{"kit": kit, "counts": counts.get(kit.slug, {})} for kit in kits]
+        current = next((kit for kit in kits if kit.is_current), None)
+        # The filters narrow only the member list. The counts above it stay whole-team, so a
+        # filtered view never changes what "12 need it" means.
+        filters = member_filters(request.GET, current)
+        member_rows = kit_member_rows(kit=current, **filters._asdict())
+        member_total = team_members().count() if filters.active else len(member_rows)
+        return render(
+            request,
+            "accounts/config_section_page.html",
+            {
+                "sections": sections,
+                "current_section_key": section_key,
+                "current_section": {"name": "Team Kit", "key": "team_kit"},
+                "is_team_kit": True,
+                "kit_entries": entries,
+                # Picked out here rather than by looping in the template for the one entry
+                # with is_current set.
+                "current_kit_entry": next((e for e in entries if e["kit"].is_current), None),
+                "member_rows": member_rows,
+                "member_total": member_total,
+                "verified_only": filters.verified_only,
+                "race_verified_only": filters.race_verified_only,
+                "status_filter": filters.statuses,
+                # One box per status, worded and coloured as the list's status column shows it.
+                "status_filter_options": [
+                    {
+                        "value": status.value,
+                        "label": status.label,
+                        "badge": BADGE_CLASSES.get(status.value, "badge-ghost"),
+                        "checked": status.value in filters.statuses,
+                    }
+                    for status in KitStatus
+                ],
+                "member_list_filtered": filters.active,
+                "member_filter_summary": filters.describe(current.name if current else ""),
+                "export_query": urlencode(filters.query()),
+                "kit_column_prefix": KIT_COLUMN_PREFIX,
+                "kit_status_choices": KitStatus.choices,
+                "import_max_kb": MAX_IMPORT_BYTES // 1024,
+                "available_roles": [],
+            },
+        )
+
+    # Handle special "background_tasks" section
+    if section_key == "background_tasks":
+        tasks = _get_task_registry()
+        _enrich_tasks_with_last_run(tasks)
+        return render(
+            request,
+            "accounts/config_section_page.html",
+            {
+                "sections": sections,
+                "current_section_key": section_key,
+                "current_section": {"name": "Background Tasks", "key": "background_tasks"},
+                "is_background_tasks": True,
+                "tasks": tasks,
+                "task_groups": _grouped_tasks(tasks),
+                "available_roles": [],
+            },
+        )
+
+    if section_key not in sections:
+        return redirect("config_settings")
+
+    section = sections[section_key]
+
+    # Get Discord roles for permission mapping selects
+    from apps.team.models import DiscordRole
+
+    available_roles = DiscordRole.objects.filter(managed=False).order_by("-position")
+
+    return render(
+        request,
+        "accounts/config_section_page.html",
+        {
+            "sections": sections,
+            "current_section_key": section_key,
+            "current_section": section,
+            "is_site_images": False,
+            "available_roles": available_roles,
+        },
+    )
+
+
+@login_required
+@require_POST
+def config_section_update(request: HttpRequest, section_key: str) -> HttpResponse:
+    """Update configuration settings for a specific section via HTMX.
+
+    Args:
+        request: The HTTP request.
+        section_key: The section key to update.
+
+    Returns:
+        Rendered section partial with updated values and success message.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    # Check permissions: app_admin OR superuser
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    sections = _get_config_sections()
+
+    if section_key not in sections:
+        return HttpResponse("Section not found", status=404)
+
+    section = sections[section_key]
+    errors = []
+
+    # Process each setting in the section
+    for setting in section["settings"]:
+        key = setting["key"]
+        input_type = setting["input_type"]
+
+        if input_type == "boolean":
+            # Checkbox - if present, True; if absent, False
+            value = key in request.POST
+        elif input_type == "number":
+            try:
+                value = int(request.POST.get(key, 0))
+            except ValueError:
+                errors.append(f"{key}: Invalid number")
+                continue
+        elif input_type == "json_list":
+            # Multi-select returns list of values
+            selected_values = request.POST.getlist(key)
+            value = json.dumps(selected_values)
+        elif input_type == "string_list":
+            # Sortable list returns multiple values with same name
+            list_values = request.POST.getlist(key)
+            # Filter out empty strings
+            list_values = [v.strip() for v in list_values if v.strip()]
+            value = json.dumps(list_values)
+        elif input_type == "json":
+            raw_value = request.POST.get(key, "")
+            if raw_value:
+                try:
+                    # Validate JSON
+                    json.loads(raw_value)
+                    value = raw_value
+                except json.JSONDecodeError:
+                    errors.append(f"{key}: Invalid JSON format")
+                    continue
+            else:
+                value = "{}"
+        else:
+            # Text and password fields
+            value = request.POST.get(key, "")
+
+        # Record what actually changed before writing it.
+        #
+        # These settings decide who holds every permission in the app, including who may
+        # view verification photographs -- so an admin can widen their own access here. That
+        # was previously untraceable: no actor, no before, no after. Secrets are noted as
+        # changed without their values.
+        #
+        # Every int-typed setting goes out as a string. The snowflakes among them --
+        # GUILD_ID, the *_ROLE_ID and *_CHANNEL_ID keys -- are 19 digits, and Logfire
+        # would round them (see log_id), so the one line that records who widened a
+        # permission would name a role that does not exist.
+        previous = getattr(config, key, None)
+        if previous != value:
+            secret = setting.get("input_type") == "password"
+            logfire.info(
+                "Site setting changed",
+                section=section_key,
+                setting=key,
+                changed_by_id=request.user.pk,
+                changed_by=request.user.get_username(),
+                old_value="(hidden)" if secret else log_id(previous),
+                new_value="(hidden)" if secret else log_id(value),
+                is_permission_mapping=key.startswith("PERM_"),
+            )
+
+        # Save to constance
+        setattr(config, key, value)
+
+    # Refresh sections to get updated values
+    sections = _get_config_sections()
+    section = sections[section_key]
+
+    # Get Discord roles for permission mapping selects
+    from apps.team.models import DiscordRole
+
+    available_roles = DiscordRole.objects.filter(managed=False).order_by("-position")
+
+    return render(
+        request,
+        "accounts/partials/config_section.html",
+        {
+            "section": section,
+            "available_roles": available_roles,
+            "success": not errors,
+            "errors": errors,
+        },
+    )
+
+
+def _build_zp_emoji_items(site_settings_obj) -> list[dict]:
+    """Build list of ZP category emoji items for template rendering.
+
+    Args:
+        site_settings_obj: SiteSettings instance.
+
+    Returns:
+        List of dicts with field_name, label, and file for each ZP category emoji.
+
+    """
+    items = []
+    for field_name, label in [
+        ("zp_a_plus_emoji", "ZP A+ Category"),
+        ("zp_a_emoji", "ZP A Category"),
+        ("zp_b_emoji", "ZP B Category"),
+        ("zp_c_emoji", "ZP C Category"),
+        ("zp_d_emoji", "ZP D Category"),
+        ("zp_e_emoji", "ZP E Category"),
+    ]:
+        file_field = getattr(site_settings_obj, field_name, None)
+        items.append({
+            "field_name": field_name,
+            "label": label,
+            "file": file_field if file_field else None,
+        })
+    return items
+
+
+def _build_zr_emoji_items(site_settings_obj) -> list[dict]:
+    """Build list of ZR category emoji items for template rendering.
+
+    Args:
+        site_settings_obj: SiteSettings instance.
+
+    Returns:
+        List of dicts with field_name, label, and file for each ZR category emoji.
+
+    """
+    items = []
+    for field_name, label in [
+        ("zr_diamond_emoji", "Diamond"),
+        ("zr_ruby_emoji", "Ruby"),
+        ("zr_emerald_emoji", "Emerald"),
+        ("zr_sapphire_emoji", "Sapphire"),
+        ("zr_amethyst_emoji", "Amethyst"),
+        ("zr_platinum_emoji", "Platinum"),
+        ("zr_gold_emoji", "Gold"),
+        ("zr_silver_emoji", "Silver"),
+        ("zr_bronze_emoji", "Bronze"),
+        ("zr_copper_emoji", "Copper"),
+    ]:
+        file_field = getattr(site_settings_obj, field_name, None)
+        items.append({
+            "field_name": field_name,
+            "label": label,
+            "file": file_field if file_field else None,
+        })
+    return items
+
+
+def _build_phenotype_emoji_items(site_settings_obj) -> list[dict]:
+    """Build list of phenotype emoji items for template rendering.
+
+    Args:
+        site_settings_obj: SiteSettings instance.
+
+    Returns:
+        List of dicts with field_name, label, and file for each phenotype emoji.
+
+    """
+    items = []
+    for field_name, label in [
+        ("phenotype_allrounder_emoji", "All-Rounder"),
+        ("phenotype_climber_emoji", "Climber"),
+        ("phenotype_puncheur_emoji", "Puncheur"),
+        ("phenotype_tt_emoji", "Time Trialist"),
+        ("phenotype_sprinter_emoji", "Sprinter"),
+        ("phenotype_pursuiter_emoji", "Pursuiter"),
+    ]:
+        file_field = getattr(site_settings_obj, field_name, None)
+        items.append({
+            "field_name": field_name,
+            "label": label,
+            "file": file_field if file_field else None,
+        })
+    return items
+
+
+def _build_age_emoji_items(site_settings_obj) -> list[dict]:
+    """Build the age bracket icon rows for the site images page.
+
+    Unlike the other families these SHIP a default, so each row reports whether it is showing
+    bundled artwork or an upload -- otherwise an empty slot reads as "missing" when it is in
+    fact the normal, working state.
+
+    Args:
+        site_settings_obj: The SiteSettings singleton.
+
+    Returns:
+        One dict per bracket with field_name, label, file and default_url.
+
+    """
+    from apps.accounts.templatetags.accounts_tags import AGE_DEFAULT_ICONS
+
+    items = []
+    for field_name, label in [
+        ("age_jnr_emoji", "Jnr"),
+        ("age_u23_emoji", "U23"),
+        ("age_snr_emoji", "Snr"),
+        ("age_vet_emoji", "Vet"),
+        ("age_mas_emoji", "Mas"),
+        ("age_50plus_emoji", "50+"),
+        ("age_60plus_emoji", "60+"),
+        ("age_70plus_emoji", "70+"),
+    ]:
+        file_field = getattr(site_settings_obj, field_name, None)
+        items.append({
+            "field_name": field_name,
+            "label": label,
+            "file": file_field if file_field else None,
+            "default_url": static(AGE_DEFAULT_ICONS[label]),
+        })
+    return items
+
+
+def _build_kit_emoji_item(site_settings_obj) -> dict:
+    """Build the team kit icon row for the site images page.
+
+    One row, not one per status: the same drawing stands for both statuses that mean the
+    kit is sorted, so there is a single slot to upload to. Like the age brackets it ships
+    a default, so the row reports which of the two it is showing.
+
+    Args:
+        site_settings_obj: The SiteSettings singleton.
+
+    Returns:
+        A dict with field_name, label, file and default_url.
+
+    """
+    from apps.accounts.templatetags.accounts_tags import KIT_DEFAULT_ICONS
+
+    file_field = getattr(site_settings_obj, "kit_emoji", None)
+    return {
+        "field_name": "kit_emoji",
+        "label": "Has the kit",
+        "file": file_field if file_field else None,
+        "default_url": static(KIT_DEFAULT_ICONS["have"]),
+    }
+
+
+@login_required
+@require_POST
+def config_site_images_update(request: HttpRequest) -> HttpResponse:
+    """Update site images (logo and hero) via HTMX.
+
+    Args:
+        request: The HTTP request with uploaded files.
+
+    Returns:
+        Rendered site images partial with updated values.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    from gotta_bike_platform.models import SiteSettings
+
+    # Check permissions: app_admin OR superuser
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    site_settings_obj = SiteSettings.get_settings()
+    success = False
+    errors = []
+    user_id = request.user.id
+    username = request.user.username
+
+    # Handle logo upload
+    if "site_logo" in request.FILES:
+        uploaded_file = request.FILES["site_logo"]
+        site_settings_obj.site_logo = uploaded_file
+        success = True
+        logfire.info(
+            "Site logo uploaded",
+            user_id=user_id,
+            username=username,
+            filename=uploaded_file.name,
+            file_size=uploaded_file.size,
+        )
+
+    # Handle logo deletion
+    if request.POST.get("delete_logo") == "true" and site_settings_obj.site_logo:
+        old_logo_name = site_settings_obj.site_logo.name
+        site_settings_obj.site_logo.delete(save=False)
+        site_settings_obj.site_logo = None
+        success = True
+        logfire.info(
+            "Site logo deleted",
+            user_id=user_id,
+            username=username,
+            deleted_file=old_logo_name,
+        )
+
+    # Handle favicon upload - convert to PNG and resize to 64x64
+    if "favicon" in request.FILES:
+        from io import BytesIO
+
+        from django.core.files.base import ContentFile
+        from PIL import Image
+
+        try:
+            uploaded_file = request.FILES["favicon"]
+            img = Image.open(uploaded_file)
+
+            # Convert to RGBA if necessary (for transparency support)
+            if img.mode not in ("RGBA", "RGB"):
+                img = img.convert("RGBA")
+
+            # Resize to fit within 64x64, maintaining aspect ratio
+            img.thumbnail((64, 64), Image.Resampling.LANCZOS)
+
+            # Save as PNG to a BytesIO buffer
+            buffer = BytesIO()
+            img.save(buffer, format="PNG", optimize=True)
+            buffer.seek(0)
+
+            # Create a new file with .png extension
+            site_settings_obj.favicon.save("favicon.png", ContentFile(buffer.read()), save=False)
+            success = True
+            logfire.info(
+                "Favicon uploaded",
+                user_id=user_id,
+                username=username,
+                original_filename=uploaded_file.name,
+                original_size=uploaded_file.size,
+            )
+        except Exception as e:
+            errors.append(f"Favicon: {e!s}")
+            logfire.error(
+                "Favicon upload failed",
+                user_id=user_id,
+                username=username,
+                error=str(e),
+            )
+
+    # Handle favicon deletion
+    if request.POST.get("delete_favicon") == "true" and site_settings_obj.favicon:
+        old_favicon_name = site_settings_obj.favicon.name
+        site_settings_obj.favicon.delete(save=False)
+        site_settings_obj.favicon = None
+        success = True
+        logfire.info(
+            "Favicon deleted",
+            user_id=user_id,
+            username=username,
+            deleted_file=old_favicon_name,
+        )
+
+    # Handle hero image upload
+    if "hero_image" in request.FILES:
+        uploaded_file = request.FILES["hero_image"]
+        site_settings_obj.hero_image = uploaded_file
+        success = True
+        logfire.info(
+            "Hero image uploaded",
+            user_id=user_id,
+            username=username,
+            filename=uploaded_file.name,
+            file_size=uploaded_file.size,
+        )
+
+    # Handle hero image deletion
+    if request.POST.get("delete_hero") == "true" and site_settings_obj.hero_image:
+        old_hero_name = site_settings_obj.hero_image.name
+        site_settings_obj.hero_image.delete(save=False)
+        site_settings_obj.hero_image = None
+        success = True
+        logfire.info(
+            "Hero image deleted",
+            user_id=user_id,
+            username=username,
+            deleted_file=old_hero_name,
+        )
+
+    # Handle verification emoji and ZP category emoji uploads and deletions
+    for emoji_field, label in [
+        ("not_verified_emoji", "Not Verified Emoji"),
+        ("verified_emoji", "Verified Emoji"),
+        ("extra_verified_emoji", "Extra Verified Emoji"),
+        ("zp_a_plus_emoji", "ZP A+ Category Emoji"),
+        ("zp_a_emoji", "ZP A Category Emoji"),
+        ("zp_b_emoji", "ZP B Category Emoji"),
+        ("zp_c_emoji", "ZP C Category Emoji"),
+        ("zp_d_emoji", "ZP D Category Emoji"),
+        ("zp_e_emoji", "ZP E Category Emoji"),
+        ("age_jnr_emoji", "Age Jnr Icon"),
+        ("age_u23_emoji", "Age U23 Icon"),
+        ("age_snr_emoji", "Age Snr Icon"),
+        ("age_vet_emoji", "Age Vet Icon"),
+        ("age_mas_emoji", "Age Mas Icon"),
+        ("age_50plus_emoji", "Age 50+ Icon"),
+        ("age_60plus_emoji", "Age 60+ Icon"),
+        ("age_70plus_emoji", "Age 70+ Icon"),
+        ("kit_emoji", "Team Kit Icon"),
+        ("zr_diamond_emoji", "ZR Diamond Emoji"),
+        ("zr_ruby_emoji", "ZR Ruby Emoji"),
+        ("zr_emerald_emoji", "ZR Emerald Emoji"),
+        ("zr_sapphire_emoji", "ZR Sapphire Emoji"),
+        ("zr_amethyst_emoji", "ZR Amethyst Emoji"),
+        ("zr_platinum_emoji", "ZR Platinum Emoji"),
+        ("zr_gold_emoji", "ZR Gold Emoji"),
+        ("zr_silver_emoji", "ZR Silver Emoji"),
+        ("zr_bronze_emoji", "ZR Bronze Emoji"),
+        ("zr_copper_emoji", "ZR Copper Emoji"),
+        ("phenotype_allrounder_emoji", "Phenotype All-Rounder"),
+        ("phenotype_climber_emoji", "Phenotype Climber"),
+        ("phenotype_puncheur_emoji", "Phenotype Puncheur"),
+        ("phenotype_tt_emoji", "Phenotype Time Trialist"),
+        ("phenotype_sprinter_emoji", "Phenotype Sprinter"),
+        ("phenotype_pursuiter_emoji", "Phenotype Pursuiter"),
+    ]:
+        if emoji_field in request.FILES:
+            uploaded_file = request.FILES[emoji_field]
+            setattr(site_settings_obj, emoji_field, uploaded_file)
+            success = True
+            logfire.info(
+                f"{label} uploaded",
+                user_id=user_id,
+                username=username,
+                filename=uploaded_file.name,
+                file_size=uploaded_file.size,
+            )
+        delete_key = f"delete_{emoji_field}"
+        if request.POST.get(delete_key) == "true" and getattr(site_settings_obj, emoji_field):
+            old_name = getattr(site_settings_obj, emoji_field).name
+            getattr(site_settings_obj, emoji_field).delete(save=False)
+            setattr(site_settings_obj, emoji_field, None)
+            success = True
+            logfire.info(
+                f"{label} deleted",
+                user_id=user_id,
+                username=username,
+                deleted_file=old_name,
+            )
+
+    if success:
+        site_settings_obj.save()
+
+    return render(
+        request,
+        "accounts/partials/config_site_images.html",
+        {
+            "site_settings_obj": site_settings_obj,
+            "zp_emoji_items": _build_zp_emoji_items(site_settings_obj),
+            "zr_emoji_items": _build_zr_emoji_items(site_settings_obj),
+            "phenotype_emoji_items": _build_phenotype_emoji_items(site_settings_obj),
+            "age_emoji_items": _build_age_emoji_items(site_settings_obj),
+            "kit_emoji_item": _build_kit_emoji_item(site_settings_obj),
+            "success": success,
+            "errors": errors,
+        },
+    )
+
+
+def _get_task_registry() -> dict:
+    """Get the unified task registry.
+
+    Returns:
+        Dictionary mapping task names to task info (task function and description).
+
+    """
+    from gotta_bike_platform.task_registry import TASK_REGISTRY
+
+    return TASK_REGISTRY
+
+
+def _grouped_tasks(tasks: dict) -> list:
+    """Group the enriched registry by the service each task contacts.
+
+    Grouped after enrichment rather than before, so each task keeps its last-run info.
+
+    Args:
+        tasks: The registry, already enriched with last-run details.
+
+    Returns:
+        Display-ordered groups, each with a label and its tasks.
+
+    """
+    from gotta_bike_platform.task_registry import grouped_tasks
+
+    return grouped_tasks(tasks)
+
+
+# A refused guild sync is recorded as a failure on purpose (see GuildSyncRefusedError), and the
+# page is where an admin confirms it, so it says why rather than showing a bare "Failed".
+REFUSED_SYNC_EXCEPTION = "apps.accounts.services.GuildSyncRefusedError"
+
+
+def _refused_sync_note(last_run: dict) -> str:
+    """Pull a refused guild sync's explanation out of its task record.
+
+    Only that exception's message is shown: it is written for admins and holds counts only,
+    while other tasks' exception text can quote URLs or data that should not be on the page.
+
+    Args:
+        last_run: The ``DBTaskResult`` values for the task's latest finished run.
+
+    Returns:
+        The message, or ``""`` for any other run.
+
+    """
+    if last_run.get("exception_class_path") != REFUSED_SYNC_EXCEPTION:
+        return ""
+    prefix = f"{REFUSED_SYNC_EXCEPTION}: "
+    lines = [line for line in (last_run.get("traceback") or "").splitlines() if line.startswith(prefix)]
+    return lines[-1][len(prefix) :].strip() if lines else ""
+
+
+def _enrich_tasks_with_last_run(tasks: dict) -> None:
+    """Add last_run info to each task in the registry.
+
+    Queries DBTaskResult for the most recent run of each task and adds
+    ``last_status``, ``last_finished_at``, and ``time_since_last_run`` keys.
+
+    Args:
+        tasks: The task registry dict (mutated in place).
+
+    """
+    from django.apps import apps
+    from django.db.models import Q
+    from django.utils import timezone
+
+    DBTaskResult = apps.get_model("django_tasks_database", "DBTaskResult")
+
+    for task_name, task_info in tasks.items():
+        task_func = task_info["task"]
+        task_path = task_func.module_path
+
+        last_run = (
+            DBTaskResult.objects.filter(
+                Q(task_path=task_path) | Q(task_path=task_name),
+                finished_at__isnull=False,
+            )
+            .order_by("-finished_at")
+            .values("status", "finished_at", "exception_class_path", "traceback")
+            .first()
+        )
+
+        task_info["last_failure_note"] = ""
+        if last_run and last_run["finished_at"]:
+            task_info["last_status"] = last_run["status"]
+            task_info["last_failure_note"] = _refused_sync_note(last_run)
+            task_info["last_finished_at"] = last_run["finished_at"]
+            delta = timezone.now() - last_run["finished_at"]
+            total_minutes = int(delta.total_seconds() // 60)
+            hours, minutes = divmod(total_minutes, 60)
+            task_info["time_since_last_run"] = f"{hours}h {minutes}m ago"
+        else:
+            task_info["last_status"] = None
+            task_info["last_finished_at"] = None
+            task_info["time_since_last_run"] = "Never"
+
+
+@login_required
+@require_POST
+def config_trigger_task(request: HttpRequest) -> HttpResponse:
+    """Trigger a background task manually via HTMX.
+
+    Args:
+        request: The HTTP request with task_name in POST data.
+
+    Returns:
+        Rendered tasks partial with success/error message.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    # Check permissions: app_admin OR superuser
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    task_name = request.POST.get("task_name", "")
+    tasks = _get_task_registry()
+    triggered_task = None
+    dry_run_result = None
+    error = None
+
+    if task_name not in tasks:
+        error = f"Task '{task_name}' not found."
+        logfire.warning(
+            "Attempted to trigger unknown task",
+            user_id=request.user.id,
+            username=request.user.username,
+            task_name=task_name,
+        )
+    else:
+        task_info = tasks[task_name]
+        task_func = task_info["task"]
+        kwargs = {}
+        for param in task_info.get("params", []):
+            value = request.POST.get(param["name"])
+            if param["type"] == "number" and value:
+                kwargs[param["name"]] = int(value)
+            elif param["type"] == "checkbox":
+                kwargs[param["name"]] = value == "on"
+        # Run dry_run tasks synchronously so results display in the UI
+        if kwargs.get("dry_run"):
+            try:
+                dry_run_result = task_func.call(**kwargs)
+            except Exception as e:
+                logfire.error("Dry run task failed", task_name=task_name, error=str(e))
+                error = f"Dry run failed: {e}"
+            else:
+                triggered_task = task_name
+        else:
+            task_func.enqueue(**kwargs)
+            triggered_task = task_name
+        logfire.info(
+            "Background task triggered manually",
+            user_id=request.user.id,
+            username=request.user.username,
+            task_name=task_name,
+            task_kwargs=kwargs,
+        )
+
+    return render(
+        request,
+        "accounts/partials/config_tasks.html",
+        {
+            "tasks": tasks,
+            "triggered_task": triggered_task,
+            "dry_run_result": dry_run_result,
+            "error": error,
+        },
+    )
+
+
+@login_required
+@require_POST
+def markdown_preview(request: HttpRequest) -> HttpResponse:
+    """Render markdown text as HTML for preview.
+
+    Args:
+        request: The HTTP request with 'text' in POST data.
+
+    Returns:
+        Rendered HTML content.
+
+    Raises:
+        PermissionDenied: If user lacks app_admin permission and is not superuser.
+
+    """
+    import markdown
+
+    # Check permissions: app_admin OR superuser
+    if not request.user.is_superuser and not request.user.is_app_admin:
+        raise PermissionDenied("You don't have permission to access this page.")
+
+    text = request.POST.get("text", "")
+    if not text:
+        return HttpResponse('<p class="text-base-content/50 italic">No content to preview</p>')
+
+    # Render markdown with same extensions as render_markdown template filter
+    html = markdown.markdown(
+        text,
+        extensions=[
+            "nl2br",  # Convert newlines to <br>
+            "sane_lists",  # Better list handling
+            "tables",  # Support tables
+        ],
+    )
+    return HttpResponse(html)

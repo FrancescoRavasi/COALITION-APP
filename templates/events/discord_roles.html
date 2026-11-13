@@ -1,0 +1,390 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}Discord Roles - {{ event.title }}{% endblock %}
+
+{% block content %}
+<style>
+details[open] .details-arrow { transform: rotate(90deg); }
+</style>
+<div class="max-w-6xl mx-auto">
+  <div class="mb-4">
+    <a href="{% url 'events:squad_manage' event.pk %}" class="link link-primary text-sm">&larr; Back to Manage Squads</a>
+  </div>
+
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
+        <h2 class="card-title text-2xl">Discord Roles &mdash; {{ event.title }}</h2>
+        <form method="post" action="{% url 'events:sync_event_roles' event.pk %}" class="shrink-0">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-outline btn-sm" title="Read-only: refreshes the app's cached copy of each rider's Discord roles. Nothing is changed in Discord.">Get Roles</button>
+        </form>
+      </div>
+
+      {% comment %}
+        Two views over the same cached role data. "Riders" is the interactive matrix;
+        "By Squad" flips the axes and is read-only -- a place to spot channel access
+        nobody should have, not a place to change it.
+      {% endcomment %}
+      <div role="tablist" class="tabs tabs-box mb-4">
+        <a role="tab" href="?tab=riders"
+           class="tab {% if active_tab == 'riders' %}tab-active font-semibold{% endif %}">Riders</a>
+        <a role="tab" href="?tab=squads"
+           class="tab {% if active_tab == 'squads' %}tab-active font-semibold{% endif %}">
+          By Squad
+          {% if squad_problem_total %}<span class="badge badge-error badge-sm ml-2">{{ squad_problem_total }}</span>{% endif %}
+        </a>
+      </div>
+
+      {% if active_tab == 'squads' %}
+      <p class="text-xs text-base-content/60 mb-3">
+        Each squad's Discord roles measured against who is actually in the squad.
+        <strong class="text-error">Not in squad</strong> is the one that matters: those people hold the
+        role, so they can see the squad's channel without being on the squad.
+        <strong>Missing</strong> is the mirror &mdash; a member who cannot see their own channel.
+        Read-only; fix these on the Riders tab or in Manage Squads. Press <strong>Get Roles</strong>
+        first, since this reads the app's cached copy of Discord.
+      </p>
+
+      {% if squad_audit %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Squad</th>
+              <th class="text-center">Members</th>
+              <th>Squad role</th>
+              <th>Captain role</th>
+              <th>Region role</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in squad_audit %}
+            <tr class="{% if row.problem_count %}bg-error/5{% endif %}">
+              <td class="font-semibold whitespace-nowrap align-top">
+                {{ row.squad.name }}
+                {% if row.problem_count %}<span class="badge badge-error badge-xs ml-1">{{ row.problem_count }}</span>{% endif %}
+              </td>
+              <td class="text-center align-top">{{ row.member_count }}</td>
+              {% for cell in row.cells %}
+              <td class="align-top">
+                {% if not cell.configured %}
+                <span class="text-base-content/30" title="Not configured for this squad">&mdash;</span>
+                {% else %}
+                <div class="text-xs text-base-content/60 whitespace-nowrap">{% if cell.name %}@{{ cell.name }}{% else %}Role {{ cell.role_id }}{% endif %}</div>
+                <div class="flex flex-wrap gap-1 mt-1">
+                  <span class="badge badge-ghost badge-sm" title="People the app believes hold this role">{{ cell.holder_count }} held</span>
+                  {% if cell.extra %}<span class="badge badge-error badge-sm">{{ cell.extra|length }} not in squad</span>{% endif %}
+                  {% if cell.missing_count %}<span class="badge badge-warning badge-sm" title="In the squad but without this role">{{ cell.missing_count }} missing</span>{% endif %}
+                </div>
+                {% if cell.extra %}
+                <ul class="mt-1 text-xs text-error space-y-0.5">
+                  {% for u in cell.extra %}<li>{{ u.get_full_name|default:u.discord_username|default:u.username }}</li>{% endfor %}
+                </ul>
+                {% endif %}
+                {% endif %}
+              </td>
+              {% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="alert"><span>This event has no squads yet.</span></div>
+      {% endif %}
+
+      {% else %}
+      {% if role_info %}
+      <details class="collapse bg-base-300 rounded-lg mb-4">
+        <summary class="collapse-title text-xs font-semibold uppercase tracking-wide text-base-content/50 py-2 min-h-0 cursor-pointer"><span class="inline-block transition-transform duration-200 details-arrow mr-1">&#9654;</span>Configured Roles</summary>
+        <div class="collapse-content space-y-1">
+          {% for ri in role_info %}
+          <div class="flex items-center gap-2 text-sm">
+            <span class="font-semibold">{{ ri.label }}:</span>
+            <span>{% if ri.name %}@{{ ri.name }}{% else %}<span class="text-base-content/50 italic">unknown</span>{% endif %}</span>
+            <span class="font-mono text-xs text-base-content/50">({{ ri.role_id }})</span>
+          </div>
+          {% endfor %}
+        </div>
+      </details>
+      {% endif %}
+
+      {% if enriched_signups %}
+      <div class="mb-2 flex flex-wrap items-center gap-3">
+        <input type="text" class="input input-bordered input-sm w-48" placeholder="Search by name..." data-roles-search>
+        {% if coordinator_roles %}
+        <label class="label cursor-pointer gap-2 py-0">
+          <input type="checkbox" class="checkbox checkbox-sm" data-coord-toggle checked>
+          <span class="label-text">Coordinator columns</span>
+        </label>
+        {% endif %}
+        {% if timezone_roles %}
+        <label class="label cursor-pointer gap-2 py-0">
+          <input type="checkbox" class="checkbox checkbox-sm" data-tz-toggle checked>
+          <span class="label-text">Region columns</span>
+        </label>
+        {% endif %}
+      </div>
+      {% comment %}
+      Cell states. Every symbol except the dash is a button that toggles the role, so
+      the legend says what a click does as well as what the symbol means.
+      {% endcomment %}
+      <details class="collapse bg-base-300 rounded-lg mb-2">
+        <summary class="collapse-title text-xs font-semibold uppercase tracking-wide text-base-content/50 py-2 min-h-0 cursor-pointer"><span class="inline-block transition-transform duration-200 details-arrow mr-1">&#9654;</span>Legend</summary>
+        <div class="collapse-content">
+      <div class="flex flex-wrap items-center gap-x-5 gap-y-1 mb-2 text-xs">
+        <span class="flex items-center gap-1">
+          <span class="text-success text-base leading-none">&#10003;</span>
+          Has the role &mdash; click to remove
+        </span>
+        <span class="flex items-center gap-1">
+          <span class="text-error text-base leading-none">&#10007;</span>
+          Missing the role &mdash; click to add
+        </span>
+        {% if timezone_roles %}
+        <span class="flex items-center gap-1">
+          <span class="opacity-60"><span class="text-error text-base leading-none">&#10007;</span><span class="text-success text-base leading-none ml-0.5">&#10003;</span></span>
+          Faded region cell &mdash; rider did not pick that region
+        </span>
+        {% endif %}
+        <span class="flex items-center gap-1">
+          <span class="text-warning text-base leading-none">&#10003;</span>
+          Has a role they should not &mdash; not in that squad; click to remove
+        </span>
+        <span class="flex items-center gap-1">
+          <span class="text-base-content/30 text-base leading-none">-</span>
+          Not in that squad, no role &mdash; nothing to do
+        </span>
+      </div>
+      <p class="text-xs text-base-content/60">
+        A red &#10007; in a <strong>squad</strong> or <strong>Event</strong> column is drift worth fixing &mdash;
+        the rider is in the squad, or registered, but does not hold the matching role. Elsewhere it is
+        usually just someone who is not a captain or coordinator. Press <strong>Get Roles</strong> first,
+        since this table shows the app's cached copy of Discord.
+      </p>
+        </div>
+      </details>
+      <div class="overflow-x-auto max-h-[70vh] pb-8">
+        <table class="table table-xs table-pin-col table-pin-col-2" data-roles-table>
+          <thead class="sticky top-0 bg-base-200 z-10">
+            <tr>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none whitespace-nowrap">Name</th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Squads</th>
+              {% if event.event_role %}
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none text-center whitespace-nowrap">Event</th>
+              {% endif %}
+              {% for squad in role_squads %}
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none text-center whitespace-nowrap">{{ squad.name }}</th>
+              {% endfor %}
+              {% for squad in captain_role_squads %}
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none text-center whitespace-nowrap">{{ squad.name }} Cpt</th>
+              {% endfor %}
+              {% for tz in timezone_roles %}
+              <th data-sort="text" class="tz-col cursor-pointer hover:text-primary select-none text-center whitespace-nowrap" title="{% if tz.name %}@{{ tz.name }}{% else %}Role {{ tz.role_id }}{% endif %} &mdash; granted on signup to riders who pick {{ tz.option }}">{{ tz.option }}</th>
+              {% endfor %}
+              {% for cr in coordinator_roles %}
+              <th data-sort="text" class="coord-col cursor-pointer hover:text-primary select-none text-center whitespace-nowrap">{% if cr.name %}@{{ cr.name }}{% else %}Coord {{ cr.role_id }}{% endif %}</th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for entry in enriched_signups %}
+            <tr>
+              <td class="font-medium">
+                {% include "accounts/_user_tooltip.html" with display_name=entry.user.get_full_name|default:entry.user.discord_username user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=entry.user.discord_avatar_url zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+              </td>
+              <td>
+                {% if entry.assigned_squads %}
+                  {% for sq in entry.assigned_squads %}{{ sq.name }}{% if not forloop.last %}, {% endif %}{% endfor %}
+                {% else %}
+                  <span class="text-base-content/30">-</span>
+                {% endif %}
+              </td>
+              {% if event.event_role %}
+              <td class="text-center">
+                {% include "events/_event_role_cell.html" with event_pk=event.pk member_user_pk=entry.user.pk has_role=entry.has_event_role %}
+              </td>
+              {% endif %}
+              {% comment %}
+              The partial owns all four states now, including the dash, so a cell that
+              HTMX swaps after a click renders the same way as one drawn on page load.
+              {% endcomment %}
+              {% for srs in entry.squad_role_status %}
+              <td class="text-center">
+                {% include "events/_squad_role_cell.html" with event_pk=event.pk squad_pk=srs.squad.pk member_user_pk=entry.user.pk has_role=srs.has_role not_member=srs.is_member|yesno:",1" %}
+              </td>
+              {% endfor %}
+              {% for crs in entry.captain_role_status %}
+              <td class="text-center">
+                {% include "events/_squad_captain_role_cell.html" with event_pk=event.pk squad_pk=crs.squad.pk member_user_pk=entry.user.pk has_role=crs.has_role not_member=crs.is_member|yesno:",1" %}
+              </td>
+              {% endfor %}
+              {% for tzs in entry.timezone_role_status %}
+              <td class="tz-col text-center{% if not tzs.selected %} opacity-60{% endif %}"
+                  title="{% if tzs.selected %}Rider selected {{ tzs.option }}{% else %}Rider did not select {{ tzs.option }}{% endif %}">
+                {% include "events/_coordinator_role_cell.html" with event_pk=event.pk member_user_pk=entry.user.pk role_id=tzs.role_id role_name=tzs.name has_role=tzs.has_role %}
+              </td>
+              {% endfor %}
+              {% for cds in entry.coordinator_role_status %}
+              <td class="coord-col text-center">
+                {% include "events/_coordinator_role_cell.html" with event_pk=event.pk member_user_pk=entry.user.pk role_id=cds.role_id role_name=cds.name has_role=cds.has_role %}
+              </td>
+              {% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/70">No registered signups for this event.</p>
+      {% endif %}
+
+      {% if stragglers %}
+      {% comment %}
+      Not in the table above, which lists registered signups only. Withdrawing does not
+      strip roles the way leaving a squad does, so these would otherwise be invisible.
+      {% endcomment %}
+      <div class="mt-6">
+        <h3 class="font-semibold text-warning text-sm mb-1">Not registered, still holding roles</h3>
+        <p class="text-xs text-base-content/60 mb-2">
+          These riders withdrew or were never registered, but still hold roles this event granted.
+          Click a role to remove it. Coordinator roles are not listed &mdash; those are a job, not a
+          consequence of racing.
+        </p>
+        <div class="overflow-x-auto">
+          <table class="table table-xs">
+            <thead>
+              <tr><th class="text-left">Rider</th><th class="text-left">Roles still held</th></tr>
+            </thead>
+            <tbody>
+              {% for row in stragglers %}
+              <tr>
+                <td class="font-medium whitespace-nowrap">
+                  {{ row.user.get_full_name|default:row.user.discord_username }}
+                </td>
+                <td>
+                  <div class="flex flex-wrap items-center gap-3">
+                    {% for h in row.held %}
+                    <span class="flex items-center gap-1 whitespace-nowrap">
+                      {% if h.kind == "event" %}
+                        {% include "events/_event_role_cell.html" with event_pk=event.pk member_user_pk=row.user.pk has_role=1 %}
+                      {% elif h.kind == "squad" %}
+                        {% include "events/_squad_role_cell.html" with event_pk=event.pk squad_pk=h.squad.pk member_user_pk=row.user.pk has_role=1 not_member=1 %}
+                      {% elif h.kind == "captain" %}
+                        {% include "events/_squad_captain_role_cell.html" with event_pk=event.pk squad_pk=h.squad.pk member_user_pk=row.user.pk has_role=1 not_member=1 %}
+                      {% else %}
+                        {% include "events/_coordinator_role_cell.html" with event_pk=event.pk member_user_pk=row.user.pk role_id=h.role_id role_name=h.role_name has_role=1 %}
+                      {% endif %}
+                      <span class="text-xs">{{ h.label }}</span>
+                    </span>
+                    {% endfor %}
+                  </div>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
+      {% endif %}{# active_tab #}
+    </div>
+  </div>
+</div>
+
+<script>
+// The Squads column is pinned beside Name. Its left offset is the Name column's
+// width, which is content-sized (avatar + full name + badges), so only the browser
+// knows it -- measure and hand it to the CSS. Recomputed on resize and whenever the
+// table reflows, since toggling the Region/Coordinator columns changes its width.
+(function() {
+  var table = document.querySelector('[data-roles-table]');
+  var anchor = table && table.querySelector('thead th:first-child');
+  if (!anchor) return;
+
+  var applied = null;
+  function setPinOffset() {
+    var width = anchor.getBoundingClientRect().width;
+    if (width === applied) return;   // guard: never write back into our own reflow
+    applied = width;
+    table.style.setProperty('--pin-col-2-left', width + 'px');
+  }
+
+  setPinOffset();
+  window.addEventListener('resize', setPinOffset);
+  if (window.ResizeObserver) new ResizeObserver(setPinOffset).observe(anchor);
+})();
+
+(function() {
+  var searchInput = document.querySelector('[data-roles-search]');
+  var table = document.querySelector('[data-roles-table]');
+  if (!searchInput || !table) return;
+
+  searchInput.addEventListener('input', function() {
+    var query = this.value.toLowerCase();
+    table.querySelectorAll('tbody tr').forEach(function(row) {
+      var name = row.cells[0].textContent.toLowerCase();
+      row.style.display = name.indexOf(query) !== -1 ? '' : 'none';
+    });
+  });
+
+  var headers = table.querySelectorAll('th[data-sort]');
+  headers.forEach(function(th, colIdx) {
+    th.addEventListener('click', function() {
+      var sortType = th.getAttribute('data-sort');
+      var asc = th.getAttribute('data-dir') !== 'asc';
+      headers.forEach(function(h) {
+        h.removeAttribute('data-dir');
+        var ind = h.querySelector('.sort-indicator');
+        if (ind) ind.remove();
+      });
+      th.setAttribute('data-dir', asc ? 'asc' : 'desc');
+      var indicator = document.createElement('span');
+      indicator.className = 'sort-indicator text-primary ml-1';
+      indicator.textContent = asc ? '\u25B2' : '\u25BC';
+      th.appendChild(indicator);
+
+      var tbody = table.querySelector('tbody');
+      var rows = Array.from(tbody.querySelectorAll('tr'));
+      rows.sort(function(a, b) {
+        var aText = a.cells[colIdx].textContent.trim();
+        var bText = b.cells[colIdx].textContent.trim();
+        if (sortType === 'num') {
+          var aNum = parseFloat(aText) || 0;
+          var bNum = parseFloat(bText) || 0;
+          return asc ? aNum - bNum : bNum - aNum;
+        }
+        return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+      });
+      rows.forEach(function(row) { tbody.appendChild(row); });
+    });
+  });
+
+  var tzToggle = document.querySelector('[data-tz-toggle]');
+  if (tzToggle) {
+    var applyTz = function() {
+      var show = tzToggle.checked;
+      table.querySelectorAll('.tz-col').forEach(function(cell) {
+        cell.style.display = show ? '' : 'none';
+      });
+    };
+    tzToggle.addEventListener('change', applyTz);
+    applyTz();
+  }
+
+  var coordToggle = document.querySelector('[data-coord-toggle]');
+  if (coordToggle) {
+    var applyCoord = function() {
+      var show = coordToggle.checked;
+      table.querySelectorAll('.coord-col').forEach(function(cell) {
+        cell.style.display = show ? '' : 'none';
+      });
+    };
+    coordToggle.addEventListener('change', applyCoord);
+    applyCoord();
+  }
+})();
+</script>
+{% endblock %}

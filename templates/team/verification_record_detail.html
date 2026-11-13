@@ -1,0 +1,690 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}Verification Record - {{ record.user.username }} - The Coalition{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex justify-between items-center mb-6">
+        <h2 class="card-title text-2xl">Verification Record</h2>
+        {% if record.is_verified %}
+        <span class="badge badge-success">Verified</span>
+        {% elif record.is_rejected %}
+        <span class="badge badge-error">Rejected</span>
+        {% else %}
+        <span class="badge badge-warning">Pending</span>
+        {% endif %}
+      </div>
+
+      <!-- Record Details -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+        <!-- Top Left: User Info -->
+        <div class="bg-base-300 rounded-lg p-4">
+          <div class="text-sm text-base-content/60 mb-1">Teammate</div>
+          <div class="font-medium">{{ record.user.first_name }} {{ record.user.last_name }}</div>
+          {% if record.user.discord_nickname %}
+          <div class="text-sm text-base-content/70">
+            {{ record.user.discord_nickname }}
+            {% if record.user.discord_id %}
+            <a aria-label="Message {{ record.user.discord_nickname }} on Discord" href="https://discord.com/users/{{ record.user.discord_id }}" target="_blank" rel="noopener"
+               class="inline-block ml-1 align-middle tooltip tooltip-right" data-tip="Message on Discord">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-primary hover:text-primary-focus" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+              </svg>
+            </a>
+            {% endif %}
+          </div>
+          {% endif %}
+          {% if record.user.zwid %}
+          <div class="text-sm text-base-content/70 mt-1">ZWID: {{ record.user.zwid }}</div>
+          <div class="flex flex-wrap gap-2 mt-2">
+            <a href="https://zwiftpower.com/profile.php?z={{ record.user.zwid }}" target="_blank" rel="noopener" class="btn btn-xs btn-outline">
+              ZwiftPower
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+            </a>
+            <a href="https://www.zwiftracing.app/riders/{{ record.user.zwid }}" target="_blank" rel="noopener" class="btn btn-xs btn-outline">
+              ZwiftRacing
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+            </a>
+          </div>
+          {% endif %}
+        </div>
+
+        <!-- Top Right: Submission Details -->
+        <div class="bg-base-300 rounded-lg p-4">
+          <div class="grid grid-cols-1 gap-3">
+            <div>
+              <div class="text-sm text-base-content/60 mb-1">Verification Type</div>
+              <div class="font-medium">{{ record.get_verify_type_display }}</div>
+            </div>
+            <div>
+              <div class="text-sm text-base-content/60 mb-1">Media Type</div>
+              <div class="font-medium">{{ record.get_media_type_display }}</div>
+            </div>
+            <div>
+              <div class="text-sm text-base-content/60 mb-1">Record Date</div>
+              {% if can_review and record.is_pending %}
+              <input type="date" id="editable-record-date" value="{{ record.record_date|date:'Y-m-d' }}"
+                     class="input input-bordered input-sm w-full font-medium">
+              {% else %}
+              <div class="font-medium">{{ record.record_date|date:"F d, Y" }}</div>
+              {% endif %}
+            </div>
+            <div>
+              <div class="text-sm text-base-content/60 mb-1">Date Submitted</div>
+              <div class="font-medium">{{ record.date_created|date:"F d, Y H:i" }}</div>
+            </div>
+          </div>
+        </div>
+
+        {% if can_view_values %}
+        <!-- Bottom Left: Submitted Value -->
+        <div class="bg-base-300 rounded-lg p-4">
+          <div class="text-sm text-base-content/60 mb-1">
+            Submitted Value{% if record.weight and can_edit_weight %}
+            <span class="font-mono text-base-content/80 ml-1">&mdash; {{ record.weight|weight_dual }}</span>
+            {% endif %}
+          </div>
+          <div class="font-medium font-mono text-lg">
+            {% if record.weight %}
+              {% if can_edit_weight %}
+              <form method="post" class="flex items-center gap-2 flex-wrap">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="update_weight">
+                <input type="number" step="0.01" min="0" name="weight"
+                       value="{{ record.weight }}"
+                       class="input input-bordered input-sm w-24 font-mono">
+                <span class="text-sm">kg</span>
+                <button type="submit" class="btn btn-xs btn-primary">Save</button>
+              </form>
+              {% else %}
+              {{ record.weight|weight_dual }}
+              {% endif %}
+            {% elif record.height %}
+              {{ record.height|height_dual }}
+            {% elif record.ftp %}
+              {{ record.ftp }} W
+            {% else %}
+              <span class="text-base-content/30">-</span>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Bottom Right: ZwiftPower Weight (if applicable) -->
+        {% if record.weight and zp_rider and zp_rider.weight %}
+        <div class="bg-base-300 rounded-lg p-4">
+          <div class="text-sm text-base-content/60 mb-1">ZwiftPower Weight</div>
+          <div class="font-medium font-mono text-lg">{{ zp_rider.weight|weight_dual }}</div>
+          <div class="text-xs text-base-content/50 mt-1 tooltip tooltip-bottom cursor-help" data-tip="Records are updated every 6 hrs. This date time represents the last time the ZwiftPower record changed.">Updated: {{ zp_rider.date_modified|date:"F d, Y H:i" }} <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+          <div class="text-sm mt-2">
+            <span class="text-base-content/60">Difference:</span>
+            {% with diff=record.weight|weight_diff:zp_rider.weight %}
+            <span class="font-medium {% if '+' in diff %}text-error{% elif '-' in diff %}text-success{% endif %}">
+              {{ diff }}
+            </span>
+            {% endwith %}
+          </div>
+        </div>
+        {% endif %}
+        {% endif %}
+      </div>
+
+      <!-- Zwift Auth: official Zwift-sourced numbers to check the submission against.
+           Rows the service cannot supply yet say so rather than rendering blank; a blank
+           weight reads as "0 kg" to a reviewer who is about to make a decision. -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <div class="flex flex-wrap items-center gap-2 mb-3">
+          <h3 class="font-semibold">Zwift Auth</h3>
+          {% if not zauth.configured %}
+          <span class="badge badge-ghost badge-sm">Service not configured</span>
+          {% elif zauth.connected %}
+          <span class="badge badge-success badge-sm">Connected</span>
+          {% else %}
+          <span class="badge badge-warning badge-sm">Not connected</span>
+          {% endif %}
+          {% if zauth.verified_via_zauth %}
+          <span class="badge badge-success badge-outline badge-sm">Verified via Zwift Auth</span>
+          {% endif %}
+          {% if zauth.connected and record.is_body_measurement %}
+          <form method="post" class="ml-auto">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="refresh_zwift_profile">
+            <button type="submit" class="btn btn-xs btn-outline h-auto py-1">Refresh height and weight</button>
+          </form>
+          {% endif %}
+        </div>
+
+        {% if zauth.connected %}
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60 mb-1 tooltip tooltip-bottom cursor-help" data-tip="The rider's live Zwift profile weight, not the weight frozen into Zwift's last racing-metrics snapshot (those two often differ).">Zwift profile weight <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+            {% if zauth.weight_kg %}
+            <div class="font-medium font-mono text-lg">{{ zauth.weight_kg|weight_dual }}</div>
+            <div class="text-xs text-base-content/50 mt-1">Read from Zwift {{ zauth.weight_as_of|date:"F d, Y H:i" }} UTC</div>
+            {% if record.weight %}
+            <div class="text-sm mt-2">
+              <span class="text-base-content/60">Difference:</span>
+              {% with diff=record.weight|weight_diff:zauth.weight_kg %}
+              <span class="font-medium {% if '+' in diff %}text-error{% elif '-' in diff %}text-success{% endif %}">{{ diff }}</span>
+              {% endwith %}
+            </div>
+            {% endif %}
+            {% else %}
+            <div class="text-sm text-base-content/50">No profile snapshot stored yet</div>
+            {% endif %}
+
+            <!-- The weight Zwift actually raced this rider at. Differs from the live profile
+                 weight whenever they have changed it since Zwift last recomputed. -->
+            <div class="mt-3 pt-3 border-t border-base-300">
+              <div class="text-sm text-base-content/60 mb-1 tooltip tooltip-bottom cursor-help" data-tip="The weight frozen into Zwift's last racing-metrics computation, alongside the rider's category, racing score and zFTP. It only moves when Zwift recomputes, so it can lag the profile weight.">Racing metrics weight <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+              {% if zauth.metrics_weight_kg %}
+              <div class="font-medium font-mono">{{ zauth.metrics_weight_kg|weight_dual }}</div>
+              {% if zauth.weight_drift %}
+              <div class="text-xs text-base-content/50 mt-1">
+                Profile weight has moved
+                <span class="badge badge-ghost badge-xs font-mono">{{ zauth.weight_drift }} kg</span>
+                since this snapshot
+              </div>
+              {% endif %}
+              {% else %}
+              <div class="text-sm text-base-content/50">&mdash;</div>
+              {% endif %}
+            </div>
+          </div>
+
+          <div>
+            <div class="text-sm text-base-content/60 mb-1">Connection</div>
+            <div class="text-sm">Since {{ zauth.connected_at|date:"F d, Y"|default:"unknown" }}</div>
+            {% if zauth.zwid %}<div class="text-sm">Zwift ID <span class="font-mono">{{ zauth.zwid }}</span></div>{% endif %}
+            {% if zauth.verified_via_zauth and zauth.verified_at %}
+            <div class="text-xs text-base-content/50 mt-1">Platform verified {{ zauth.verified_at|date:"M j, Y" }}</div>
+            {% endif %}
+          </div>
+        </div>
+
+        <div class="divider my-3"></div>
+        <!-- 90-day ranges come from the service's deduped snapshot history, so they can rest
+             on very few points; the count is shown rather than implying confidence. -->
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
+          <div>
+            <div class="text-base-content/60 text-xs">Height</div>
+            {% if zauth.height_cm %}
+            <div class="font-mono">{{ zauth.height_cm }} cm</div>
+            {% else %}
+            <div class="text-base-content/40" title="{{ zauth.unavailable_reason }}">&mdash;</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="text-base-content/60 text-xs">Height 90d range</div>
+            {% if zauth.height_90d_min %}
+            <div class="font-mono">{{ zauth.height_90d_min }} &ndash; {{ zauth.height_90d_max }} cm</div>
+            <div class="text-base-content/40 text-xs">{{ zauth.height_90d_count }} reading{{ zauth.height_90d_count|pluralize }}</div>
+            {% else %}
+            <div class="text-base-content/40" title="Height was added to the snapshot history later, so older snapshots lack it">&mdash;</div>
+            {% endif %}
+          </div>
+          <!-- Two weight ranges on purpose: the racing-metrics weight is what Zwift categorised
+               the rider at (the anti-sandbagging signal); the profile weight is what they have set. -->
+          <div>
+            <div class="text-base-content/60 text-xs tooltip tooltip-bottom cursor-help" data-tip="Range of the racing-metrics weight (the weight Zwift raced and categorised the rider at) over the last 90 days of recorded changes.">Metrics weight 90d range</div>
+            {% if zauth.weight_90d_min %}
+            <div class="font-mono">{{ zauth.weight_90d_min }} &ndash; {{ zauth.weight_90d_max }} kg</div>
+            <div class="text-base-content/40 text-xs">{{ zauth.weight_90d_count }} reading{{ zauth.weight_90d_count|pluralize }}</div>
+            {% if zauth.weight_90d_swing is not None %}
+            <div class="text-xs font-mono {% if zauth.weight_90d_swing_high %}text-warning font-semibold{% else %}text-base-content/60{% endif %}">swing {{ zauth.weight_90d_swing|floatformat:1 }} kg</div>
+            {% endif %}
+            {% else %}
+            <div class="text-base-content/40" title="No snapshot history in this window yet">&mdash;</div>
+            {% endif %}
+          </div>
+          <div>
+            <div class="text-base-content/60 text-xs tooltip tooltip-bottom cursor-help" data-tip="Range of the rider's live Zwift profile weight over the last 90 days of recorded changes. It moves as soon as the rider edits their weight, even without racing.">Profile weight 90d range</div>
+            {% if zauth.profile_weight_90d_min %}
+            <div class="font-mono">{{ zauth.profile_weight_90d_min }} &ndash; {{ zauth.profile_weight_90d_max }} kg</div>
+            <div class="text-base-content/40 text-xs">{{ zauth.profile_weight_90d_count }} reading{{ zauth.profile_weight_90d_count|pluralize }}</div>
+            {% if zauth.profile_weight_90d_swing is not None %}
+            <div class="text-xs font-mono {% if zauth.profile_weight_90d_swing_high %}text-warning font-semibold{% else %}text-base-content/60{% endif %}">swing {{ zauth.profile_weight_90d_swing|floatformat:1 }} kg</div>
+            {% endif %}
+            {% else %}
+            <div class="text-base-content/40" title="No profile-weight history in this window yet">&mdash;</div>
+            {% endif %}
+            {% if zauth.profile_weight_history_since %}
+            <div class="text-base-content/40 text-xs">recorded since {{ zauth.profile_weight_history_since|date:"M j, Y" }}</div>
+            {% endif %}
+          </div>
+        </div>
+        {% elif zauth.configured %}
+        <p class="text-sm text-base-content/60">This rider has not connected their Zwift account, so there are
+          no official Zwift numbers to compare the submission against.</p>
+        {% else %}
+        <p class="text-sm text-base-content/60">The Zwift Auth service is not configured for this
+          environment.</p>
+        {% endif %}
+      </div>
+
+      {% if record.notes %}
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <div class="text-sm text-base-content/60 mb-1">Notes</div>
+        <div>{{ record.notes }}</div>
+      </div>
+      {% endif %}
+
+      <!-- Media Section -->
+      {% if can_view_media %}
+      <!-- Media File -->
+      {% if record.media_file %}
+      <div class="mb-6">
+        <div class="text-sm text-base-content/60 mb-2">Uploaded File</div>
+        <div class="bg-base-300 rounded-lg p-4">
+          {% if record.media_type == "photo" %}
+          <!-- Clickable image that opens in modal -->
+          <a href="{% url 'team:verification_record_media' record.pk %}" target="_blank" rel="noopener" class="block">
+            <img src="{% url 'team:verification_record_media' record.pk %}" alt="Verification photo" class="max-w-full max-h-96 h-auto rounded-lg mx-auto cursor-zoom-in hover:opacity-90 transition-opacity" />
+          </a>
+          <div class="text-center mt-2 text-sm text-base-content/60">Click image to view full size</div>
+          {% elif record.media_type == "video" %}
+          <video controls class="max-w-full max-h-96 rounded-lg mx-auto bg-black">
+            <source src="{% url 'team:verification_record_media' record.pk %}" type="video/mp4">
+            <source src="{% url 'team:verification_record_media' record.pk %}" type="video/webm">
+            <source src="{% url 'team:verification_record_media' record.pk %}" type="video/quicktime">
+            Your browser does not support the video tag.
+          </video>
+          {% else %}
+          <a href="{% url 'team:verification_record_media' record.pk %}" target="_blank" rel="noopener" class="btn btn-outline btn-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            Download File
+          </a>
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- External URL -->
+      {% if record.url %}
+      <div class="mb-6">
+        <div class="text-sm text-base-content/60 mb-2">External Link</div>
+        <div class="bg-base-300 rounded-lg p-4">
+          <a href="{{ record.url }}" target="_blank" rel="noopener" class="link link-primary break-all">
+            {{ record.url }}
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+          </a>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if not record.media_file and not record.url %}
+      <div class="alert alert-info mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        <span>No media file or URL attached to this record.</span>
+      </div>
+      {% endif %}
+      {% else %}
+      <!-- Media hidden for non-verification team members on reviewed records -->
+      <div class="alert mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+        <span>Media content is restricted to the Performance Verification Team for reviewed records.</span>
+      </div>
+      {% endif %}
+
+      <!-- Review Checklist -->
+      {% if checklist_items %}
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <div class="text-sm text-base-content/60 mb-2">Review Checklist</div>
+        <div class="space-y-1">
+          {% for item in checklist_items %}
+          <label class="flex items-start gap-2 cursor-pointer">
+            <input type="checkbox" class="checkbox checkbox-sm checkbox-primary mt-0.5 review-checklist-item">
+            <span class="text-sm">{{ item }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% comment %}
+        Who may decide this record, for everyone who opens it -- an admin should see why an
+        Other record came to them as clearly as a reviewer sees why it did not. From
+        services.review_requirements, the rule the list and the decision POST also use.
+      {% endcomment %}
+      {% if review_requirements %}
+      <div class="alert alert-info mb-6" role="note">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        <div>
+          <div class="font-medium">Who can decide this record</div>
+          <ul class="text-sm list-disc ms-5">
+            {% for requirement in review_requirements %}<li>{{ requirement.explanation }}</li>{% endfor %}
+          </ul>
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- Verification Status -->
+      {% if record.is_verified %}
+      <div class="bg-success/10 border border-success rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-2 text-success mb-2">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+          </svg>
+          <span class="font-medium">Verified</span>
+        </div>
+        <div class="text-sm">
+          <span>Reviewed by: </span>
+          <span class="font-medium">{{ record.reviewed_by.first_name }} {{ record.reviewed_by.last_name }}</span>
+          {% if record.reviewed_by.discord_nickname %}
+          <span class="text-base-content/70">({{ record.reviewed_by.discord_nickname }})</span>
+          {% endif %}
+          {% if record.reviewed_by.discord_id %}
+          <a aria-label="Message {{ record.reviewed_by.first_name }} {{ record.reviewed_by.last_name }} on Discord" href="https://discord.com/users/{{ record.reviewed_by.discord_id }}" target="_blank" rel="noopener"
+             class="inline-block ml-1 align-middle tooltip tooltip-right" data-tip="Message on Discord">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-primary hover:text-primary-focus" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+            </svg>
+          </a>
+          {% endif %}
+        </div>
+        <div class="text-sm text-base-content/70">
+          {{ record.reviewed_date|date:"F d, Y H:i" }}
+        </div>
+        {% if record.review_note %}
+        <div class="text-sm mt-2">
+          <span class="font-medium">Note: </span>
+          <span>{{ record.review_note }}</span>
+        </div>
+        {% endif %}
+        {% if can_change_status %}
+        <div class="mt-3 pt-3 border-t border-success/30 flex gap-2">
+          <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="reset_pending">
+            <button type="submit" class="btn btn-warning btn-xs btn-outline"
+                    onclick="return confirm('Reset this record to pending?')">Reset to Pending</button>
+          </form>
+          <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="reject">
+            <button type="submit" class="btn btn-error btn-xs btn-outline"
+                    onclick="return confirm('Reject this verified record?')">Reject</button>
+          </form>
+        </div>
+        {% endif %}
+      </div>
+      {% elif record.is_rejected %}
+      <div class="bg-error/10 border border-error rounded-lg p-4 mb-6">
+        <div class="flex items-center gap-2 text-error mb-2">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+          </svg>
+          <span class="font-medium">Rejected</span>
+        </div>
+        <div class="text-sm">
+          <span>Reviewed by: </span>
+          <span class="font-medium">{{ record.reviewed_by.first_name }} {{ record.reviewed_by.last_name }}</span>
+          {% if record.reviewed_by.discord_nickname %}
+          <span class="text-base-content/70">({{ record.reviewed_by.discord_nickname }})</span>
+          {% endif %}
+          {% if record.reviewed_by.discord_id %}
+          <a aria-label="Message {{ record.reviewed_by.first_name }} {{ record.reviewed_by.last_name }} on Discord" href="https://discord.com/users/{{ record.reviewed_by.discord_id }}" target="_blank" rel="noopener"
+             class="inline-block ml-1 align-middle tooltip tooltip-right" data-tip="Message on Discord">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 text-primary hover:text-primary-focus" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+            </svg>
+          </a>
+          {% endif %}
+        </div>
+        <div class="text-sm text-base-content/70 mb-2">
+          {{ record.reviewed_date|date:"F d, Y H:i" }}
+        </div>
+        {% if record.review_note %}
+        <div class="text-sm mt-2">
+          <span class="font-medium">Note: </span>
+          <span>{{ record.review_note }}</span>
+        </div>
+        {% endif %}
+        {% if can_change_status %}
+        <div class="mt-3 pt-3 border-t border-error/30 flex gap-2">
+          <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="reset_pending">
+            <button type="submit" class="btn btn-warning btn-xs btn-outline"
+                    onclick="return confirm('Reset this record to pending?')">Reset to Pending</button>
+          </form>
+          {% if record.user != user %}
+          <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="verify">
+            <button type="submit" class="btn btn-success btn-xs btn-outline"
+                    onclick="return confirm('Verify this rejected record?')">Verify</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+      {% elif can_review %}
+      <div class="mb-6">
+        <div class="alert alert-warning mb-4">
+          <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+          <span>This record is pending review. Review the media before verifying or rejecting.</span>
+        </div>
+        <p class="text-sm text-base-content/70 mb-4">The team member will be sent a DM with the review status change. You can add an optional note with your review.</p>
+        <div class="flex flex-wrap gap-4">
+          {% if record.user == user %}
+          <div class="tooltip" data-tip="You cannot approve your own record">
+            <button type="button" class="btn btn-success btn-disabled" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+              </svg>
+              Verify Record
+            </button>
+          </div>
+          {% else %}
+          <button type="button" class="btn btn-success" onclick="openReviewModal('verify')">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+            </svg>
+            Verify Record
+          </button>
+          {% endif %}
+          <button type="button" class="btn btn-error btn-outline" onclick="openReviewModal('reject')">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+            Reject Record
+          </button>
+        </div>
+      </div>
+      <!-- Review Note Modal -->
+      <dialog id="review-note-modal" class="modal">
+        <div class="modal-box">
+          <h3 class="font-bold text-lg" id="review-modal-title">Review Verification Record</h3>
+          <form method="post" class="mt-4">
+            {% csrf_token %}
+            <input type="hidden" name="action" id="review-modal-action" value="">
+            <input type="hidden" name="record_date" class="js-record-date-hidden">
+            <div class="form-control">
+              <label class="label">
+                <span class="label-text">Review note to Member (optional)</span>
+              </label>
+              <textarea name="review_note" class="textarea textarea-bordered h-24" placeholder="Add a message for the Member..."></textarea>
+            </div>
+            <div class="modal-action">
+              <button type="button" class="btn" onclick="document.getElementById('review-note-modal').close()">Cancel</button>
+              <button type="submit" id="review-modal-submit" class="btn">Submit</button>
+            </div>
+          </form>
+        </div>
+        <form method="dialog" class="modal-backdrop">
+          <button>close</button>
+        </form>
+      </dialog>
+      <script>
+        function openReviewModal(action) {
+          const modal = document.getElementById('review-note-modal');
+          const actionInput = document.getElementById('review-modal-action');
+          const title = document.getElementById('review-modal-title');
+          const submitBtn = document.getElementById('review-modal-submit');
+          actionInput.value = action;
+          if (action === 'verify') {
+            title.textContent = 'Verify Verification Record';
+            submitBtn.textContent = 'Verify';
+            submitBtn.className = 'btn btn-success';
+          } else {
+            title.textContent = 'Reject Verification Record';
+            submitBtn.textContent = 'Reject';
+            submitBtn.className = 'btn btn-error';
+          }
+          modal.showModal();
+        }
+      </script>
+      {% else %}
+      <div class="alert mb-6">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+        {% if unmet_requirements %}
+        {% comment %}
+          What the banner above means for this reviewer. The reason itself is in that banner,
+          which always lists every requirement -- repeating it here put the same sentence on
+          the page twice, back to back.
+        {% endcomment %}
+        <span>This record is pending review. You can look at the evidence, but the decision belongs to the people named above.</span>
+        {% else %}
+        <span>This record is pending review. Only verification reviewers can verify or reject it.</span>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      <!-- Back Link -->
+      <div class="divider"></div>
+      <div class="flex justify-between items-center">
+        <a href="{% url 'team:verification_records' %}" class="link link-primary">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+          </svg>
+          Back to Verification Records
+        </a>
+        {% if can_delete %}
+        <form method="post"
+              onsubmit="return confirm('Are you sure you want to permanently delete this verification record? This cannot be undone.');">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="delete">
+          <button type="submit" class="btn btn-error btn-sm btn-outline">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            Delete Record
+          </button>
+        </form>
+        {% endif %}
+      </div>
+
+      <!-- Other Verification Records -->
+      {% if other_records %}
+      <div class="divider"></div>
+      <h3 class="text-lg font-semibold mb-3">Other Records for {{ record.user.first_name }} {{ record.user.last_name }}</h3>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Type</th>
+              <th>Status</th>
+              <th>Review Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for other in other_records %}
+            <tr>
+              <td>
+                <a href="{% url 'team:verification_record_detail' pk=other.pk %}" class="link link-primary">
+                  {{ other.record_date|date:"M d, Y"|default:"—" }}
+                </a>
+              </td>
+              <td>{{ other.get_verify_type_display }}</td>
+              <td>
+                {% if other.is_verified %}
+                <span class="badge badge-success badge-sm">Verified</span>
+                {% elif other.is_rejected %}
+                <span class="badge badge-error badge-sm">Rejected</span>
+                {% else %}
+                <span class="badge badge-warning badge-sm">Pending</span>
+                {% endif %}
+              </td>
+              <td class="max-w-xs truncate">{{ other.review_note|default:"—" }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+
+      <!-- Who viewed this record -->
+      <div class="divider"></div>
+      <h3 class="text-lg font-semibold mb-1">Viewed By</h3>
+      <p class="text-sm text-base-content/60 mb-3">
+        Everyone who opened this record, including reviewers who didn't complete a review.
+      </p>
+      {% if record_views %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm table-cards">
+          <thead>
+            <tr>
+              <th>Reviewer</th>
+              <th>Last viewed</th>
+              <th>First viewed</th>
+              <th class="text-right">Views</th>
+              <th class="text-right">Media views</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for view in record_views %}
+            <tr>
+              <td class="font-medium">
+                <a href="{% url 'accounts:public_profile' user_id=view.user.pk %}" class="link link-hover">
+                  {{ view.user.get_full_name|default:view.user.discord_username|default:view.user.username }}
+                </a>
+              </td>
+              <td class="whitespace-nowrap" data-label="Last viewed">{{ view.last_viewed_at|date:"M d, Y H:i" }}</td>
+              <td class="whitespace-nowrap text-base-content/60" data-label="First viewed">{{ view.first_viewed_at|date:"M d, Y H:i" }}</td>
+              <td class="text-right" data-label="Views">
+                <span class="badge badge-ghost badge-sm">{{ view.view_count }}</span>
+              </td>
+              <td class="text-right" data-label="Media views">
+                {% if view.media_view_count %}
+                <span class="badge badge-warning badge-sm">{{ view.media_view_count }}</span>
+                {% else %}
+                <span class="text-base-content/30">—</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/50">No views recorded yet.</p>
+      {% endif %}
+
+    </div>
+  </div>
+</div>
+{% if can_review and record.is_pending %}
+<script>
+(function() {
+  var datePicker = document.getElementById('editable-record-date');
+  if (!datePicker) return;
+  document.querySelectorAll('.js-record-date-hidden').forEach(function(hidden) {
+    hidden.value = datePicker.value;
+    hidden.closest('form').addEventListener('submit', function() {
+      hidden.value = datePicker.value;
+    });
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

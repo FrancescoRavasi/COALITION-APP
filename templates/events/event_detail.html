@@ -1,0 +1,1909 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}{{ event.title }}{% endblock %}
+
+{% block content %}
+<style>
+.tooltip::before,.tooltip::after{transition-delay:0s!important;transition-duration:75ms!important}
+.squad-assign-ctrl{display:none}
+/* Squad tag filter and By Category scales: the pressed one also shows a check mark, so its state never rests on the
+   fill alone (btn-neutral sits close to the card colour in the dark theme). The second
+   declaration hides the glyph from screen readers, which already hear "pressed". */
+#squad-tag-filter button[aria-pressed="true"]::before,
+#category-source button[aria-pressed="true"]::before,
+#status-filter button[aria-pressed="true"]::before{content:"\2713";content:"\2713" / ""}
+/* The signup status filter's counts: a pill in the button's own text colour, so it reads in
+   both the pressed (neutral) and the outline buttons. */
+.status-count{display:inline-block;min-width:1.25rem;padding:0 .375rem;border-radius:999px;font-size:.6875rem;line-height:1.125rem;font-weight:600;text-align:center;font-variant-numeric:tabular-nums;background:color-mix(in oklab,currentColor 16%,transparent)}
+/* Event sections: folder tabs joined to the box of the panel they switch, so a tab reads as
+   part of the table below it; on a phone they sit in a two-column grid above the box, a
+   fifth (a race series' Series board) leaving the last one the full width.
+   Styled on aria-selected, which the tab script keeps current. The selected count is
+   base-content on base-100 rather than primary, which fails contrast in the dark theme. */
+.event-tabs,.event-panels{--event-tab-line:color-mix(in oklab,var(--color-base-content) 22%,transparent)}
+.event-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.375rem;margin-bottom:.5rem}
+.event-tab{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:.25rem .5rem;min-height:2.75rem;padding:.25rem .5rem;text-align:center;border:1px solid var(--event-tab-line);border-radius:var(--radius-field);background:var(--color-base-300);color:var(--color-base-content);font-size:.9375rem;font-weight:500;text-decoration:none}
+.event-tab:last-child:nth-child(odd){grid-column:1/-1}
+.event-tab[aria-selected="true"]{background:var(--color-base-100);border-color:var(--color-base-content);box-shadow:inset 0 0 0 1px var(--color-base-content);font-weight:600}
+.event-tab-count{display:inline-block;min-width:1.5rem;padding:0 .5rem;border-radius:999px;font-size:.75rem;line-height:1.25rem;font-weight:600;text-align:center;font-variant-numeric:tabular-nums;background:color-mix(in oklab,var(--color-base-content) 12%,transparent)}
+.event-tab[aria-selected="true"] .event-tab-count{background:var(--color-base-content);color:var(--color-base-100)}
+.event-panels{--pin-col-bg:var(--color-base-100);background:var(--color-base-100);border:1px solid var(--event-tab-line);border-radius:var(--radius-box);padding:1rem}
+@media(min-width:640px){
+  .event-tabs{display:flex;flex-wrap:wrap;align-items:flex-end;gap:.125rem;margin-bottom:0}
+  .event-tab{flex-wrap:nowrap;white-space:nowrap;justify-content:flex-start;padding:0 1.25rem;background:transparent;border-color:transparent;border-bottom-width:0;border-radius:.625rem .625rem 0 0;color:color-mix(in oklab,var(--color-base-content) 80%,transparent)}
+  .event-tab:hover{background:color-mix(in oklab,var(--color-base-content) 7%,transparent);color:var(--color-base-content)}
+  .event-tab[aria-selected="true"]{position:relative;z-index:1;margin-bottom:-1px;background:var(--color-base-100);border-color:var(--event-tab-line);border-bottom-color:var(--color-base-100);border-bottom-width:1px;box-shadow:none;color:var(--color-base-content)}
+  .event-panels{border-top-left-radius:0;padding:1.25rem}
+}
+@media(max-width:767px){
+  [data-signup-table] [data-col="zwid"],
+  [data-signup-table] [data-col="ftp"],
+  [data-signup-table] [data-col="wkg"],
+  [data-signup-table] [data-col="zftp"],
+  [data-signup-table] [data-col="zmap"],
+  [data-signup-table] [data-col="zauth"],
+  [data-signup-table] [data-col="notes"],
+  [data-signup-table] [data-col="custom_answers"]{display:none!important}
+  /* Pin the caret + Name columns of the squads summary table while the rest
+     scrolls horizontally (the expandable detail rows are left untouched). */
+  #squad-table thead th:nth-child(1),
+  #squad-table thead th:nth-child(2),
+  #squad-table tr.squad-row td:nth-child(1),
+  #squad-table tr.squad-row td:nth-child(2){
+    position:sticky; background:var(--color-base-100); z-index:5;
+  }
+  #squad-table thead th:nth-child(1),
+  #squad-table tr.squad-row td:nth-child(1){ left:0; }
+  #squad-table thead th:nth-child(2),
+  #squad-table tr.squad-row td:nth-child(2){ left:1.5rem; }
+}
+</style>
+<div class="max-w-6xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-start mb-4">
+        <div class="flex items-center gap-4">
+          {% if event.logo %}
+          <img src="{{ event.logo.url }}" alt="{{ event.title }}" class="h-16 max-w-32 object-contain rounded" style="filter:drop-shadow(0 0 1px rgba(0,0,0,.4)) drop-shadow(0 0 1px rgba(255,255,255,.4))">
+          {% endif %}
+          <h2 class="card-title text-2xl">{{ event.title }}</h2>
+        </div>
+        {# Gear menu replaces the old "Edit Event" button. #}
+        {# Items the user's roles don't cover are greyed out, as on the squad manage page. #}
+        {% if is_event_admin or can_view_squad_manage or can_view_v_report or can_add_members %}
+        <div class="flex justify-end shrink-0">
+          <div class="dropdown dropdown-end">
+            <label tabindex="0" class="btn btn-outline btn-sm btn-square" title="Event actions" aria-label="Event actions">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </label>
+            <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box shadow-lg z-50 p-2 w-60 max-w-[calc(100vw-2rem)]">
+              <li{% if not is_event_admin %} class="menu-disabled"{% endif %}>
+                <a {% if is_event_admin %}href="{% url 'events:event_edit' event.pk %}"{% else %}title="Requires the event admin permission"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                  </svg>
+                  Event setup
+                </a>
+              </li>
+              <li{% if not can_view_squad_manage %} class="menu-disabled"{% endif %}>
+                <a {% if can_view_squad_manage %}href="{% url 'events:squad_manage' event.pk %}"{% else %}title="Requires event admin, head captain, coordinator, or squad captain"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                  </svg>
+                  Manage squads
+                </a>
+              </li>
+              <li{% if not can_view_v_report %} class="menu-disabled"{% endif %}>
+                <a {% if can_view_v_report %}href="{% url 'events:squad_v_report' event.pk %}"{% else %}title="Requires event admin, head captain, or squad captain"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                  </svg>
+                  Eligibility
+                </a>
+              </li>
+              {% if event.is_race_series %}
+              <li{% if not is_event_admin %} class="menu-disabled"{% endif %}>
+                <a {% if is_event_admin %}href="{% url 'events:series_stages' event.pk %}"{% else %}title="Requires the event admin permission"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 21V5m0 0h11l-2 4 2 4H3" />
+                  </svg>
+                  Stages
+                </a>
+              </li>
+              <li{% if not can_view_v_report %} class="menu-disabled"{% endif %}>
+                <a {% if can_view_v_report %}href="{% url 'events:series_board' event.pk %}"{% else %}title="Requires event admin, head captain, or squad captain"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5h16v14H4zM4 10h16M9 5v14" />
+                  </svg>
+                  Series board
+                </a>
+              </li>
+              {% endif %}
+              <li{% if not can_add_members %} class="menu-disabled"{% endif %}>
+                <button type="button"
+                        {% if can_add_members %}onclick="document.getElementById('add_members_modal').showModal()"{% else %}disabled title="Requires the event head captain role, app admin, or superuser"{% endif %}>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"/>
+                  </svg>
+                  Add members
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
+        {% endif %}
+      </div>
+
+      <p class="text-sm text-base-content/70">
+        {{ event.start_date|date:"M j, Y" }} &ndash; {{ event.end_date|date:"M j, Y" }}
+      </p>
+
+      {% if event.description %}
+      <div class="prose prose-sm max-w-none mt-4">{{ event.description|render_markdown }}</div>
+      {% endif %}
+
+      {% if event.url or event.discord_channel_id %}
+      <div class="flex flex-wrap items-center gap-4 mt-4">
+        {% if event.url %}
+        <a href="{{ event.url }}" target="_blank" rel="noopener" class="link link-primary">
+          Event Link
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+          </svg>
+        </a>
+        {% endif %}
+        {% if event.discord_channel_id %}
+        <span class="tooltip" data-tip="Discord channel">
+          <a href="https://discord.com/channels/{{ guild_id }}/{{ event.discord_channel_id }}"
+             target="_blank" rel="noopener"
+             class="text-primary inline-flex items-center" aria-label="Discord channel">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 fill-current" viewBox="0 0 24 24"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"></path></svg>
+          </a>
+        </span>
+        {% endif %}
+      </div>
+      {% endif %}
+
+      {% comment %}
+        The one thing most people come here to do, so it gets the full width of the card and
+        sits directly under the event links rather than tucked beside the Signups heading.
+        It states the current position as well as the action: a rider who is already signed
+        up should be able to tell at a glance without opening anything.
+      {% endcomment %}
+      <div class="mt-6">
+        {% if event.signups_open %}
+          {% if user_signup and user_signup.status == "registered" %}
+          <button class="btn btn-success btn-outline btn-block"
+                  onclick="document.getElementById('edit_signup_modal').showModal()">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            You&rsquo;re signed up &mdash; edit
+          </button>
+          {% else %}
+          <button class="btn btn-primary btn-block"
+                  onclick="document.getElementById('signup_modal').showModal()">
+            Sign up for this event
+          </button>
+          {% endif %}
+        {% else %}
+        <p class="text-sm text-base-content/70">Signups are closed for this event.</p>
+        {% endif %}
+        {% comment %}
+          The rider's own status, when it has something to tell them: a withdrawn signup, or a
+          staff status with a message for riders. Staff notes are never shown here.
+        {% endcomment %}
+        {% if user_signup.status == "withdrawn" %}
+        <div class="rounded-box bg-base-200 p-3 mt-3 flex flex-col items-start gap-2">
+          {% include "events/_signup_status_badge.html" with withdrawn=True departed=False status=None %}
+          <p class="text-sm">You're not racing this event: your signup was withdrawn.{% if event.signups_open %} Changed your mind? Sign up again.{% endif %}</p>
+        </div>
+        {% elif my_status %}
+        <div class="rounded-box bg-base-200 p-3 mt-3 flex flex-col items-start gap-2">
+          {% include "events/_signup_status_badge.html" with status=my_status withdrawn=False departed=False %}
+          <p class="text-sm break-words">{{ my_status.rider_message }}</p>
+        </div>
+        {% endif %}
+      </div>
+
+      {% comment %}
+        Tabs, so the page states what it holds instead of making you scroll to find out.
+
+        Every panel is rendered and the script hides all but one, rather than the server
+        sending a single panel per ?tab=. That keeps each panel's own scripts working (they
+        find their elements on load), keeps the page a single document for anything that
+        reads it whole, and degrades to today's behaviour -- everything stacked -- if the
+        script never runs. The URL still carries ?tab= so a link opens on the right panel.
+
+        The look is keyed on aria-selected (the .event-tab rules above), so the state assistive
+        tech hears and the one on screen cannot disagree. The tab names its panel, so each
+        panel's heading is for screen readers only.
+
+        Signups comes first and opens by default; a viewer who cannot see the signups opens on
+        By Squad instead (data-default-tab). By Category has no count: it counts squad members,
+        and beside the signup count it read as a second total of the same riders. The panels
+        keep their old order, which only the no-JS fallback shows.
+      {% endcomment %}
+      {# One block, so the card body's gap cannot open between a tab and its box. #}
+      <div class="mt-8">
+      <div role="tablist" class="event-tabs" id="event-tabs"
+           data-default-tab="{% if can_view_signups %}signups{% else %}squads{% endif %}">
+        <a role="tab" href="?tab=signups" data-tab="signups" id="tab-signups"
+           aria-controls="panel-signups" aria-selected="false"
+           class="event-tab">Signups
+          <span class="event-tab-count">{{ signup_count }}</span>
+        </a>
+        <a role="tab" href="?tab=squads" data-tab="squads" id="tab-squads"
+           aria-controls="panel-squads" aria-selected="false"
+           class="event-tab">By Squad
+          <span class="event-tab-count">{{ squads|length }}</span>
+        </a>
+        <a role="tab" href="?tab=category" data-tab="category" id="tab-category"
+           aria-controls="panel-category" aria-selected="false"
+           class="event-tab">By Category</a>
+        {% if event.is_race_series and can_view_v_report %}
+        <a role="tab" href="?tab=series" data-tab="series" id="tab-series"
+           aria-controls="panel-series" aria-selected="false"
+           class="event-tab">Series board</a>
+        {% endif %}
+        <a role="tab" href="?tab=races" data-tab="races" id="tab-races"
+           aria-controls="panel-races" aria-selected="false"
+           class="event-tab">Races
+          <span class="event-tab-count">{{ races|length }}</span>
+        </a>
+      </div>
+      <div class="event-panels">
+      {% if signup_stat_groups %}
+      {{ signup_stat_columns|json_script:"signup-stat-columns" }}
+      {{ signup_stat_values|json_script:"signup-stat-values" }}
+      <script>
+        // The extra Zwift Racing columns (apps/events/rider_stats.py), for the signups table and
+        // the By Squad rider tables: built in the page from the JSON above rather than sent as
+        // cells hidden in every row. Each table's own boxes show and hide its columns, remembered
+        // in this browser under its own key. Ahead of both tables, so both can call it.
+        window.addStatColumns = function (options) {
+          var columns = JSON.parse(document.getElementById('signup-stat-columns').textContent);
+          var values = JSON.parse(document.getElementById('signup-stat-values').textContent);
+          var saved = {};
+          try { saved = JSON.parse(localStorage.getItem(options.storageKey)) || {}; } catch (e) {}
+          var tables = Array.prototype.filter.call(options.tables, function (table) { return table.tHead; });
+
+          tables.forEach(function (table) {
+            var head = table.tHead.rows[0];
+            columns.forEach(function (column) {
+              var th = document.createElement('th');
+              th.dataset.col = options.prefix + column.key;
+              if (options.sortable) {
+                th.dataset.sort = column.kind === 'category' ? 'text' : 'num';
+                th.className = 'cursor-pointer hover:text-primary select-none whitespace-nowrap';
+              } else {
+                th.className = 'whitespace-nowrap';
+              }
+              th.textContent = column.header;
+              th.style.display = saved[column.key] ? '' : 'none';
+              head.appendChild(th);
+            });
+            // Rows of its own tbody only: a squad's rider table sits in the squads table's tbody,
+            // so "tbody tr" also matches the rider table's header row.
+            Array.prototype.filter.call(table.querySelectorAll(options.rows), function (row) {
+              return row.parentNode.tagName === 'TBODY' && row.parentNode.parentNode === table;
+            }).forEach(function (row) {
+              // A row with no key (a squad member with no signup) still gets its cells, blank,
+              // or every column after it would shift.
+              var rowValues = values[row.getAttribute(options.rowKey)] || [];
+              columns.forEach(function (column, i) {
+                var td = document.createElement('td');
+                td.dataset.col = options.prefix + column.key;
+                if (rowValues[i] && column.kind === 'category') {
+                  // A badge, as the vELO 1 category cells are; the name is set as text, never HTML.
+                  var badge = document.createElement('span');
+                  badge.className = 'badge badge-sm';
+                  badge.textContent = rowValues[i];
+                  td.appendChild(badge);
+                } else if (rowValues[i]) {
+                  td.className = 'font-mono text-sm text-right';
+                  td.textContent = rowValues[i];
+                } else {
+                  td.className = 'text-base-content/70';
+                  td.textContent = '-';
+                }
+                td.style.display = saved[column.key] ? '' : 'none';
+                row.appendChild(td);
+              });
+            });
+          });
+
+          document.querySelectorAll(options.toggles).forEach(function (box) {
+            var key = box.dataset.statCol;
+            box.checked = !!saved[key];
+            box.addEventListener('change', function () {
+              saved[key] = box.checked;
+              try { localStorage.setItem(options.storageKey, JSON.stringify(saved)); } catch (e) {}
+              tables.forEach(function (table) {
+                table.querySelectorAll('[data-col="' + options.prefix + key + '"]').forEach(function (el) {
+                  el.style.display = box.checked ? '' : 'none';
+                });
+              });
+            });
+          });
+        };
+      </script>
+      {% endif %}
+
+      <div role="tabpanel" id="panel-squads" data-tab-panel="squads" aria-labelledby="tab-squads">
+      {% if squads or is_event_admin %}
+      <div class="flex flex-wrap items-center justify-end gap-2 mb-4">
+        <h3 class="sr-only">Squads{% if squads %} ({{ squads|length }}){% endif %}</h3>
+        {# justify-end: a button that wraps stays at the right, so its dropdown-end menu opens on screen. #}
+        <div class="flex flex-wrap items-center justify-end gap-2">
+          {% if squads %}
+          <button type="button" class="btn btn-outline btn-sm" id="squad-expand-all"
+                  onclick="toggleAllSquadMembers()">Expand all</button>
+          {% endif %}
+          <div class="dropdown dropdown-end">
+            <label tabindex="0" class="btn btn-outline btn-sm">Squad columns</label>
+            <ul tabindex="0" class="dropdown-content menu bg-base-200 rounded-box shadow-lg z-50 p-2 w-64 max-h-72 overflow-y-auto">
+              <li class="menu-title text-xs">Columns on the squads table</li>
+              {% if event_squad_tags %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_tags"> Tags</label></li>
+              {% endif %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_members"> Members</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_tz"> Time zone</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_gender"> Squad Gender</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_enforced"> Enforced Requirements</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_zwift_cat"> Zwift Category</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_womens_cat"> Women's Zwift Category</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_zr_cat"> ZR Category</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_captain"> Captain</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-field-toggle" data-scol="sqf_vice"> Vice Captain</label></li>
+            </ul>
+          </div>
+          <div class="dropdown dropdown-end">
+            <label tabindex="0" class="btn btn-outline btn-sm">Rider columns</label>
+            {# flex-nowrap: a daisyUI menu wraps into side-by-side columns at its height limit, which cut the labels short. #}
+            <ul tabindex="0" class="dropdown-content menu flex-nowrap bg-base-200 rounded-box shadow-lg z-50 p-2 w-72 max-w-[calc(100vw-4rem)] max-h-96 overflow-y-auto">
+              <li class="menu-title text-xs text-base-content/70">Shown when a squad is expanded</li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_name" checked> Name</label></li>
+              {% if can_view_signup_table %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zwid"> ZWID</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_timezone"> Timezone</label></li>
+              {% if event.squad_gender_required %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_squad_gender"> Squad Gender</label></li>{% endif %}
+              {% endif %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_gender" checked> Gender</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_category" checked> ZP Category</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_rating" checked> ZR Category</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_ftp" checked> FTP</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_wkg" checked> WKG</label></li>
+              {% if can_view_signup_table %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zftp"> zFTP</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zmap"> zMAP</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zauth"> Zauth</label></li>
+              {% endif %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_verified" checked> Verified</label></li>
+              {% if can_view_signup_table and event.event_role %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_event_role"> Event Role</label></li>{% endif %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_has_role" checked> Has Role</label></li>
+              {% if can_view_signup_table and can_view_signup_notes %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_notes"> Notes</label></li>{% endif %}
+              {% if can_view_signup_table and signup_questions %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_custom_answers"> Answers</label></li>{% endif %}
+              <li class="menu-title text-xs pt-2 text-base-content/70">Zwift Racing</li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_age"> Age</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_cur_rating"> Current Rating</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_cur_cat"> Current Cat</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_max30_rating"> Max30 Rating</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_max30_cat"> Max30 Cat</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_max90_rating"> Max90 Rating</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_max90_cat"> Max90 Cat</label></li>
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-col-toggle" data-col="sq_zr_phenotype"> Phenotype</label></li>
+              {# Empty unless the viewer gets the full signup table: these carry everyone's power. #}
+              {% for group in signup_stat_groups %}
+              <li class="menu-title text-xs pt-2 text-base-content/70">{{ group.title }}</li>
+              {% for column in group.columns %}
+              <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs squad-stat-col-toggle" data-stat-col="{{ column.key }}"> {{ column.label }}</label></li>
+              {% endfor %}
+              {% endfor %}
+            </ul>
+          </div>
+          {# Eligibility and Manage Squads moved to the header gear menu. #}
+        </div>
+      </div>
+      {% if squads %}
+      {% if event_squad_tags %}
+      {# Single-select tag filter: one tag at a time, "All" (or the active tag again) clears it. #}
+      <div class="mb-3">
+        <div class="flex flex-wrap items-center gap-2" role="group" id="squad-tag-filter" aria-labelledby="squad-tag-filter-label">
+          <span id="squad-tag-filter-label" class="text-sm font-semibold">Filter squads by tag</span>
+          <button type="button" class="btn btn-xs btn-neutral" data-squad-tag-filter="" aria-pressed="true">All</button>
+          {% for tag in event_squad_tags %}
+          {# A long tag wraps inside its button (still at least btn-xs tall) instead of pushing the card sideways. #}
+          <button type="button" class="btn btn-xs btn-outline h-auto min-h-[var(--size)] py-0.5 max-w-full text-left wrap-anywhere" data-squad-tag-filter="{{ tag }}" aria-pressed="false">{{ tag }}</button>
+          {% endfor %}
+        </div>
+        {# Always in the page (empty when unfiltered) so screen readers pick up each change. #}
+        <p id="squad-tag-filter-status" role="status" class="text-sm mt-1"></p>
+      </div>
+      {% endif %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm" id="squad-table">
+          <thead>
+            <tr>
+              <th class="!px-0 !w-6"></th>
+              <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Name</th>
+              {% if event_squad_tags %}<th data-scol="sqf_tags" data-sort="text" class="cursor-pointer hover:text-primary select-none">Tags</th>{% endif %}
+              <th data-scol="sqf_members" data-sort="num" class="cursor-pointer hover:text-primary select-none">Members</th>
+              <th data-scol="sqf_tz" data-sort="text" class="cursor-pointer hover:text-primary select-none">Time zone</th>
+              <th data-scol="sqf_gender" data-sort="text" class="cursor-pointer hover:text-primary select-none">Squad Gender</th>
+              <th data-scol="sqf_enforced" class="select-none">Enforced Requirements</th>
+              <th data-scol="sqf_zwift_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none">Zwift Category</th>
+              <th data-scol="sqf_womens_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none">Women's Zwift Category</th>
+              <th data-scol="sqf_zr_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none">ZR Category</th>
+              <th data-scol="sqf_captain" data-sort="text" class="cursor-pointer hover:text-primary select-none">Captain</th>
+              <th data-scol="sqf_vice" data-sort="text" class="cursor-pointer hover:text-primary select-none">Vice Captain</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for squad in squads %}
+            <tr class="squad-row"{% if event_squad_tags %} data-squad-tags="{{ squad.tags_json }}"{% endif %}>
+              <td class="!px-0 !w-6">
+                <button aria-label="Show details for {{ squad.name }}" type="button" class="btn btn-ghost btn-xs !px-0 !min-h-0" onclick="toggleSquadMembers({{ squad.pk }})" title="Show details">
+                  <svg id="squad-arrow-{{ squad.pk }}" xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </td>
+              <td class="font-semibold">{{ squad.name }}</td>
+              {% if event_squad_tags %}
+              {# nowrap: inside the scrolling table a tag keeps to one line rather than being squeezed letter by letter. #}
+              <td data-scol="sqf_tags" class="whitespace-nowrap">
+                {% if squad.tag_list %}{% include "events/_squad_tag_badges.html" with tags=squad.tag_list %}{% else %}<span class="text-base-content/70">-</span>{% endif %}
+              </td>
+              {% endif %}
+              <td data-scol="sqf_members">
+                {% if squad.enriched_members %}
+                <div class="tooltip tooltip-right" data-tip="{{ squad.member_names_tooltip }}">
+                  <span class="cursor-default underline decoration-dotted">{{ squad.member_count }}</span>
+                </div>
+                {% else %}
+                {{ squad.member_count }}
+                {% endif %}
+              </td>
+              <td data-scol="sqf_tz">{{ squad.squad_timezone|default:"-" }}</td>
+              <td data-scol="sqf_gender">{% if squad.gender %}{% include "events/_squad_gender_badge.html" with gender=squad.gender %}{% else %}<span class="text-base-content/30">-</span>{% endif %}</td>
+              {# enforcement_summary is a property, so bind it once rather than recomputing per use. #}
+              {% with enforced=squad.enforcement_summary %}
+              <td data-scol="sqf_enforced">
+                {% if enforced %}
+                {% comment %}
+                  A squad enforcing everything yields eight badges, which makes the row
+                  tower over its neighbours. Show two, keep the rest one hover away.
+                {% endcomment %}
+                <div class="flex items-center gap-1">
+                  {% for item in enforced|slice:":2" %}<span class="badge badge-warning badge-sm whitespace-nowrap">{{ item }}</span>{% endfor %}
+                  {% if enforced|length > 2 %}
+                  <div class="tooltip tooltip-left" data-tip="{{ enforced|join:" · " }}">
+                    <span class="badge badge-warning badge-outline badge-sm cursor-default">+{{ enforced|length|add:"-2" }}</span>
+                  </div>
+                  {% endif %}
+                </div>
+                {% else %}
+                <span class="text-base-content/30" title="Nothing blocks a rider from joining this squad">None</span>
+                {% endif %}
+              </td>
+              {% endwith %}
+              <td data-scol="sqf_zwift_cat">
+                {% include "events/_squad_category_range.html" with low=squad.min_zwift_category high=squad.max_zwift_category %}
+              </td>
+              <td data-scol="sqf_womens_cat">
+                {% include "events/_squad_category_range.html" with low=squad.min_womens_zwift_category high=squad.max_womens_zwift_category %}
+              </td>
+              <td data-scol="sqf_zr_cat">
+                {% include "events/_squad_category_range.html" with low=squad.min_zwift_racing_category high=squad.max_zwift_racing_category %}
+              </td>
+              <td data-scol="sqf_captain">{% for c in squad.captains.all %}{{ c.get_full_name|default:c.discord_username }}{% if not forloop.last %}, {% endif %}{% empty %}-{% endfor %}</td>
+              <td data-scol="sqf_vice">{% for vc in squad.vice_captains.all %}{{ vc.get_full_name|default:vc.discord_username }}{% if not forloop.last %}, {% endif %}{% empty %}-{% endfor %}</td>
+            </tr>
+            <tr id="squad-members-{{ squad.pk }}" style="display:none">
+              {# Every squads-table column; the column toggler re-counts the visible ones on load. #}
+              <td colspan="{% if event_squad_tags %}12{% else %}11{% endif %}" class="p-0">
+                <div class="bg-base-300 rounded-lg mx-2 mb-2 p-2">
+                  <div class="flex flex-wrap items-center gap-2 mb-2 relative">
+                    {% if squad.discord_channel_id %}
+                    <a href="https://discord.com/channels/{{ guild_id }}/{{ squad.discord_channel_id }}" target="_blank" rel="noopener" class="btn btn-outline btn-xs">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                      Discord Channel
+                    </a>
+                    {% endif %}
+                  </div>
+                  {% if squad.enriched_members %}
+                  <div>
+                  <table class="table table-xs squad-member-table">
+                    <thead>
+                      <tr>
+                        <th data-col="sq_name">Name</th>
+                        {% if can_view_signup_table %}
+                        <th data-col="sq_zwid">ZWID</th>
+                        <th data-col="sq_timezone">Timezone</th>
+                        {% if event.squad_gender_required %}<th data-col="sq_squad_gender">Squad Gender</th>{% endif %}
+                        {% endif %}
+                        <th data-col="sq_gender">Gender</th>
+                        <th data-col="sq_category">ZP Category</th>
+                        <th data-col="sq_rating">ZR Category</th>
+                        <th data-col="sq_ftp">FTP</th>
+                        <th data-col="sq_wkg">WKG</th>
+                        {% if can_view_signup_table %}
+                        <th data-col="sq_zftp">zFTP</th>
+                        <th data-col="sq_zmap">zMAP</th>
+                        <th data-col="sq_zauth">Zauth</th>
+                        {% endif %}
+                        <th data-col="sq_verified">Verified</th>
+                        {% if can_view_signup_table and event.event_role %}<th data-col="sq_event_role">Event Role</th>{% endif %}
+                        {% if squad.team_discord_role %}<th data-col="sq_has_role">Has Role</th>{% endif %}
+                        {% if can_view_signup_table and can_view_signup_notes %}<th data-col="sq_notes">Notes</th>{% endif %}
+                        {% if can_view_signup_table and signup_questions %}<th data-col="sq_custom_answers">Answers</th>{% endif %}
+                        <th data-col="sq_zr_age" style="display:none">Age</th>
+                        <th data-col="sq_zr_cur_rating" style="display:none">Current Rating</th>
+                        <th data-col="sq_zr_cur_cat" style="display:none">Current Cat</th>
+                        <th data-col="sq_zr_max30_rating" style="display:none">Max30 Rating</th>
+                        <th data-col="sq_zr_max30_cat" style="display:none">Max30 Cat</th>
+                        <th data-col="sq_zr_max90_rating" style="display:none">Max90 Rating</th>
+                        <th data-col="sq_zr_max90_cat" style="display:none">Max90 Cat</th>
+                        <th data-col="sq_zr_phenotype" style="display:none">Phenotype</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {% for member in squad.enriched_members %}
+                      <tr{% if member.signup_entry %} data-member-signup="{{ member.signup_entry.signup.pk }}"{% endif %}>
+                        <td data-col="sq_name">
+                          {% if member.user.pk in squad.captain_pks %}<span class="tooltip" data-tip="Captain">🎖️</span>{% elif member.user.pk in squad.vice_captain_pks %}<span class="tooltip" data-tip="Vice Captain">🎖️</span>{% endif %}
+                          {% include "accounts/_user_tooltip.html" with display_name=member.user.get_full_name|default:member.user.discord_username user_id=member.user.pk discord_id=member.user.discord_id discord_avatar_url=member.user.discord_avatar_url zwid=member.zwid zp_category=member.zp_category zp_category_w=member.zp_category_w zr_category=member.zr_category zr_v2=member.zr_v2_category zr_rating=member.zr_rating zr_phenotype=member.zr_phenotype zr_age=member.zr_age is_race_ready=member.is_race_ready is_extra_verified=member.is_extra_verified in_zwiftpower=member.in_zwiftpower in_zwiftracing=member.in_zwiftracing %}
+                        </td>
+                        {% include "events/_rider_cells.html" with e=member.signup_entry|default:member p="sq_" full=can_view_signup_table %}
+                        {% if squad.team_discord_role %}
+                        <td data-col="sq_has_role">
+                          {% if can_manage_roles %}
+                            {% include "events/_squad_role_cell.html" with event_pk=event.pk squad_pk=squad.pk member_user_pk=member.user.pk has_role=member.has_discord_role %}
+                          {% else %}
+                            {% if member.has_discord_role %}
+                            <div class="tooltip" data-tip="Has discord role"><span class="text-success">&#10003;</span></div>
+                            {% else %}
+                            <div class="tooltip" data-tip="Missing discord role"><span class="text-error">&#10007;</span></div>
+                            {% endif %}
+                          {% endif %}
+                        </td>
+                        {% endif %}
+                        {% include "events/_rider_cells_more.html" with e=member.signup_entry|default:member p="sq_" full=can_view_signup_table %}
+                      </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                  </div>
+                  {% else %}
+                  <p class="text-sm text-base-content/50">No members in this squad yet.</p>
+                  {% endif %}
+                </div>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if signup_stat_groups %}
+      <script>
+        addStatColumns({
+          tables: document.querySelectorAll('.squad-member-table'),
+          rows: 'tbody tr', rowKey: 'data-member-signup', prefix: 'sq_',
+          storageKey: 'event_squad_stat_cols', toggles: '.squad-stat-col-toggle', sortable: false
+        });
+      </script>
+      {% endif %}
+      {% endif %}
+      {% else %}
+      <p class="text-sm text-base-content/70">No squads yet.</p>
+      {% endif %}
+      </div>
+
+      <div role="tabpanel" id="panel-signups" data-tab-panel="signups" aria-labelledby="tab-signups">
+      {# Event Signup Section #}
+      <div class="flex items-center gap-2 mb-3">
+        <h3 class="sr-only">Signups</h3>
+        {% comment %}
+          Gated on `signups`, not `signup_count`: the count is registered-only, so an event
+          where everyone withdrew would render the table with no way to open it.
+        {% endcomment %}
+        {% if can_view_signups and signups %}
+        <p class="text-sm text-base-content/70"><span class="font-semibold text-base-content tabular-nums" id="signup-count-badge">{{ signup_count }}</span> signed up</p>
+        {% endif %}
+        {% if event.signups_open %}
+          {% comment %}
+            Shareable link that lands on this page with the signup form already open, so a
+            rider following it does not have to find the button. ?signup=1 rather than a
+            #fragment: the page is login-gated, and allauth's ?next= carries a query string
+            through the login round-trip where a fragment would be dropped.
+          {% endcomment %}
+          <button type="button" class="btn btn-ghost btn-sm btn-square ml-auto"
+                  data-signup-share="{{ request.scheme }}://{{ request.get_host }}{% url 'events:event_detail' event.pk %}?signup=1"
+                  title="Copy a link that opens the signup form"
+                  aria-label="Copy a link that opens the signup form">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                 stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M13.828 10.172a4 4 0 010 5.656l-3 3a4 4 0 01-5.656-5.656l1.5-1.5"/>
+              <path stroke-linecap="round" stroke-linejoin="round"
+                    d="M10.172 13.828a4 4 0 010-5.656l3-3a4 4 0 015.656 5.656l-1.5 1.5"/>
+            </svg>
+          </button>
+        {% endif %}
+      </div>
+
+
+      {% if can_view_signups and signups %}
+      <div id="signups-content">
+      {% if can_view_signup_table %}
+      <div class="mt-2">
+        <div class="flex items-center gap-2 mb-2">
+          <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
+            {% comment %}
+              vELO 2 tier filters: the mixed tier, and the women's tier only women have (a man's
+              row carries none). Only the tiers this event's riders hold are offered.
+            {% endcomment %}
+            {% if signup_velo2_options.mixed %}
+            <select class="select select-bordered select-sm w-auto" data-signup-velo2-filter="velo2" aria-label="Filter signups by vELO 2 tier">
+              <option value="">vELO 2: any</option>
+              {% for tier in signup_velo2_options.mixed %}<option value="{{ tier }}">vELO 2: {{ tier }}</option>{% endfor %}
+            </select>
+            {% endif %}
+            {% if signup_velo2_options.women %}
+            <select class="select select-bordered select-sm w-auto" data-signup-velo2-filter="velo2Women" aria-label="Filter signups by vELO 2 women's tier">
+              <option value="">vELO 2 women's: any</option>
+              {% for tier in signup_velo2_options.women %}<option value="{{ tier }}">vELO 2 women's: {{ tier }}</option>{% endfor %}
+            </select>
+            {% endif %}
+            <input type="text" class="input input-bordered input-sm w-48" placeholder="Search by name..." data-signup-search="detail">
+            {% if can_export_signups %}
+            <a href="{% url 'events:signup_export' event.pk %}" class="btn btn-outline btn-sm btn-square"
+               title="Download every registered signup as CSV, all columns" aria-label="Export signups as CSV">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+              </svg>
+            </a>
+            {% endif %}
+            <div class="dropdown dropdown-end">
+              <label tabindex="0" class="btn btn-outline btn-sm">Columns</label>
+              {# flex-nowrap: a daisyUI menu wraps into side-by-side columns at its height limit, which cut the labels short. #}
+              <ul tabindex="0" class="dropdown-content menu flex-nowrap bg-base-200 rounded-box shadow-lg z-50 p-2 w-72 max-w-[calc(100vw-4rem)] max-h-96 overflow-y-auto">
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="name" checked> Name</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zwid" checked> ZWID</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="timezone" checked> Timezone</label></li>
+                {% if event.squad_gender_required %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="squad_gender" checked> Squad Gender</label></li>{% endif %}
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="gender" checked> Gender</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="category" checked> ZP Category</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="rating" checked> ZR Category</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="ftp" checked> FTP</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="wkg" checked> WKG</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zftp" checked> zFTP</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zmap" checked> zMAP</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zauth" checked> Zauth</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="verified" checked> Verified</label></li>
+                {% if squads %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="squad" checked> Squad</label></li>{% endif %}
+                {% if can_view_signup_notes %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="notes" checked> Notes</label></li>{% endif %}
+                {% if signup_questions %}<li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="custom_answers" checked> Answers</label></li>{% endif %}
+                {# text-base-content/70: daisyUI's own menu-title colour falls to 2.5:1 in the light theme. #}
+                <li class="menu-title text-xs pt-2 text-base-content/70">Zwift Racing</li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_age"> Age</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_cur_rating"> Current Rating</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_cur_cat"> Current Cat</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_max30_rating"> Max30 Rating</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_max30_cat"> Max30 Cat</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_max90_rating"> Max90 Rating</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_max90_cat"> Max90 Cat</label></li>
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs col-toggle" data-col="zr_phenotype"> Phenotype</label></li>
+                {% comment %}
+                  The rest of the Zwift Racing figures, from the rider profile cache. Their cells are built
+                  in the page from #signup-stat-values (at the top of the panels), so these boxes carry
+                  data-stat-col, not data-col: the toggler above hides everything with a matching
+                  data-col, which would take the box itself.
+                {% endcomment %}
+                {% for group in signup_stat_groups %}
+                <li class="menu-title text-xs pt-2 text-base-content/70">{{ group.title }}</li>
+                {% for column in group.columns %}
+                <li><label class="label cursor-pointer justify-start gap-2 py-1"><input type="checkbox" class="checkbox checkbox-xs stat-col-toggle" data-stat-col="{{ column.key }}"> {{ column.label }}</label></li>
+                {% endfor %}
+                {% endfor %}
+              </ul>
+            </div>
+          </div>
+        </div>
+        {% comment %}
+          Signup status filter: one bucket at a time (apps.events.signup_status.BUCKETS), only
+          the buckets someone is in. Like the squad tag filter, the pressed button also shows a
+          check mark, so its state never rests on the fill alone.
+        {% endcomment %}
+        {% if status_counts|length > 1 %}
+        <div class="flex flex-wrap items-center gap-2 mb-2" role="group" id="status-filter" aria-labelledby="status-filter-label">
+          <span id="status-filter-label" class="text-sm font-semibold">Status</span>
+          <button type="button" class="btn btn-xs btn-neutral gap-1" data-status-filter="" aria-pressed="true">All <span class="status-count">{{ signups|length }}</span></button>
+          {% for bucket in status_counts %}
+          <button type="button" class="btn btn-xs btn-outline gap-1" data-status-filter="{{ bucket.key }}" aria-pressed="false">{{ bucket.label }} <span class="status-count">{{ bucket.count }}</span></button>
+          {% endfor %}
+        </div>
+        <p id="status-filter-status" role="status" class="sr-only"></p>
+        {% endif %}
+        {% if status_still_placed %}
+        <div class="flex flex-wrap items-center gap-2 text-sm mb-3">
+          <span class="badge badge-warning badge-sm gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path></svg>Needs attention</span>
+          <span>
+            {% for entry in status_still_placed|slice:":3" %}{{ entry.user.get_full_name|default:entry.user.discord_username }}{% if not forloop.last %}, {% endif %}{% endfor %}{% if status_still_placed|length > 3 %} and {{ status_still_placed|length|add:"-3" }} more{% endif %}
+            {% if status_still_placed|length == 1 %}left the team but still has a squad place.{% else %}left the team but still have squad places.{% endif %}
+          </span>
+          {% if status_counts|length > 1 %}<button type="button" class="link text-sm" data-status-filter-shortcut="left">Show them</button>{% endif %}
+        </div>
+        {% endif %}
+        {% if answer_facets %}
+        {% include "events/_answer_facets.html" %}
+        {{ answer_payload|json_script:"answer-payload" }}
+        <div class="text-center py-8 hidden" id="answer-empty">
+          <p class="text-base-content/60 mb-3">No signup matches these answers.</p>
+          <button type="button" class="btn btn-sm btn-outline" id="answer-empty-clear">Clear all filters</button>
+        </div>
+        {% endif %}
+        <div class="overflow-x-auto">
+          <table class="table table-sm table-pin-col" data-signup-table="detail">
+            <thead>
+              <tr>
+                <th data-col="name" data-sort="text" class="cursor-pointer hover:text-primary select-none">Name</th>
+                <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Status</th>
+                <th data-col="zwid" data-sort="num" class="cursor-pointer hover:text-primary select-none">ZWID</th>
+                <th data-col="timezone" data-sort="text" class="cursor-pointer hover:text-primary select-none">Timezone</th>
+                {% if event.squad_gender_required %}<th data-col="squad_gender" data-sort="text" class="cursor-pointer hover:text-primary select-none">Squad Gender</th>{% endif %}
+                <th data-col="gender" data-sort="text" class="cursor-pointer hover:text-primary select-none">Gender</th>
+                <th data-col="category" data-sort="text" class="cursor-pointer hover:text-primary select-none">ZP Category</th>
+                <th data-col="rating" data-sort="text" class="cursor-pointer hover:text-primary select-none">ZR Category</th>
+                <th data-col="ftp" data-sort="num" class="cursor-pointer hover:text-primary select-none">FTP</th>
+                <th data-col="wkg" data-sort="num" class="cursor-pointer hover:text-primary select-none">WKG</th>
+                <th data-col="zftp" data-sort="num" class="cursor-pointer hover:text-primary select-none">zFTP</th>
+                <th data-col="zmap" data-sort="num" class="cursor-pointer hover:text-primary select-none">zMAP</th>
+                <th data-col="zauth" data-sort="text" class="cursor-pointer hover:text-primary select-none" title="How the rider's Zwift account was verified. Squads with &quot;require zauth&quot; accept only Zwift OAuth.">Zauth</th>
+                <th data-col="verified" data-sort="text" class="cursor-pointer hover:text-primary select-none">Verified</th>
+                {% if event.event_role %}<th data-col="event_role" data-sort="text" class="cursor-pointer hover:text-primary select-none">Event Role</th>{% endif %}
+                {% if squads %}<th data-col="squad" data-sort="text" class="cursor-pointer hover:text-primary select-none">Squad</th>{% endif %}
+                {% if can_view_signup_notes %}<th data-col="notes" data-sort="text" class="cursor-pointer hover:text-primary select-none">Notes</th>{% endif %}
+                {% if signup_questions %}<th data-col="custom_answers">Answers{% if answer_facets %} <span class="text-xs font-normal text-base-content/50">(sort in a facet &#9650;&#9660;)</span>{% endif %}</th>{% endif %}
+                <th data-col="zr_age" data-sort="text" class="cursor-pointer hover:text-primary select-none" style="display:none">Age</th>
+                <th data-col="zr_cur_rating" data-sort="num" class="cursor-pointer hover:text-primary select-none" style="display:none">Current Rating</th>
+                <th data-col="zr_cur_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none" style="display:none">Current Cat</th>
+                <th data-col="zr_max30_rating" data-sort="num" class="cursor-pointer hover:text-primary select-none" style="display:none">Max30 Rating</th>
+                <th data-col="zr_max30_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none" style="display:none">Max30 Cat</th>
+                <th data-col="zr_max90_rating" data-sort="num" class="cursor-pointer hover:text-primary select-none" style="display:none">Max90 Rating</th>
+                <th data-col="zr_max90_cat" data-sort="text" class="cursor-pointer hover:text-primary select-none" style="display:none">Max90 Cat</th>
+                <th data-col="zr_phenotype" data-sort="text" class="cursor-pointer hover:text-primary select-none" style="display:none">Phenotype</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for entry in signups %}
+              {% with withdrawn=entry.signup.is_withdrawn %}
+              {# Riders who withdrew or left the team are tinted as well as labelled in the Status cell. #}
+              <tr data-signup-pk="{{ entry.signup.pk }}" data-name="{{ entry.user.get_full_name|default:entry.user.discord_username }}" data-velo2="{{ entry.zr_v2_category }}" data-velo2-women="{{ entry.zr_v2_women_category }}" data-status-bucket="{{ entry.bucket }}"{% if withdrawn %} data-signup-withdrawn{% endif %}{% if withdrawn or entry.departed %} class="bg-base-200"{% endif %}>
+                <td data-col="name" data-sort-value="{{ entry.user.get_full_name|default:entry.user.discord_username }}">
+                  {% include "accounts/_user_tooltip.html" with display_name=entry.user.get_full_name|default:entry.user.discord_username user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=entry.user.discord_avatar_url zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype zr_age=entry.zr_age is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+                  {% if answer_facets %}<div class="md:hidden text-xs text-base-content/60 mt-1 max-w-48 empty:hidden" data-answer-focus></div>{% endif %}
+                </td>
+                <td data-sort-value="{{ entry.status_text }}">
+                  {% include "events/_signup_status_cell.html" with e=entry can_set=can_set_status next=status_next %}
+                </td>
+                {% include "events/_rider_cells.html" with e=entry p="" full=True %}
+                {% if squads %}
+                <td data-col="squad" id="squad-cell-{{ entry.signup.pk }}">
+                  {% include "events/_squad_cell.html" with assigned_squads=entry.assigned_squads squads=squads event_pk=event.pk signup_id=entry.signup.pk can_add=entry.can_add_to_squad %}
+                </td>
+                {% endif %}
+                {% include "events/_rider_cells_more.html" with e=entry p="" full=True %}
+              </tr>
+              {% endwith %}
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {# What the Status badges mean -- only the kinds someone in the table has. #}
+        {% if status_key.waiting or status_key.set_aside or status_key.withdrawn or status_key.left %}
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs mt-3">
+          <span class="text-base-content/80">Key:</span>
+          {% if status_key.waiting %}
+          <span class="inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path></svg>Waiting for a squad: still offered when placing riders, after those who need one</span>
+          {% endif %}
+          {% if status_key.set_aside %}
+          <span class="inline-flex items-center gap-1"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1"></rect><rect x="14" y="5" width="4" height="14" rx="1"></rect></svg>Set aside: not offered until someone changes the status</span>
+          {% endif %}
+          {% if status_key.withdrawn %}
+          <span class="inline-flex flex-wrap items-center gap-1">{% include "events/_signup_status_badge.html" with withdrawn=True departed=False status=None %} not racing; the signup is kept</span>
+          {% endif %}
+          {% if status_key.left %}
+          <span class="inline-flex flex-wrap items-center gap-1">{% include "events/_signup_status_badge.html" with departed=True withdrawn=False status=None %} set by the app when a rider leaves the Discord server</span>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% if signup_stat_groups %}
+        <script>
+          // Before the sort script further down binds every th[data-sort].
+          addStatColumns({
+            tables: document.querySelectorAll('[data-signup-table="detail"]'),
+            rows: 'tbody tr[data-signup-pk]', rowKey: 'data-signup-pk', prefix: '',
+            storageKey: 'event_signup_stat_cols', toggles: '.stat-col-toggle', sortable: true
+          });
+        </script>
+        {% endif %}
+        </div>
+      {% else %}
+      {# Non-admin members with show_signups on: names + icons only #}
+      <div class="mt-2 flex flex-wrap gap-2">
+        {% for entry in signups %}
+        <div class="badge badge-ghost badge-lg gap-1 py-3">
+          {% include "accounts/_user_tooltip.html" with display_name=entry.user.get_full_name|default:entry.user.discord_username user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=entry.user.discord_avatar_url zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype zr_age=entry.zr_age is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+      </div>
+      {% elif can_view_signups %}
+      <p class="text-sm text-base-content/70">No one has signed up yet.</p>
+      {% else %}
+      <p class="text-sm text-base-content/70">Only event admins, coordinators and squad captains can see who has signed up.</p>
+      {% endif %}
+
+
+      </div>
+
+      <div role="tabpanel" id="panel-category" data-tab-panel="category" aria-labelledby="tab-category">
+      {% if squads %}
+      <h3 class="sr-only">By Category</h3>
+      <div id="category-content">
+        {% comment %}
+          Three scales, all from the rider profile cache (rider_stats.category_tables): Zwift's
+          own category, vELO 1's tier and vELO 2's. Each counts every rider by their mixed
+          category and every woman again by her women's, shown after a slash.
+        {% endcomment %}
+        <div class="flex flex-wrap items-center gap-2 mb-3" role="group" id="category-source" aria-labelledby="category-source-label">
+          <span id="category-source-label" class="text-sm text-base-content/70">Count by</span>
+          {% for table in category_tables %}
+          <button type="button" class="btn btn-xs {% if forloop.first %}btn-neutral{% else %}btn-outline{% endif %}"
+                  data-category-source="{{ table.key }}" aria-pressed="{% if forloop.first %}true{% else %}false{% endif %}">{{ table.label }}</button>
+          {% endfor %}
+        </div>
+        {% for table in category_tables %}
+        <div id="cat-table-{{ table.key }}"{% if not forloop.first %} hidden{% endif %}>
+          {# Outside the scrolling box, so it wraps on a phone instead of scrolling away with the table. #}
+          {% if table.has_women %}
+          <p class="text-sm text-base-content/70 mb-2" id="cat-note-{{ table.key }}">Each count is riders by mixed category / women by women's category.</p>
+          {% endif %}
+          <div class="overflow-x-auto">
+          <table class="table table-sm" data-cat-table{% if table.has_women %} aria-describedby="cat-note-{{ table.key }}"{% endif %}>
+            <thead>
+              <tr>
+                <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Squad</th>
+                <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Timezone</th>
+                {% for cat in table.columns %}
+                <th class="text-center">{{ cat }}</th>
+                {% endfor %}
+                <th class="text-center">None</th>
+                <th data-sort="num" data-default-sort="desc" class="text-center cursor-pointer hover:text-primary select-none">{{ table.score_label }}</th>
+                <th class="text-center">Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in table.rows %}
+              <tr>
+                <td class="font-semibold">{{ row.squad.name }}</td>
+                <td>{{ row.squad.squad_timezone|default:"-" }}</td>
+                {% for count in row.cells %}
+                <td class="text-center">{% include "events/_category_count.html" %}</td>
+                {% endfor %}
+                <td class="text-center">{% include "events/_category_count.html" with count=row.none %}</td>
+                <td class="text-center">{% if row.avg is not None %}<span class="font-mono text-sm">{{ row.avg }}</span>{% else %}<span class="text-base-content/70">-</span>{% endif %}</td>
+                <td class="text-center font-semibold">{% include "events/_category_count.html" with count=row.total %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+            <tfoot>
+              <tr class="font-semibold">
+                <td colspan="2">Total</td>
+                {% for count in table.totals.cells %}
+                <td class="text-center">{% include "events/_category_count.html" %}</td>
+                {% endfor %}
+                <td class="text-center">{% include "events/_category_count.html" with count=table.totals.none %}</td>
+                <td class="text-center">{% if table.totals.avg is not None %}<span class="font-mono text-sm">{{ table.totals.avg }}</span>{% else %}<span class="text-base-content/70">-</span>{% endif %}</td>
+                <td class="text-center">{% include "events/_category_count.html" with count=table.totals.total %}</td>
+              </tr>
+            </tfoot>
+          </table>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/70">Category counts appear once the event has squads.</p>
+      {% endif %}
+      </div>
+
+      {% if event.is_race_series and can_view_v_report %}
+      {% comment %}
+        The series board is fetched the first time its tab is shown (intersect fires once the
+        panel is visible), not built on every visit to this page. series_board_view answers
+        this element's id as HX-Target (series_views.BOARD_PANEL_ID) with the board alone.
+      {% endcomment %}
+      <div role="tabpanel" id="panel-series" data-tab-panel="series" aria-labelledby="tab-series">
+        <div id="series-board-panel"
+             hx-get="{% url 'events:series_board' event.pk %}" hx-trigger="intersect once"
+             hx-target="this" hx-swap="innerHTML">
+          <p class="flex flex-wrap items-center gap-2 text-sm text-base-content/80">
+            <span class="loading loading-spinner loading-sm" aria-hidden="true"></span>
+            <span role="status" data-board-status>Loading the series board&hellip;</span>
+            <a href="{% url 'events:series_board' event.pk %}" class="link">Open it on its own page</a>
+          </p>
+        </div>
+      </div>
+      {% endif %}
+
+      <div role="tabpanel" id="panel-races" data-tab-panel="races" aria-labelledby="tab-races">
+      {% if races %}
+      <h3 class="sr-only">Races</h3>
+      <div class="space-y-3">
+        {% for race in races %}
+        <div class="card bg-base-300">
+          <div class="card-body p-4">
+            <h4 class="font-semibold">{{ race.title }}</h4>
+            <p class="text-sm text-base-content/70">
+              {{ race.start_date|date:"M j, Y" }}{% if race.start_time %} at {{ race.start_time|time:"g:i A" }}{% endif %}
+              {% if race.end_date %} &ndash; {{ race.end_date|date:"M j, Y" }}{% endif %}
+            </p>
+            {% if race.zwift_category or race.zwift_rating %}
+            <div class="flex gap-2 mt-1">
+              {% if race.zwift_category %}
+              <span class="badge badge-sm badge-outline">Cat {{ race.zwift_category }}</span>
+              {% endif %}
+              {% if race.zwift_rating %}
+              <span class="badge badge-sm badge-outline">Rating: {{ race.zwift_rating }}</span>
+              {% endif %}
+            </div>
+            {% endif %}
+            {% if race.description %}
+            <p class="text-sm mt-2">{{ race.description }}</p>
+            {% endif %}
+            {% if race.url or race.race_pass or race.discord_channel_id %}
+            <div class="flex flex-wrap gap-3 mt-2">
+              {% if race.url %}
+              <a href="{{ race.url }}" target="_blank" rel="noopener" class="link link-primary text-sm">
+                Race Details
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </a>
+              {% endif %}
+              {% if race.race_pass %}
+              <a href="{{ race.race_pass }}" target="_blank" rel="noopener" class="link link-primary text-sm">
+                Race Pass
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </a>
+              {% endif %}
+              {% if race.discord_channel_id %}
+              <a href="https://discord.com/channels/{{ guild_id }}/{{ race.discord_channel_id }}" target="_blank" rel="noopener" class="link link-primary text-sm">
+                Discord Channel
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 inline ml-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </a>
+              {% endif %}
+            </div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="text-sm text-base-content/70">No races have been added to this event.</p>
+      {% endif %}
+      </div>
+      </div>
+      </div>
+
+      <div class="mt-6">
+        <a href="{% url 'events:event_list' %}" class="btn btn-ghost btn-sm">&larr; Back to Events</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+      {% comment %}
+        Dialogs sit at the end, outside every panel, because the controls that open them
+        do: the signup button is in the header and Add members in the gear menu. A <dialog>
+        inside a display:none panel cannot be opened by showModal(), so keeping them out
+        here is what lets the panels be hidden without breaking the buttons.
+      {% endcomment %}
+      {% if can_set_status and can_view_signup_table %}
+      {% include "events/_signup_status_dialog.html" %}
+      {% endif %}
+      {% if event.signups_open %}
+        {% if user_signup and user_signup.status == "registered" %}
+        <dialog id="edit_signup_modal" class="modal">
+          <div class="modal-box">
+            <h3 class="text-lg font-bold mb-4">Edit Signup</h3>
+            <form method="post" action="{% url 'events:event_signup_edit' event.pk %}" class="space-y-4">
+              {% csrf_token %}
+              {% if event.timezone_options %}
+              <div class="form-control w-full">
+                <label class="label">
+                  <span class="label-text">Timezone{% if event.timezone_required %} <span class="text-error">*</span>{% endif %}</span>
+                </label>
+                <div class="flex flex-wrap gap-3">
+                  {% for tz in event.timezone_options %}
+                  <label class="label cursor-pointer gap-2">
+                    <input type="checkbox" name="signup_timezone" value="{{ tz }}" class="checkbox checkbox-sm"{% if tz in user_signup.signup_timezone %} checked{% endif %}>
+                    <span class="label-text">{{ tz }}</span>
+                  </label>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% if event.squad_gender_required and event.squad_gender_options %}
+              <div class="form-control w-full">
+                <label class="label">
+                  <span class="label-text">Squad Gender Preference <span class="text-error">*</span></span>
+                </label>
+                <div class="flex flex-wrap gap-3">
+                  {% for g in event.squad_gender_options %}
+                  <label class="label cursor-pointer gap-2">
+                    <input type="checkbox" name="signup_squad_gender" value="{{ g }}" class="checkbox checkbox-sm"{% if g in user_signup.signup_squad_gender %} checked{% endif %}>
+                    <span class="label-text">{{ g }}</span>
+                  </label>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% include "events/_signup_question_fields.html" with fields=signup_question_fields %}
+              <div class="form-control w-full">
+                <label class="label" for="edit_signup_notes">
+                  <span class="label-text">Notes</span>
+                </label>
+                <textarea name="notes" id="edit_signup_notes" class="textarea textarea-bordered w-full" rows="3" placeholder="Any notes for the people running this event (optional)">{{ user_signup.notes }}</textarea>
+              </div>
+              <div class="modal-action">
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('edit_signup_modal').close()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Changes</button>
+              </div>
+            </form>
+            <div class="divider">or</div>
+            <form method="post" action="{% url 'events:event_signup_delete' event.pk %}" onsubmit="return confirm('Are you sure you want to remove your signup?')">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-error btn-outline btn-sm w-full">Remove Signup</button>
+            </form>
+          </div>
+          <form method="dialog" class="modal-backdrop"><button>close</button></form>
+        </dialog>
+        {% else %}
+        <dialog id="signup_modal" class="modal">
+          <div class="modal-box">
+            <h3 class="text-lg font-bold mb-4">Sign Up for {{ event.title }}</h3>
+            {% if signup_blockers %}
+            {% comment %}
+              The event's signup requirements (apps.events.signup_requirements) are not met: say
+              what is missing and where to fix it, instead of offering a form the server would
+              refuse. The same rule refuses the POST, a squad invite and a captain's add.
+            {% endcomment %}
+            <div class="alert alert-warning" role="alert">
+              <div>
+                <p class="font-semibold">Before you can sign up</p>
+                <p class="text-sm">This event requires:</p>
+                <ul class="list-disc list-inside text-sm mt-1 space-y-1">
+                  {% for blocker in signup_blockers %}
+                  <li>{{ blocker.needs|capfirst }} &mdash; <a href="{{ blocker.fix_url }}" class="link font-semibold">{{ blocker.fix_label }}</a></li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </div>
+            <div class="modal-action">
+              <button type="button" class="btn" onclick="this.closest('dialog').close()">Close</button>
+            </div>
+            {% else %}
+            {% if event.signup_instructions %}
+            <div class="prose prose-sm max-w-none mb-4">{{ event.signup_instructions|render_markdown }}</div>
+            {% endif %}
+            <form method="post" action="{% url 'events:event_signup' event.pk %}" class="space-y-4">
+              {% csrf_token %}
+              {% if event.timezone_options %}
+              <div class="form-control w-full">
+                <label class="label">
+                  <span class="label-text">Timezone{% if event.timezone_required %} <span class="text-error">*</span>{% endif %}</span>
+                </label>
+                <div class="flex flex-wrap gap-3">
+                  {% for tz in event.timezone_options %}
+                  <label class="label cursor-pointer gap-2">
+                    <input type="checkbox" name="signup_timezone" value="{{ tz }}" class="checkbox checkbox-sm">
+                    <span class="label-text">{{ tz }}</span>
+                  </label>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% if event.squad_gender_required and event.squad_gender_options %}
+              <div class="form-control w-full">
+                <label class="label">
+                  <span class="label-text">Squad Gender Preference <span class="text-error">*</span></span>
+                </label>
+                <div class="flex flex-wrap gap-3">
+                  {% for g in event.squad_gender_options %}
+                  <label class="label cursor-pointer gap-2">
+                    <input type="checkbox" name="signup_squad_gender" value="{{ g }}" class="checkbox checkbox-sm">
+                    <span class="label-text">{{ g }}</span>
+                  </label>
+                  {% endfor %}
+                </div>
+              </div>
+              {% endif %}
+              {% include "events/_signup_question_fields.html" with fields=signup_question_fields %}
+              <div class="form-control w-full">
+                <label class="label" for="signup_notes">
+                  <span class="label-text">Notes</span>
+                </label>
+                <textarea name="notes" id="signup_notes" class="textarea textarea-bordered w-full" rows="3" placeholder="Any notes for the people running this event (optional)"></textarea>
+              </div>
+              <div class="modal-action">
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('signup_modal').close()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Sign Up</button>
+              </div>
+            </form>
+            {% endif %}
+          </div>
+          <form method="dialog" class="modal-backdrop"><button>close</button></form>
+        </dialog>
+        {% endif %}
+      {% endif %}
+
+      {% if can_add_members %}
+      {# The trigger lives in the event gear menu; only the dialog remains here. #}
+      <dialog id="add_members_modal" class="modal">
+        <div class="modal-box max-w-lg">
+          <h3 class="text-lg font-bold mb-4">Add Members to Event</h3>
+          <p class="text-sm text-base-content/70 mb-4">Search for team members to add to this event{% if event.event_role %} and assign the event Discord role{% endif %}.</p>
+          <div class="form-control mb-4">
+            <input type="text" id="add-members-search" class="input input-bordered w-full" placeholder="Search by name (min 2 characters)..." autocomplete="off">
+          </div>
+          <div id="add-members-results" class="max-h-60 overflow-y-auto mb-4"></div>
+          <form method="post" action="{% url 'events:add_members' event.pk %}" id="add-members-form">
+            {% csrf_token %}
+            <div id="add-members-selected" class="flex flex-wrap gap-2 mb-4"></div>
+            <div class="modal-action">
+              <button type="button" class="btn btn-ghost" onclick="document.getElementById('add_members_modal').close()">Cancel</button>
+              <button type="submit" class="btn btn-primary" id="add-members-submit" disabled>Add Selected</button>
+            </div>
+          </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+      </dialog>
+      {% endif %}
+
+<script>
+function toggleSquadMembers(squadPk) {
+  var row = document.getElementById('squad-members-' + squadPk);
+  var arrow = document.getElementById('squad-arrow-' + squadPk);
+  if (row.style.display === 'none') {
+    row.style.display = '';
+    arrow.style.transform = 'rotate(90deg)';
+  } else {
+    row.style.display = 'none';
+    arrow.style.transform = '';
+  }
+  syncSquadExpandAllLabel();
+}
+// Detail rows of the squads the tag filter is showing. A filtered-out squad's rows carry the
+// hidden attribute, so "Expand all" neither opens them nor counts them.
+function shownSquadDetailRows() {
+  return Array.from(document.querySelectorAll('tr[id^="squad-members-"]')).filter(function(row) {
+    return !row.hidden;
+  });
+}
+function toggleAllSquadMembers() {
+  var rows = shownSquadDetailRows();
+  if (!rows.length) return;
+  // Collapse only when everything is already open, so a half-expanded table opens the
+  // rest rather than throwing away what the user already opened.
+  var expand = rows.some(function(row) { return row.style.display === 'none'; });
+  rows.forEach(function(row) {
+    var pk = row.id.replace('squad-members-', '');
+    var isOpen = row.style.display !== 'none';
+    // Skip the rows already in the state we are moving to; toggle the rest.
+    if (isOpen === expand) return;
+    toggleSquadMembers(pk);
+  });
+  syncSquadExpandAllLabel();
+}
+
+function syncSquadExpandAllLabel() {
+  var button = document.getElementById('squad-expand-all');
+  if (!button) return;
+  var rows = shownSquadDetailRows();
+  var allOpen = rows.length > 0 && rows.every(function(row) { return row.style.display !== 'none'; });
+  button.textContent = allOpen ? 'Collapse all' : 'Expand all';
+}
+
+// By Category: one scale's table at a time, its button pressed.
+(function() {
+  var buttons = Array.prototype.slice.call(document.querySelectorAll('[data-category-source]'));
+  buttons.forEach(function(button) {
+    button.addEventListener('click', function() {
+      buttons.forEach(function(other) {
+        var on = other === button;
+        other.setAttribute('aria-pressed', on ? 'true' : 'false');
+        other.classList.toggle('btn-neutral', on);
+        other.classList.toggle('btn-outline', !on);
+        var table = document.getElementById('cat-table-' + other.getAttribute('data-category-source'));
+        if (table) table.hidden = !on;
+      });
+    });
+  });
+})();
+
+
+// Column toggler for signup table
+(function() {
+  var STORAGE_KEY = 'event_signup_cols';
+  var DEFAULTS = {
+    name: true, zwid: false, timezone: true, gender: true, category: true,
+    rating: true, ftp: false, wkg: false, verified: false, squad: true, notes: true,
+    zr_age: false, zr_cur_rating: false, zr_cur_cat: false,
+    zr_max30_rating: false, zr_max30_cat: false,
+    zr_max90_rating: false, zr_max90_cat: false, zr_phenotype: false
+  };
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch(e) {}
+
+  // The column's cells only: its box in the Columns menu carries the same data-col, and hiding
+  // that too left an unchecked column as bare text no keyboard or screen reader could reach.
+  function cellsOf(col) {
+    return document.querySelectorAll('th[data-col="' + col + '"], td[data-col="' + col + '"]');
+  }
+
+  function getVisible(col) {
+    return col in saved ? saved[col] : (col in DEFAULTS ? DEFAULTS[col] : true);
+  }
+
+  function applyCols() {
+    document.querySelectorAll('.col-toggle').forEach(function(cb) {
+      var col = cb.getAttribute('data-col');
+      var show = getVisible(col);
+      cb.checked = show;
+      cellsOf(col).forEach(function(el) {
+        el.style.display = show ? '' : 'none';
+      });
+    });
+  }
+
+  document.querySelectorAll('.col-toggle').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+      var col = this.getAttribute('data-col');
+      saved[col] = this.checked;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+      cellsOf(col).forEach(function(el) {
+        el.style.display = saved[col] ? '' : 'none';
+      });
+    });
+  });
+
+  applyCols();
+})();
+
+// Column toggler for the squads summary table (squad-level fields).
+// Kept separate from the member-table toggler below: that one controls rider columns
+// inside an expanded squad, which is why a single "Columns" button read as nonsense.
+// Distinct attribute (data-scol), class and storage key so the two cannot collide.
+(function() {
+  var STORAGE_KEY = 'event_squad_field_cols';
+  var DEFAULTS = {
+    sqf_tags: true,
+    sqf_members: true, sqf_tz: true, sqf_gender: true, sqf_enforced: true,
+    sqf_zwift_cat: true, sqf_womens_cat: true,
+    sqf_zr_cat: false, sqf_captain: false, sqf_vice: false
+  };
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch(e) {}
+
+  function getVisible(col) {
+    return col in saved ? saved[col] : (col in DEFAULTS ? DEFAULTS[col] : true);
+  }
+
+  // The expanded-members row spans the whole table, so its colspan has to follow the
+  // visible column count rather than the hardcoded total.
+  function syncColspan() {
+    var table = document.getElementById('squad-table');
+    if (!table) return;
+    // Its own header cells: the rider tables nested in the expanded rows have theirs too.
+    var visible = Array.from(table.querySelectorAll('thead th')).filter(function(th) {
+      return th.closest('table') === table && th.style.display !== 'none';
+    }).length;
+    table.querySelectorAll('tr[id^="squad-members-"] > td').forEach(function(td) {
+      td.setAttribute('colspan', visible);
+    });
+  }
+
+  function setCol(col, show) {
+    document.querySelectorAll('[data-scol="' + col + '"]').forEach(function(el) {
+      el.style.display = show ? '' : 'none';
+    });
+  }
+
+  document.querySelectorAll('.squad-field-toggle').forEach(function(cb) {
+    var col = cb.getAttribute('data-scol');
+    cb.checked = getVisible(col);
+    setCol(col, cb.checked);
+    cb.addEventListener('change', function() {
+      saved[col] = this.checked;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+      setCol(col, this.checked);
+      syncColspan();
+    });
+  });
+
+  syncColspan();
+})();
+
+// Column toggler for squad member tables
+(function() {
+  var STORAGE_KEY = 'event_squad_cols';
+  var DEFAULTS = {
+    sq_name: true, sq_gender: true, sq_category: true, sq_rating: true,
+    sq_ftp: false, sq_wkg: false, sq_verified: false, sq_has_role: true,
+    sq_zwid: false, sq_timezone: false, sq_squad_gender: false, sq_zftp: false, sq_zmap: false,
+    sq_zauth: false, sq_event_role: false, sq_notes: false, sq_custom_answers: false,
+    sq_zr_age: false, sq_zr_cur_rating: false, sq_zr_cur_cat: false,
+    sq_zr_max30_rating: false, sq_zr_max30_cat: false,
+    sq_zr_max90_rating: false, sq_zr_max90_cat: false, sq_zr_phenotype: false
+  };
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch(e) {}
+
+  // The column's cells only: its box in the Columns menu carries the same data-col, and hiding
+  // that too left an unchecked column as bare text no keyboard or screen reader could reach.
+  function cellsOf(col) {
+    return document.querySelectorAll('th[data-col="' + col + '"], td[data-col="' + col + '"]');
+  }
+
+  function getVisible(col) {
+    return col in saved ? saved[col] : (col in DEFAULTS ? DEFAULTS[col] : true);
+  }
+
+  function applyCols() {
+    document.querySelectorAll('.squad-col-toggle').forEach(function(cb) {
+      var col = cb.getAttribute('data-col');
+      var show = getVisible(col);
+      cb.checked = show;
+      cellsOf(col).forEach(function(el) {
+        el.style.display = show ? '' : 'none';
+      });
+    });
+  }
+
+  document.querySelectorAll('.squad-col-toggle').forEach(function(cb) {
+    cb.addEventListener('change', function() {
+      var col = this.getAttribute('data-col');
+      saved[col] = this.checked;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+      cellsOf(col).forEach(function(el) {
+        el.style.display = saved[col] ? '' : 'none';
+      });
+    });
+  });
+
+  applyCols();
+})();
+
+// Squad table sorting (keeps data row + detail row paired)
+(function() {
+  var table = document.getElementById('squad-table');
+  if (!table) return;
+  var headers = table.querySelectorAll('th[data-sort]');
+  headers.forEach(function(th) {
+    th.addEventListener('click', function() {
+      // Real cell index among all <th> (the leading arrow column has no data-sort)
+      var colIdx = Array.from(th.parentNode.children).indexOf(th);
+      var sortType = th.getAttribute('data-sort');
+      var asc = th.getAttribute('data-dir') !== 'asc';
+      headers.forEach(function(h) {
+        h.removeAttribute('data-dir');
+        var ind = h.querySelector('.sort-indicator');
+        if (ind) ind.remove();
+      });
+      th.setAttribute('data-dir', asc ? 'asc' : 'desc');
+      var indicator = document.createElement('span');
+      indicator.className = 'sort-indicator text-primary ml-1';
+      indicator.textContent = asc ? '\u25B2' : '\u25BC';
+      th.appendChild(indicator);
+
+      var tbody = table.querySelector('tbody');
+      // Collect paired rows: each .squad-row + its next sibling (detail row)
+      var pairs = [];
+      var dataRows = tbody.querySelectorAll('tr.squad-row');
+      dataRows.forEach(function(row) {
+        pairs.push({ data: row, detail: row.nextElementSibling });
+      });
+      pairs.sort(function(a, b) {
+        var aText = a.data.cells[colIdx].textContent.trim();
+        var bText = b.data.cells[colIdx].textContent.trim();
+        if (sortType === 'num') {
+          var aNum = parseFloat(aText) || 0;
+          var bNum = parseFloat(bText) || 0;
+          return asc ? aNum - bNum : bNum - aNum;
+        }
+        return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+      });
+      pairs.forEach(function(pair) {
+        tbody.appendChild(pair.data);
+        if (pair.detail) tbody.appendChild(pair.detail);
+      });
+    });
+  });
+  // Sort by Name A-Z on page load
+  if (headers.length > 0) headers[0].click();
+})();
+
+// Squad tag filter (single-select). Only rendered when the event has squad tags. Each squad
+// row carries its tags as JSON in data-squad-tags; a squad's detail row is its next sibling,
+// which the sort above keeps true, and is hidden with it.
+(function() {
+  var group = document.getElementById('squad-tag-filter');
+  var table = document.getElementById('squad-table');
+  if (!group || !table) return;
+  var status = document.getElementById('squad-tag-filter-status');
+  var buttons = Array.from(group.querySelectorAll('button[data-squad-tag-filter]'));
+  var active = '';
+
+  function tagsOf(row) {
+    var tags = [];
+    try { tags = JSON.parse(row.getAttribute('data-squad-tags') || '[]'); } catch (e) { tags = []; }
+    if (!Array.isArray(tags)) return [];
+    return tags.map(function(tag) { return String(tag).toLowerCase(); });
+  }
+
+  function apply(tag) {
+    active = tag;
+    var key = tag.toLowerCase();
+    var rows = Array.from(table.querySelectorAll('tbody tr.squad-row'));
+    var shown = 0;
+    rows.forEach(function(row) {
+      var match = !key || tagsOf(row).indexOf(key) !== -1;
+      row.hidden = !match;
+      var detail = row.nextElementSibling;
+      if (detail && detail.id.indexOf('squad-members-') === 0) detail.hidden = !match;
+      if (match) shown += 1;
+    });
+    buttons.forEach(function(button) {
+      var pressed = button.getAttribute('data-squad-tag-filter') === tag;
+      button.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+      button.classList.toggle('btn-neutral', pressed);
+      button.classList.toggle('btn-outline', !pressed);
+    });
+    if (status) {
+      status.textContent = key
+        ? 'Showing ' + shown + ' of ' + rows.length + (rows.length === 1 ? ' squad' : ' squads')
+        : '';
+    }
+    syncSquadExpandAllLabel();
+  }
+
+  buttons.forEach(function(button) {
+    button.addEventListener('click', function() {
+      var tag = button.getAttribute('data-squad-tag-filter');
+      // Clicking the active tag again clears the filter, as "All" does.
+      apply(tag && tag !== active ? tag : '');
+    });
+  });
+})();
+
+// Category table sorting (every scale's table)
+(function() {
+  function getColIdx(th) {
+    return Array.from(th.parentNode.children).indexOf(th);
+  }
+
+  function sortCatTable(table, colIdx, sortType, asc) {
+    var tbody = table.querySelector('tbody');
+    var rows = Array.from(tbody.querySelectorAll('tr'));
+    rows.sort(function(a, b) {
+      var aText = a.cells[colIdx].textContent.trim();
+      var bText = b.cells[colIdx].textContent.trim();
+      if (sortType === 'num') {
+        var aNum = parseFloat(aText) || 0;
+        var bNum = parseFloat(bText) || 0;
+        return asc ? aNum - bNum : bNum - aNum;
+      }
+      return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+    });
+    rows.forEach(function(row) { tbody.appendChild(row); });
+  }
+
+  function setIndicator(th, dir) {
+    th.setAttribute('data-dir', dir);
+    var ind = document.createElement('span');
+    ind.className = 'sort-indicator text-primary ml-1';
+    ind.textContent = dir === 'asc' ? '\u25B2' : '\u25BC';
+    th.appendChild(ind);
+  }
+
+  document.querySelectorAll('[data-cat-table]').forEach(function(table) {
+    var headers = table.querySelectorAll('th[data-sort]');
+    headers.forEach(function(th) {
+      th.addEventListener('click', function() {
+        var sortType = th.getAttribute('data-sort');
+        var colIdx = getColIdx(th);
+        var asc = th.getAttribute('data-dir') !== 'asc';
+        headers.forEach(function(h) {
+          h.removeAttribute('data-dir');
+          var ind = h.querySelector('.sort-indicator');
+          if (ind) ind.remove();
+        });
+        setIndicator(th, asc ? 'asc' : 'desc');
+        sortCatTable(table, colIdx, sortType, asc);
+      });
+    });
+    // Default sort: primary by default-sort column desc, secondary by timezone asc
+    // Stable sort: apply secondary first, then primary
+    var defaultCol = table.querySelector('th[data-default-sort]');
+    var tzHeader = headers[1]; // Timezone is always second sortable header
+    if (defaultCol && tzHeader) {
+      sortCatTable(table, getColIdx(tzHeader), 'text', true);
+      sortCatTable(table, getColIdx(defaultCol), defaultCol.getAttribute('data-sort'), false);
+      setIndicator(defaultCol, 'desc');
+    } else if (tzHeader) {
+      sortCatTable(table, getColIdx(tzHeader), 'text', true);
+      setIndicator(tzHeader, 'asc');
+    }
+  });
+})();
+</script>
+<script>
+(function() {
+  // Search
+  // A row can be hidden by the name search, the answer facets, the vELO 2 filters and the
+  // status filter independently; each writes a flag and this decides, so none can un-hide
+  // another's rows.
+  window.applyRowVisibility = function(row) {
+    row.style.display = (row.dataset.searchHidden || row.dataset.answerHidden || row.dataset.velo2Hidden || row.dataset.statusHidden) ? 'none' : '';
+  };
+
+  function cellSortText(row, colIdx) {
+    var cell = row.cells[colIdx];
+    if (!cell) return '';
+    return (cell.dataset.sortValue !== undefined ? cell.dataset.sortValue : cell.textContent).trim();
+  }
+
+  document.querySelectorAll('[data-signup-search]').forEach(function(input) {
+    var tableId = input.getAttribute('data-signup-search');
+    var table = document.querySelector('[data-signup-table="' + tableId + '"]');
+    if (!table) return;
+    input.addEventListener('input', function() {
+      var query = this.value.toLowerCase();
+      table.querySelectorAll('tbody tr').forEach(function(row) {
+        // data-name where present: cells[0] now also carries the mobile answer line.
+        var name = (row.dataset.name || (row.cells[0] ? row.cells[0].textContent : '')).toLowerCase();
+        row.dataset.searchHidden = name.indexOf(query) !== -1 ? '' : '1';
+        applyRowVisibility(row);
+      });
+      // The answer facets own the count badge and the zero-match state, and both depend on
+      // searchHidden, so they have to be recomputed here too.
+      if (typeof window.answerFacetsRender === 'function') window.answerFacetsRender();
+    });
+  });
+
+  // vELO 2 tier filters. A select's data-signup-velo2-filter names the row attribute it
+  // matches: "velo2" reads data-velo2, "velo2Women" reads data-velo2-women.
+  document.querySelectorAll('[data-signup-table="detail"]').forEach(function(table) {
+    var selects = Array.from(document.querySelectorAll('[data-signup-velo2-filter]'));
+    if (!selects.length) return;
+    var applyVelo2 = function() {
+      table.querySelectorAll('tbody tr[data-signup-pk]').forEach(function(row) {
+        var match = selects.every(function(select) {
+          return !select.value || row.dataset[select.dataset.signupVelo2Filter] === select.value;
+        });
+        row.dataset.velo2Hidden = match ? '' : '1';
+        applyRowVisibility(row);
+      });
+      if (typeof window.answerFacetsRender === 'function') window.answerFacetsRender();
+    };
+    selects.forEach(function(select) { select.addEventListener('change', applyVelo2); });
+    // A browser can restore a choice on Back; filter to it rather than show every row under it.
+    if (selects.some(function(select) { return select.value; })) applyVelo2();
+  });
+
+  // Signup status filter: one bucket at a time, "All" (or the pressed one again) clears it.
+  // Each row carries its bucket (apps.events.signup_status.bucket) in data-status-bucket.
+  (function() {
+    var group = document.getElementById('status-filter');
+    var table = document.querySelector('[data-signup-table="detail"]');
+    if (!group || !table) return;
+    var buttons = Array.from(group.querySelectorAll('[data-status-filter]'));
+    var status = document.getElementById('status-filter-status');
+    function choose(key) {
+      buttons.forEach(function(button) {
+        var pressed = button.dataset.statusFilter === key;
+        button.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+        button.classList.toggle('btn-neutral', pressed);
+        button.classList.toggle('btn-outline', !pressed);
+      });
+      var shown = 0;
+      table.querySelectorAll('tbody tr[data-signup-pk]').forEach(function(row) {
+        var match = !key || row.dataset.statusBucket === key;
+        row.dataset.statusHidden = match ? '' : '1';
+        applyRowVisibility(row);
+        if (match) shown++;
+      });
+      if (typeof window.answerFacetsRender === 'function') window.answerFacetsRender();
+      if (status) {
+        var label = key ? buttons.find(function(b) { return b.dataset.statusFilter === key; }).firstChild.textContent.trim() : '';
+        status.textContent = key ? shown + ' signup' + (shown === 1 ? '' : 's') + ': ' + label : 'Showing every signup';
+      }
+    }
+    buttons.forEach(function(button) {
+      button.addEventListener('click', function() {
+        var key = button.dataset.statusFilter;
+        choose(button.getAttribute('aria-pressed') === 'true' ? '' : key);
+      });
+    });
+    // "Show them" beside a riders-who-left warning presses that bucket.
+    document.querySelectorAll('[data-status-filter-shortcut]').forEach(function(link) {
+      link.addEventListener('click', function() {
+        var key = link.dataset.statusFilterShortcut;
+        choose(key);
+        var target = buttons.find(function(b) { return b.dataset.statusFilter === key; });
+        if (target) target.focus();
+      });
+    });
+  })();
+
+  // Sort
+  document.querySelectorAll('[data-signup-table]').forEach(function(table) {
+    var headers = table.querySelectorAll('th[data-sort]');
+    headers.forEach(function(th) {
+      th.addEventListener('click', function() {
+        // Real cell index among all <th>, in case a non-sortable column is added
+        var colIdx = Array.from(th.parentNode.children).indexOf(th);
+        var sortType = th.getAttribute('data-sort');
+        var asc = th.getAttribute('data-dir') !== 'asc';
+        // Reset all headers in this table
+        headers.forEach(function(h) {
+          h.removeAttribute('data-dir');
+          var ind = h.querySelector('.sort-indicator');
+          if (ind) ind.remove();
+        });
+        if (typeof window.answerFacetsClearSort === 'function') window.answerFacetsClearSort();
+        th.setAttribute('data-dir', asc ? 'asc' : 'desc');
+        var indicator = document.createElement('span');
+        indicator.className = 'sort-indicator text-primary ml-1';
+        indicator.textContent = asc ? '\u25B2' : '\u25BC';
+        th.appendChild(indicator);
+
+        var tbody = table.querySelector('tbody');
+        var rows = Array.from(tbody.querySelectorAll('tr'));
+        rows.sort(function(a, b) {
+          var aText = cellSortText(a, colIdx);
+          var bText = cellSortText(b, colIdx);
+          if (sortType === 'num') {
+            var aNum = parseFloat(aText) || 0;
+            var bNum = parseFloat(bText) || 0;
+            return asc ? aNum - bNum : bNum - aNum;
+          }
+          return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+        });
+        rows.forEach(function(row) { tbody.appendChild(row); });
+      });
+    });
+  });
+})();
+</script>
+{% if answer_facets %}{% include "events/_answer_facets_script.html" %}{% endif %}
+{% if can_add_members %}
+<script>
+(function() {
+  var searchInput = document.getElementById('add-members-search');
+  var resultsDiv = document.getElementById('add-members-results');
+  var selectedDiv = document.getElementById('add-members-selected');
+  var submitBtn = document.getElementById('add-members-submit');
+  if (!searchInput) return;
+
+  var selected = {};
+  var names = {};  // id -> display name, from the latest results; never read back out of the DOM
+  var searchTimeout = null;
+  var searchUrl = '{% url "events:add_members_search" event.pk %}';
+
+  // Names and usernames are chosen by riders, so everything from the search is escaped before it
+  // goes near innerHTML -- otherwise a name containing markup would run in the captain's browser.
+  function escapeHtml(text) {
+    var div = document.createElement('div');
+    div.textContent = text == null ? '' : String(text);
+    return div.innerHTML.replace(/"/g, '&quot;');
+  }
+
+  searchInput.addEventListener('input', function() {
+    clearTimeout(searchTimeout);
+    var q = this.value.trim();
+    if (q.length < 2) { resultsDiv.innerHTML = ''; return; }
+    searchTimeout = setTimeout(function() {
+      fetch(searchUrl + '?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(data) { renderResults(data.results || []); });
+    }, 300);
+  });
+
+  function renderResults(results) {
+    if (!results.length) {
+      resultsDiv.innerHTML = '<p class="text-sm text-base-content/50 p-2">No matching members found.</p>';
+      return;
+    }
+    var html = '<ul class="menu menu-sm bg-base-200 rounded-lg">';
+    results.forEach(function(u) {
+      names[u.id] = u.display_name;
+      var isSelected = u.id in selected;
+      // A rider the event's signup requirements rule out is shown, but cannot be picked.
+      var inactive = isSelected || !!u.blocked;
+      html += '<li><button type="button" class="' + (inactive ? 'opacity-50' : '') + '" data-user-id="' + escapeHtml(u.id) + '"' + (inactive ? ' disabled' : '') + '>' +
+        '<span>' + escapeHtml(u.display_name) + '</span>' +
+        (u.discord_username ? '<span class="text-xs text-base-content/50">' + escapeHtml(u.discord_username) + '</span>' : '') +
+        (u.blocked ? '<span class="text-xs text-base-content/70">Can&rsquo;t add &mdash; ' + escapeHtml(u.blocked) + '</span>' : '') +
+        '</button></li>';
+    });
+    html += '</ul>';
+    resultsDiv.innerHTML = html;
+
+    resultsDiv.querySelectorAll('button[data-user-id]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var uid = this.getAttribute('data-user-id');
+        var name = names[uid];
+        if (!(uid in selected)) {
+          selected[uid] = name;
+          updateSelected();
+          this.classList.add('opacity-50');
+          this.disabled = true;
+        }
+      });
+    });
+  }
+
+  function updateSelected() {
+    var html = '';
+    var keys = Object.keys(selected);
+    keys.forEach(function(uid) {
+      html += '<div class="badge badge-primary gap-1">' +
+        '<input type="hidden" name="user_ids" value="' + escapeHtml(uid) + '">' +
+        escapeHtml(selected[uid]) +
+        '<button type="button" class="btn btn-ghost btn-xs !p-0 !min-h-0" data-remove="' + escapeHtml(uid) + '" aria-label="Remove ' + escapeHtml(selected[uid]) + '">&times;</button>' +
+        '</div>';
+    });
+    selectedDiv.innerHTML = html;
+    submitBtn.disabled = keys.length === 0;
+
+    selectedDiv.querySelectorAll('button[data-remove]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        delete selected[this.getAttribute('data-remove')];
+        updateSelected();
+      });
+    });
+  }
+
+  // Clear state when modal opens
+  document.getElementById('add_members_modal').addEventListener('close', function() {
+    searchInput.value = '';
+    resultsDiv.innerHTML = '';
+    selected = {};
+    updateSelected();
+  });
+})();
+</script>
+{% endif %}
+
+<script>
+  // Share-a-signup-link button, plus the ?signup=1 landing it produces.
+  (function () {
+    document.addEventListener("click", function (e) {
+      var btn = e.target.closest && e.target.closest("[data-signup-share]");
+      if (!btn) return;
+      var url = btn.dataset.signupShare;
+      var done = function () {
+        var prev = btn.getAttribute("title");
+        btn.classList.add("text-success");
+        btn.setAttribute("title", "Link copied");
+        setTimeout(function () {
+          btn.classList.remove("text-success");
+          btn.setAttribute("title", prev);
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(done).catch(function () { window.prompt("Copy this link:", url); });
+      } else {
+        window.prompt("Copy this link:", url);
+      }
+    });
+
+    // Opening the right modal is not simply "the signup one": someone already registered
+    // who follows a shared link should land on their existing answers, not a blank form.
+    var params = new URLSearchParams(window.location.search);
+    if (params.get("signup") === "1") {
+      var modal = document.getElementById("edit_signup_modal") || document.getElementById("signup_modal");
+      if (modal && typeof modal.showModal === "function") { modal.showModal(); }
+    }
+  })();
+</script>
+
+<script>
+  // Tab switching. Every panel is in the page and this shows one. If the script never runs
+  // the page renders as it used to, every section stacked -- which is why the panels are not
+  // hidden in the markup.
+  (function () {
+    var bar = document.getElementById('event-tabs');
+    if (!bar) return;
+    var tabs = Array.prototype.slice.call(bar.querySelectorAll('[data-tab]'));
+    var panels = Array.prototype.slice.call(document.querySelectorAll('[data-tab-panel]'));
+    if (!tabs.length || !panels.length) return;
+
+    var known = tabs.map(function (a) { return a.dataset.tab; });
+    // Signups by default, but By Squad for a viewer who cannot see the signups.
+    var fallback = known.indexOf(bar.dataset.defaultTab) !== -1 ? bar.dataset.defaultTab : known[0];
+    function wanted() {
+      var q = new URLSearchParams(window.location.search).get('tab');
+      return known.indexOf(q) !== -1 ? q : fallback;
+    }
+
+    function show(key) {
+      panels.forEach(function (panel) { panel.hidden = panel.dataset.tabPanel !== key; });
+      tabs.forEach(function (tab) {
+        var on = tab.dataset.tab === key;
+        tab.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+
+    bar.addEventListener('click', function (e) {
+      var tab = e.target.closest && e.target.closest('[data-tab]');
+      if (!tab || e.metaKey || e.ctrlKey || e.shiftKey || (e.button && e.button !== 0)) return;
+      e.preventDefault();
+      show(tab.dataset.tab);
+      // Keep the URL honest so a copied link opens the same panel, without a reload and
+      // without stacking a history entry for every click.
+      var url = new URL(window.location.href);
+      url.searchParams.set('tab', tab.dataset.tab);
+      window.history.replaceState({}, '', url);
+    });
+
+    // Automatic activation: arrows move and select, the expected tablist behaviour and a
+    // natural fit for these being ordinary links.
+    bar.addEventListener('keydown', function (e) {
+      var i = tabs.indexOf(document.activeElement);
+      if (i === -1) return;
+      var next = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1
+               : e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : null;
+      if (next === null) return;
+      e.preventDefault();
+      next = (next + tabs.length) % tabs.length;
+      tabs[next].focus();
+      tabs[next].click();
+    });
+
+    show(wanted());
+    window.addEventListener('popstate', function () { show(wanted()); });
+  })();
+
+  // The Series board tab loads on first open; if that fails, say so instead of spinning on.
+  (function () {
+    var panel = document.getElementById('series-board-panel');
+    if (!panel) return;
+    function failed() {
+      var status = panel.querySelector('[data-board-status]');
+      if (!status) return;
+      status.textContent = 'The series board could not be loaded.';
+      var spinner = panel.querySelector('.loading');
+      if (spinner) spinner.remove();
+    }
+    panel.addEventListener('htmx:responseError', failed);
+    panel.addEventListener('htmx:sendError', failed);
+  })();
+</script>
+
+{% endblock %}

@@ -1,0 +1,699 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}{{ grid.title }} - Results{% endblock %}
+
+{% block extra_css %}
+<style>
+  /* On mobile, the wrapper becomes the scroll container so the sticky-top
+     date header stays visible while scrolling through hours. Desktop keeps
+     its natural height (page handles scrolling). */
+  .avail-grid-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-width: 767px) {
+    .avail-grid-wrap { max-height: calc(100vh - 8rem); overflow-y: auto; }
+  }
+  .avail-grid { border-collapse: collapse; user-select: none; -webkit-user-select: none; }
+  .avail-grid th,
+  .avail-grid td { border: 1px solid color-mix(in oklch, var(--color-base-content) 20%, transparent); text-align: center; min-width: 7rem; }
+  .avail-grid th { position: sticky; top: 0; z-index: 2; padding: 0.35rem 0.5rem; font-size: 0.75rem; }
+  .avail-grid th.row-header { position: sticky; left: 0; z-index: 3; background: var(--color-base-200); }
+  .avail-grid thead th { background: var(--color-base-200); }
+  .avail-grid thead th:first-child { z-index: 4; }
+  .heatmap-cell { vertical-align: top; padding: 0.2rem 0.3rem; position: relative; overflow: visible; }
+  /* Match the response form: diagonal-stripe overlay on unselectable cells so
+     they remain unmistakable from active cells in both light and dark themes. */
+  .heatmap-cell.cell-blocked,
+  .heatmap-cell.cell-inactive {
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0,
+      transparent 4px,
+      color-mix(in oklch, var(--color-base-content) 30%, transparent) 4px,
+      color-mix(in oklch, var(--color-base-content) 30%, transparent) 5px
+    );
+  }
+  .heatmap-cell.cell-blocked { background-color: color-mix(in oklch, var(--color-error) 20%, var(--color-base-100)); }
+  .heatmap-cell.cell-inactive { background-color: var(--color-base-100); }
+  .heatmap-cell .cell-count { font-size: 0.7rem; font-weight: 700; margin-bottom: 0.1rem; }
+  .heatmap-cell .cell-name { font-size: 0.6rem; font-weight: 400; line-height: 1.2; }
+  .heatmap-cell .cell-name .dropdown > a > .avatar { display: none; }
+  .heatmap-cell .cell-name .dropdown-content { font-size: 0.75rem; white-space: normal; }
+  /* Shrink the inline profile icons (race-verified emoji, ZP/ZR category
+     badges, phenotype icon) so multiple riders fit per heatmap cell without
+     wrapping or crowding. Scoped to .heatmap-cell so other pages (roster,
+     profile, my_events) keep the larger, more readable defaults. */
+  .heatmap-cell .cell-name .dropdown > a { gap: 0.15rem; }
+  .heatmap-cell .cell-name .dropdown > a > span:first-of-type { gap: 0.1rem; }
+  .heatmap-cell .cell-name img { width: 0.8rem; height: 0.8rem; }
+  .heatmap-cell .cell-name .badge {
+    font-size: 0.55rem;
+    line-height: 1;
+    height: 0.85rem;
+    min-height: 0.85rem;
+    padding: 0 0.25rem;
+  }
+  /* Toggle: hide the profile icons inside cells when the table is .icons-hidden. */
+  .avail-grid.icons-hidden .heatmap-cell .cell-name img,
+  .avail-grid.icons-hidden .heatmap-cell .cell-name .badge {
+    display: none;
+  }
+  /* Rider lanes (_results_row_in_lanes): every lane is one line of a fixed height, so a
+     rider sits on the same line in every day column of a row. Nothing in a lane may wrap --
+     a second line would push every lane below it out of step -- so an over-long name is
+     cut short instead; the full name is in the rider card. */
+  .heatmap-cell .cell-lane { height: 1rem; display: flex; align-items: center; justify-content: center; white-space: nowrap; }
+  .avail-grid.icons-hidden .heatmap-cell .cell-lane { height: 0.8rem; }
+  .heatmap-cell .cell-lane + .cell-lane { border-top: 1px solid color-mix(in oklch, var(--color-base-content) 12%, transparent); }
+  .heatmap-cell .cell-lane .dropdown { max-width: 100%; }
+  .heatmap-cell .cell-lane .dropdown > a { flex-wrap: nowrap; }
+  .heatmap-cell .cell-lane .dropdown > a > span:first-of-type { min-width: 0; max-width: 10rem; overflow: hidden; text-overflow: ellipsis; }
+  .heatmap-cell .cell-lane .slot-badge { margin-bottom: 0; line-height: 1.3; }
+  /* Picked to race that day: outside the rider link, so a cut-short name never hides it
+     and the Icons toggle never does either. */
+  .heatmap-cell .cell-racing { flex: none; font-size: 0.65rem; line-height: 1; margin-right: 0.15rem; }
+  .heatmap-cell.cell-clickable { cursor: pointer; }
+  .heatmap-cell.cell-clickable:hover { outline: 2px solid oklch(0.6 0.15 250); outline-offset: -2px; }
+  .slot-badge { font-size: 0.55rem; font-weight: 700; background: oklch(0.55 0.2 250); color: white; border-radius: 0.2rem; padding: 0 0.2rem; display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 0.1rem; }
+  .heatmap-cell.cell-clickable.cell-empty::after {
+    content: "+ SCHEDULE";
+    position: absolute;
+    top: 0.15rem;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 0.55rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    color: oklch(0.55 0.2 250);
+    background: var(--color-base-100);
+    border: 1px dashed oklch(0.55 0.2 250);
+    border-radius: 0.2rem;
+    padding: 0 0.25rem;
+    line-height: 1.1;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease-in;
+    white-space: nowrap;
+  }
+  .heatmap-cell.cell-clickable.cell-empty:hover::after { opacity: 1; }
+  /* Filter: cells below the chosen rider-count threshold dim out so the
+     captain can spot the popular slots at a glance. The cells stay clickable
+     so the admin can still create scheduled races on them if they want. */
+  .heatmap-cell.cell-below-min { opacity: 0.18; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+  <div class="mb-4">
+    <a href="{% url 'events:event_detail' event.pk %}" class="link link-primary text-sm">&larr; Back to Event</a>
+  </div>
+
+  <h1 class="text-2xl font-bold mb-1">{{ grid.title }} - Results</h1>
+  <p class="text-base-content/70 mb-2">{{ event.title }} &mdash; {{ squad.name }}</p>
+
+  <p class="text-sm text-base-content/50 mb-4">
+    {{ total_responders }} response{{ total_responders|pluralize }}
+  </p>
+
+  <!-- Heatmap Grid -->
+  <div class="avail-grid-wrap mb-6">
+    <table class="avail-grid" id="avail-grid">
+      <thead>
+        <tr>
+          <th class="row-header">{{ display_timezone }}</th>
+          {% for d in display_dates %}
+          <th>{{ d.day_name }}<br>{{ d.date_str }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in grid_rows %}
+        <tr>
+          <th class="row-header" data-raw-time="{{ row.time_slot }}">{{ row.time_slot }}</th>
+          {% for cell in row.cells %}
+          <td class="heatmap-cell{% if cell.is_blocked %} cell-blocked{% endif %}{% if is_event_admin and not cell.is_blocked %} cell-clickable{% if not cell.selection_name %} cell-empty{% endif %}{% endif %}"
+              {% if not cell.is_blocked %}
+              data-count="{{ cell.count }}"
+              data-utc-date="{{ cell.utc_date }}"
+              data-utc-time="{{ cell.utc_time }}"
+              {% if is_event_admin %}onclick="openSlotModal('{{ cell.utc_date }}', '{{ cell.utc_time }}')"{% endif %}
+              {% if cell.count > 0 %}
+              style="background: oklch(0.75 0.15 145 / {{ cell.opacity }});{% if cell.dark_text %} color: oklch(0.2 0.05 145);{% endif %}"
+              {% else %}
+              style="background: var(--color-base-300);"
+              {% endif %}
+              {% endif %}>
+            {% if not cell.is_blocked %}
+              {% if row.has_race %}
+              <div class="cell-lane">{% if cell.selection_name %}<div class="slot-badge" title="{{ cell.selection_name }}">{{ cell.selection_name }}</div>{% endif %}</div>
+              {% endif %}
+              {% for entry in cell.lanes %}
+              <div class="cell-lane{% if entry %} cell-name{% endif %}">
+                {% if entry %}
+                {% if entry.racing %}<span class="cell-racing" role="img" aria-label="Racing {{ entry.racing }}" title="Racing {{ entry.racing }}">🏁</span>{% endif %}
+                {% include "accounts/_user_tooltip.html" with display_name=entry.display_name user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=None zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype zr_age=entry.zr_age is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+                {% endif %}
+              </div>
+              {% endfor %}
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Legend -->
+  <div class="flex flex-wrap items-center gap-2 mb-6 text-sm">
+    <span class="text-base-content/70">Legend:</span>
+    <div class="flex items-center gap-1">
+      <span class="inline-block w-6 h-4 rounded" style="background: var(--color-base-300);"></span>
+      <span>0</span>
+    </div>
+    <div class="flex items-center gap-1">
+      <span class="inline-block w-6 h-4 rounded" style="background: oklch(0.75 0.15 145); opacity: 0.5;"></span>
+      <span>Low</span>
+    </div>
+    <div class="flex items-center gap-1">
+      <span class="inline-block w-6 h-4 rounded" style="background: oklch(0.75 0.15 145);"></span>
+      <span>All</span>
+    </div>
+    <div class="flex items-center gap-1 ml-2">
+      <span class="inline-block w-6 h-4 rounded heatmap-cell cell-blocked"></span>
+      <span>Blocked</span>
+    </div>
+    {% if is_event_admin %}
+    <div class="flex items-center gap-1 ml-2">
+      <span class="slot-badge">Name</span>
+      <span>Scheduled race</span>
+    </div>
+    {% endif %}
+    {% if has_racing_flags %}
+    <div class="flex items-center gap-1 ml-2">
+      <span aria-hidden="true">🏁</span>
+      <span>Picked to race that day</span>
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Filter: minimum rider count + icon toggle -->
+  <div class="flex flex-wrap items-center gap-4 mb-6 text-sm">
+    <div class="flex items-center gap-2">
+      <label for="min-rider-filter" class="text-base-content/70">Rider Count</label>
+      <select id="min-rider-filter" class="select select-bordered select-sm">
+        <option value="0" selected>All cells</option>
+      </select>
+      <span class="text-base-content/50 text-xs" id="min-rider-filter-hint"></span>
+    </div>
+    <label class="label cursor-pointer gap-2 py-0">
+      <input type="checkbox" id="show-icons-toggle" class="checkbox checkbox-sm">
+      <span class="label-text text-sm">Icons</span>
+    </label>
+    <label class="label cursor-pointer gap-2 py-0">
+      <span class="text-base-content/70 text-sm">24 h</span>
+      <input type="checkbox" id="time-format-toggle" class="toggle toggle-sm" aria-label="Time format toggle (24 h / 12 h)">
+      <span class="text-base-content/70 text-sm">12 h</span>
+    </label>
+  </div>
+
+  <!-- Copy Availability (shareable image) -->
+  <div class="mb-6">
+    <p class="text-sm text-base-content/70 mb-2">
+      Copy a simplified availability image to share with opponents. Set the <strong>Rider Count</strong> filter above,
+      then slots that meet it show their count; already-scheduled slots show &ldquo;Racing&rdquo;.
+    </p>
+    <button type="button"
+            id="copy-availability-btn"
+            class="btn btn-primary btn-sm"
+            data-grid-title="{{ grid.title }}"
+            data-event-title="{{ event.title }}"
+            data-squad-name="{{ squad.name }}"
+            data-tz-label="{{ display_timezone }}">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+      </svg>
+      <span data-copy-label>Copy Availability</span>
+    </button>
+    <span id="copy-availability-status" class="ml-3 text-sm" aria-live="polite"></span>
+  </div>
+
+  <!-- Slot Selections -->
+  <div class="mb-6">
+    <h3 class="text-sm font-semibold mb-2">Scheduled Races</h3>
+    <div id="slot-selections-container">
+      {% include "events/_slot_selections_container.html" with enriched_selections=slot_selections_enriched %}
+    </div>
+  </div>
+
+  <!-- Responders -->
+  {% if enriched_responders %}
+  <div class="mb-6">
+    <h3 class="text-sm font-semibold mb-2">Responders ({{ total_responders }})</h3>
+    <div class="overflow-x-auto mb-3">
+      <table class="table table-sm" data-responders-table>
+        <thead>
+          <tr>
+            <th data-sort="text" class="cursor-pointer hover:text-primary select-none">Name</th>
+            {% if grid.max_races_question %}<th data-sort="num" class="text-center cursor-pointer hover:text-primary select-none">Max Races</th>{% endif %}
+            {% if grid.rest_days_question %}<th data-sort="num" class="text-center cursor-pointer hover:text-primary select-none">Rest Days</th>{% endif %}
+            <th data-sort="num" class="text-center cursor-pointer hover:text-primary select-none">Scheduled</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for entry in enriched_responders %}
+          <tr>
+            <td>
+              {% include "accounts/_user_tooltip.html" with display_name=entry.display_name user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=entry.user.discord_avatar_url zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype zr_age=entry.zr_age is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+            </td>
+            {% if grid.max_races_question %}
+            <td class="text-center font-mono">{% if entry.max_races is not None %}{{ entry.max_races }}{% else %}<span class="text-base-content/30">-</span>{% endif %}</td>
+            {% endif %}
+            {% if grid.rest_days_question %}
+            <td class="text-center font-mono">{% if entry.rest_days is not None %}{{ entry.rest_days }}{% else %}<span class="text-base-content/30">-</span>{% endif %}</td>
+            {% endif %}
+            <td class="text-center font-mono">{% if entry.scheduled_count %}{{ entry.scheduled_count }}{% else %}<span class="text-base-content/30">0</span>{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Waiting Response -->
+  {% if enriched_non_responders %}
+  <div class="mb-6">
+    <h3 class="text-sm font-semibold mb-2">Waiting Response ({{ enriched_non_responders|length }})</h3>
+    <div class="flex flex-wrap gap-2">
+      {% for entry in enriched_non_responders %}
+      {% include "accounts/_user_tooltip.html" with display_name=entry.display_name user_id=entry.user.pk discord_id=entry.user.discord_id discord_avatar_url=entry.user.discord_avatar_url zwid=entry.zwid zp_category=entry.zp_category zp_category_w=entry.zp_category_w zr_category=entry.zr_category zr_v2=entry.zr_v2_category zr_rating=entry.zr_rating zr_phenotype=entry.zr_phenotype zr_age=entry.zr_age is_race_ready=entry.is_race_ready is_extra_verified=entry.is_extra_verified in_zwiftpower=entry.in_zwiftpower in_zwiftracing=entry.in_zwiftracing %}
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+<!-- Min-rider filter (available to anyone viewing the results page) -->
+<script>
+(function() {
+  var select = document.getElementById('min-rider-filter');
+  var hint = document.getElementById('min-rider-filter-hint');
+  if (!select) return;
+
+  var cells = document.querySelectorAll('.heatmap-cell[data-count]');
+  var maxCount = 0;
+  cells.forEach(function(td) {
+    var n = parseInt(td.dataset.count, 10) || 0;
+    if (n > maxCount) maxCount = n;
+  });
+
+  for (var i = 1; i <= maxCount; i++) {
+    var opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = '≥ ' + i + ' rider' + (i === 1 ? '' : 's');
+    select.appendChild(opt);
+  }
+
+  function applyFilter() {
+    var threshold = parseInt(select.value, 10) || 0;
+    var visibleCount = 0;
+    cells.forEach(function(td) {
+      var n = parseInt(td.dataset.count, 10) || 0;
+      if (threshold > 0 && n < threshold) {
+        td.classList.add('cell-below-min');
+      } else {
+        td.classList.remove('cell-below-min');
+        visibleCount++;
+      }
+    });
+    if (hint) {
+      hint.textContent = threshold > 0
+        ? '(' + visibleCount + ' cell' + (visibleCount === 1 ? '' : 's') + ' shown)'
+        : '';
+    }
+  }
+
+  select.addEventListener('change', applyFilter);
+  applyFilter();
+
+  // Show/hide profile icons in cells. Persist the choice in localStorage so a
+  // captain who prefers the compact view keeps it across visits.
+  var ICON_STORAGE_KEY = 'availability_results.show_icons';
+  var iconToggle = document.getElementById('show-icons-toggle');
+  var grid = document.getElementById('avail-grid');
+  if (iconToggle && grid) {
+    var stored = null;
+    try { stored = window.localStorage.getItem(ICON_STORAGE_KEY); } catch (e) { /* private mode */ }
+    var showIcons = stored === null ? false : stored === '1';
+    iconToggle.checked = showIcons;
+    grid.classList.toggle('icons-hidden', !showIcons);
+    iconToggle.addEventListener('change', function() {
+      var on = iconToggle.checked;
+      grid.classList.toggle('icons-hidden', !on);
+      try { window.localStorage.setItem(ICON_STORAGE_KEY, on ? '1' : '0'); } catch (e) { /* ignore */ }
+    });
+  }
+
+  // Time format toggle (24h / 12h) for row headers — persists in localStorage.
+  var TIME_FORMAT_KEY = 'availability.time_format';
+  function currentTimeFormat() {
+    try {
+      var stored = window.localStorage.getItem(TIME_FORMAT_KEY);
+      return stored === '12' ? '12' : '24';
+    } catch (e) { return '24'; }
+  }
+  function formatTimeForDisplay(hhmm) {
+    if (currentTimeFormat() !== '12') return hhmm;
+    var parts = hhmm.split(':');
+    var h = parseInt(parts[0], 10);
+    var m = parts[1];
+    var period = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12 === 0 ? 12 : h % 12;
+    return h12 + ':' + m + ' ' + period;
+  }
+  function applyTimeFormat() {
+    document.querySelectorAll('.row-header[data-raw-time]').forEach(function(th) {
+      th.textContent = formatTimeForDisplay(th.dataset.rawTime);
+    });
+  }
+  var timeFormatToggle = document.getElementById('time-format-toggle');
+  if (timeFormatToggle) {
+    timeFormatToggle.checked = currentTimeFormat() === '12';
+    applyTimeFormat();
+    timeFormatToggle.addEventListener('change', function() {
+      var v = timeFormatToggle.checked ? '12' : '24';
+      try { window.localStorage.setItem(TIME_FORMAT_KEY, v); } catch (e2) {}
+      applyTimeFormat();
+    });
+  }
+})();
+</script>
+
+<!-- Copy Availability: render simplified grid to canvas and write to clipboard -->
+<script>
+(function() {
+  var btn = document.getElementById('copy-availability-btn');
+  var status = document.getElementById('copy-availability-status');
+  if (!btn) return;
+
+  function setStatus(text, cls) {
+    if (!status) return;
+    status.textContent = text || '';
+    status.className = 'ml-3 text-sm ' + (cls || 'text-base-content/70');
+  }
+
+  function currentTimeFormat() {
+    var t = document.getElementById('time-format-toggle');
+    return t && t.checked ? '12' : '24';
+  }
+
+  function formatTime(hhmm) {
+    if (currentTimeFormat() !== '12') return hhmm;
+    var parts = hhmm.split(':');
+    var h = parseInt(parts[0], 10);
+    var m = parts[1];
+    var period = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12 === 0 ? 12 : h % 12;
+    return h12 + ':' + m + ' ' + period;
+  }
+
+  function readGridData(threshold) {
+    var grid = document.getElementById('avail-grid');
+    if (!grid) return null;
+
+    var headerThs = grid.querySelectorAll('thead th');
+    var dayHeaders = [];
+    for (var i = 1; i < headerThs.length; i++) {
+      var html = headerThs[i].innerHTML || '';
+      var lines = html.split(/<br\s*\/?>/i).map(function(s) {
+        var div = document.createElement('div');
+        div.innerHTML = s;
+        return (div.textContent || '').trim();
+      }).filter(function(s) { return s.length > 0; });
+      dayHeaders.push(lines);
+    }
+
+    var rows = [];
+    grid.querySelectorAll('tbody tr').forEach(function(tr) {
+      var rh = tr.querySelector('.row-header');
+      var rawTime = rh && rh.dataset.rawTime ? rh.dataset.rawTime : (rh ? rh.textContent.trim() : '');
+      var cells = [];
+      tr.querySelectorAll('td.heatmap-cell').forEach(function(td) {
+        var blocked = td.classList.contains('cell-blocked');
+        var hasRace = !!td.querySelector('.slot-badge');
+        var count = parseInt(td.dataset.count || '0', 10);
+        var kind = 'empty';
+        var label = '';
+        if (hasRace) { kind = 'race'; label = 'Racing'; }
+        else if (!blocked && count > threshold) { kind = 'high'; label = '≥' + (threshold + 1); }
+        else if (!blocked && count === threshold) { kind = 'low'; label = String(threshold); }
+        cells.push({ kind: kind, label: label });
+      });
+      rows.push({ time: formatTime(rawTime), cells: cells });
+    });
+
+    return { dayHeaders: dayHeaders, rows: rows };
+  }
+
+  function buildCanvas(data, threshold) {
+    var dpr = window.devicePixelRatio || 1;
+    var cols = data.dayHeaders.length;
+    var nRows = data.rows.length;
+
+    var cellW = 96;
+    var cellH = 30;
+    var rowHeaderW = 84;
+    var colHeaderH = 46;
+    var padding = 20;
+    var titleH = 78;
+    var footerH = 28;
+
+    var width = padding * 2 + rowHeaderW + cols * cellW;
+    var height = padding * 2 + titleH + colHeaderH + nRows * cellH + footerH;
+
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    var ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+
+    // Background
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, width, height);
+
+    // Header text
+    var gridTitle = btn.dataset.gridTitle || '';
+    var eventTitle = btn.dataset.eventTitle || '';
+    var squadName = btn.dataset.squadName || '';
+    var tzLabel = btn.dataset.tzLabel || '';
+    var fmt = currentTimeFormat() === '12' ? '12-hour' : '24-hour';
+
+    ctx.fillStyle = '#0f172a';
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 20px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+    ctx.fillText(gridTitle, padding, padding);
+
+    ctx.fillStyle = '#475569';
+    ctx.font = '13px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+    var sub = eventTitle + (squadName ? '  —  ' + squadName : '');
+    ctx.fillText(sub, padding, padding + 28);
+    ctx.fillText('Timezone: ' + tzLabel + '  ·  Times shown in ' + fmt, padding, padding + 48);
+
+    var gridX = padding;
+    var gridY = padding + titleH;
+    var totalW = rowHeaderW + cols * cellW;
+    var totalH = colHeaderH + nRows * cellH;
+
+    // Column header strip
+    ctx.fillStyle = '#f1f5f9';
+    ctx.fillRect(gridX, gridY, totalW, colHeaderH);
+
+    ctx.fillStyle = '#0f172a';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = 'bold 12px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+    data.dayHeaders.forEach(function(lines, ci) {
+      var x = gridX + rowHeaderW + ci * cellW + cellW / 2;
+      var midY = gridY + colHeaderH / 2;
+      var lineH = 14;
+      var startY = midY - ((lines.length - 1) * lineH) / 2;
+      lines.forEach(function(line, li) {
+        ctx.fillText(line, x, startY + li * lineH);
+      });
+    });
+
+    // Rows
+    data.rows.forEach(function(row, ri) {
+      var y = gridY + colHeaderH + ri * cellH;
+
+      // Row header
+      ctx.fillStyle = '#f1f5f9';
+      ctx.fillRect(gridX, y, rowHeaderW, cellH);
+      ctx.fillStyle = '#0f172a';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = 'bold 11px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+      ctx.fillText(row.time, gridX + rowHeaderW / 2, y + cellH / 2);
+
+      // Cells
+      row.cells.forEach(function(cell, ci) {
+        var x = gridX + rowHeaderW + ci * cellW;
+        var bg = '#ffffff';
+        var fg = '#0f172a';
+        var font = 'bold 13px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+        if (cell.kind === 'race') { bg = '#2563eb'; fg = '#ffffff'; font = 'bold 12px system-ui, -apple-system, "Segoe UI", Arial, sans-serif'; }
+        else if (cell.kind === 'high') { bg = '#16a34a'; fg = '#ffffff'; }
+        else if (cell.kind === 'low') { bg = '#bbf7d0'; fg = '#14532d'; }
+        ctx.fillStyle = bg;
+        ctx.fillRect(x, y, cellW, cellH);
+        if (cell.label) {
+          ctx.fillStyle = fg;
+          ctx.font = font;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(cell.label, x + cellW / 2, y + cellH / 2);
+        }
+      });
+    });
+
+    // Grid lines
+    ctx.strokeStyle = '#cbd5e1';
+    ctx.lineWidth = 1;
+    // Vertical
+    for (var i = 0; i <= cols + 1; i++) {
+      var vx = gridX + (i === 0 ? 0 : rowHeaderW + (i - 1) * cellW);
+      ctx.beginPath();
+      ctx.moveTo(vx + 0.5, gridY);
+      ctx.lineTo(vx + 0.5, gridY + totalH);
+      ctx.stroke();
+    }
+    // Horizontal
+    for (var j = 0; j <= nRows + 1; j++) {
+      var hy = gridY + (j === 0 ? 0 : colHeaderH + (j - 1) * cellH);
+      ctx.beginPath();
+      ctx.moveTo(gridX, hy + 0.5);
+      ctx.lineTo(gridX + totalW, hy + 0.5);
+      ctx.stroke();
+    }
+
+    // Legend in footer
+    var legendY = gridY + totalH + 8;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    var lx = padding;
+    function drawSwatch(color, text) {
+      var boxW = 14, boxH = 12;
+      ctx.fillStyle = color;
+      ctx.fillRect(lx, legendY - boxH / 2, boxW, boxH);
+      ctx.strokeStyle = '#cbd5e1';
+      ctx.strokeRect(lx + 0.5, legendY - boxH / 2 + 0.5, boxW - 1, boxH - 1);
+      lx += boxW + 6;
+      ctx.fillStyle = '#334155';
+      ctx.font = '11px system-ui, -apple-system, "Segoe UI", Arial, sans-serif';
+      ctx.fillText(text, lx, legendY);
+      lx += ctx.measureText(text).width + 14;
+    }
+    drawSwatch('#bbf7d0', threshold + ' riders');
+    drawSwatch('#16a34a', '≥' + (threshold + 1) + ' riders');
+    drawSwatch('#2563eb', 'Racing');
+    drawSwatch('#ffffff', 'Fewer than ' + threshold);
+
+    return canvas;
+  }
+
+  async function copyToClipboard(canvas) {
+    var blob = await new Promise(function(resolve) { canvas.toBlob(resolve, 'image/png'); });
+    if (!blob) throw new Error('toBlob returned null');
+    if (!navigator.clipboard || typeof window.ClipboardItem === 'undefined') {
+      throw new Error('clipboard-image-unsupported');
+    }
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+  }
+
+  function downloadCanvas(canvas) {
+    var url = canvas.toDataURL('image/png');
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = 'availability.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  btn.addEventListener('click', async function() {
+    var filterSelect = document.getElementById('min-rider-filter');
+    var threshold = filterSelect ? (parseInt(filterSelect.value, 10) || 0) : 0;
+    if (threshold <= 0) {
+      setStatus('Set the Rider Count filter first.', 'text-warning');
+      setTimeout(function() { setStatus(''); }, 4000);
+      return;
+    }
+    setStatus('Building image…', 'text-base-content/70');
+    btn.disabled = true;
+    try {
+      var data = readGridData(threshold);
+      if (!data) { setStatus('Grid not found.', 'text-error'); return; }
+      var canvas = buildCanvas(data, threshold);
+      try {
+        await copyToClipboard(canvas);
+        setStatus('Copied to clipboard.', 'text-success');
+      } catch (err) {
+        downloadCanvas(canvas);
+        setStatus('Clipboard unavailable — downloaded instead.', 'text-warning');
+      }
+    } catch (e) {
+      setStatus('Could not build image: ' + (e && e.message ? e.message : e), 'text-error');
+    } finally {
+      btn.disabled = false;
+      setTimeout(function() { setStatus(''); }, 4000);
+    }
+  });
+})();
+</script>
+
+<!-- Responders table column sorting -->
+<script>
+(function() {
+  document.querySelectorAll('[data-responders-table]').forEach(function(table) {
+    var headers = table.querySelectorAll('th[data-sort]');
+    headers.forEach(function(th, colIdx) {
+      th.addEventListener('click', function() {
+        var sortType = th.getAttribute('data-sort');
+        var asc = th.getAttribute('data-dir') !== 'asc';
+        headers.forEach(function(h) {
+          h.removeAttribute('data-dir');
+          var ind = h.querySelector('.sort-indicator');
+          if (ind) ind.remove();
+        });
+        th.setAttribute('data-dir', asc ? 'asc' : 'desc');
+        var indicator = document.createElement('span');
+        indicator.className = 'sort-indicator text-primary ml-1';
+        indicator.textContent = asc ? '▲' : '▼';
+        th.appendChild(indicator);
+
+        var tbody = table.querySelector('tbody');
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+        rows.sort(function(a, b) {
+          var aText = a.cells[colIdx].textContent.trim();
+          var bText = b.cells[colIdx].textContent.trim();
+          if (sortType === 'num') {
+            var aNum = parseFloat(aText);
+            var bNum = parseFloat(bText);
+            if (isNaN(aNum)) aNum = 0;
+            if (isNaN(bNum)) bNum = 0;
+            return asc ? aNum - bNum : bNum - aNum;
+          }
+          return asc ? aText.localeCompare(bText) : bText.localeCompare(aText);
+        });
+        rows.forEach(function(row) { tbody.appendChild(row); });
+      });
+    });
+  });
+})();
+</script>
+
+{% if is_event_admin %}{% include "events/_slot_modal.html" %}{% endif %}
+{% endblock %}

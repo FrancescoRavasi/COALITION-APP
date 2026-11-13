@@ -1,0 +1,387 @@
+{% if success %}
+<div class="alert alert-success mb-4">
+    <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+    <span>Images updated successfully!</span>
+</div>
+{% endif %}
+
+{% if errors %}
+<div class="alert alert-error mb-4">
+    <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+    <div>
+        <span>Some images could not be saved:</span>
+        <ul class="list-disc list-inside text-sm mt-1">
+            {% for error in errors %}
+            <li>{{ error }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+</div>
+{% endif %}
+
+<form hx-post="{% url 'config_site_images_update' %}"
+      hx-target="#site-images-form"
+      hx-swap="innerHTML"
+      hx-encoding="multipart/form-data"
+      class="space-y-6 pt-2">
+    {% csrf_token %}
+
+    <!-- Site Logo -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Site Logo</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if site_settings_obj.site_logo %}
+            <div class="relative">
+                <img src="{{ site_settings_obj.site_logo.url }}" alt="Current logo" class="max-h-16 max-w-48 object-contain bg-base-300 rounded p-2">
+                <button aria-label="Delete the site logo" type="submit" name="delete_logo" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="site_logo"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: PNG with transparency, 200x50 pixels</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Favicon -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Favicon</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if site_settings_obj.favicon %}
+            <div class="relative">
+                <img src="{{ site_settings_obj.favicon.url }}" alt="Current favicon" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the favicon" type="submit" name="delete_favicon" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="favicon"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Any image format accepted. Will be converted to 64x64 PNG.</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hero Image -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Hero Image</span>
+        </label>
+        <div class="space-y-3">
+            {% if site_settings_obj.hero_image %}
+            <div class="relative inline-block">
+                <img src="{{ site_settings_obj.hero_image.url }}" alt="Current hero image" class="max-h-32 max-w-full object-contain bg-base-300 rounded">
+                <button aria-label="Delete the hero image" type="submit" name="delete_hero" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <input type="file"
+                   name="hero_image"
+                   accept="image/*"
+                   class="file-input file-input-bordered w-full">
+            <label class="label">
+                <span class="label-text-alt">Recommended: 1920x600 pixels for best display on home page</span>
+            </label>
+        </div>
+    </div>
+
+    <!-- Verification Emojis -->
+    <div class="divider">Verification Emojis</div>
+
+    <!-- Not Verified Emoji -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Not Verified Emoji</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if site_settings_obj.not_verified_emoji %}
+            <div class="relative">
+                <img src="{{ site_settings_obj.not_verified_emoji.url }}" alt="Not verified emoji" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the not-verified emoji" type="submit" name="delete_not_verified_emoji" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="not_verified_emoji"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Verified Emoji -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Verified Emoji</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if site_settings_obj.verified_emoji %}
+            <div class="relative">
+                <img src="{{ site_settings_obj.verified_emoji.url }}" alt="Verified emoji" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the verified emoji" type="submit" name="delete_verified_emoji" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="verified_emoji"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Extra Verified Emoji -->
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">Extra Verified Emoji</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if site_settings_obj.extra_verified_emoji %}
+            <div class="relative">
+                <img src="{{ site_settings_obj.extra_verified_emoji.url }}" alt="Extra verified emoji" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the extra-verified emoji" type="submit" name="delete_extra_verified_emoji" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="extra_verified_emoji"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- ZP Category Emojis -->
+    <div class="divider">ZP Category Emojis</div>
+    <p class="text-sm text-base-content/70 mb-4">When uploaded, these replace the default letter badges for ZwiftPower categories.</p>
+
+    {% for item in zp_emoji_items %}
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">{{ item.label }}</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if item.file %}
+            <div class="relative">
+                <img src="{{ item.file.url }}" alt="{{ item.label }}" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the {{ item.label }} emoji" type="submit" name="delete_{{ item.field_name }}" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="{{ item.field_name }}"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <!-- ZR Category Emojis -->
+    <div class="divider">ZR Category Emojis</div>
+    <p class="text-sm text-base-content/70 mb-4">When uploaded, these replace the default text badges for Zwift Racing categories.</p>
+
+    {% for item in zr_emoji_items %}
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">{{ item.label }}</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if item.file %}
+            <div class="relative">
+                <img src="{{ item.file.url }}" alt="{{ item.label }}" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the {{ item.label }} emoji" type="submit" name="delete_{{ item.field_name }}" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="{{ item.field_name }}"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <!-- Age Bracket Icons -->
+    <div class="divider">Age brackets</div>
+    <p class="text-sm text-base-content/70 mb-4">
+        These ship with a default set, so every bracket already has an icon. Uploading one
+        replaces the default for that bracket only; deleting it puts the default back.
+    </p>
+
+    {% for item in age_emoji_items %}
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">{{ item.label }}</span>
+        </label>
+        <div class="flex items-start gap-4">
+            <div class="relative">
+                {% if item.file %}
+                <img src="{{ item.file.url }}" alt="{{ item.label }}" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the {{ item.label }} icon and restore the default" type="submit" name="delete_{{ item.field_name }}" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+                {% else %}
+                <img src="{{ item.default_url }}" alt="{{ item.label }}, the bundled default" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                {% endif %}
+            </div>
+            <div class="flex-1">
+                <input type="file"
+                       name="{{ item.field_name }}"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">
+                        {% if item.file %}Custom icon uploaded{% else %}Showing the bundled default{% endif %}
+                    </span>
+                </label>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <!-- Team Kit Icon -->
+    <div class="divider">Team kit</div>
+    <p class="text-sm text-base-content/70 mb-4">
+        Shown on a rider's roster card once they have the kit -- both when the team has
+        completed the Zwift order and when the rider says it arrived. One icon covers both;
+        the card's tooltip says which. This ships with a default, so uploading replaces it
+        and deleting puts it back.
+    </p>
+
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">{{ kit_emoji_item.label }}</span>
+        </label>
+        <div class="flex items-start gap-4">
+            <div class="relative">
+                {% if kit_emoji_item.file %}
+                <img src="{{ kit_emoji_item.file.url }}" alt="{{ kit_emoji_item.label }}" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the team kit icon and restore the default" type="submit" name="delete_{{ kit_emoji_item.field_name }}" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+                {% else %}
+                <img src="{{ kit_emoji_item.default_url }}" alt="The bundled default team kit icon" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                {% endif %}
+            </div>
+            <div class="flex-1">
+                <input type="file"
+                       name="{{ kit_emoji_item.field_name }}"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">
+                        {% if kit_emoji_item.file %}Custom icon uploaded{% else %}Showing the bundled default{% endif %}
+                    </span>
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- Phenotype Emojis -->
+    <div class="divider">Phenotypes</div>
+    <p class="text-sm text-base-content/70 mb-4">When uploaded, these replace the default text for Zwift Racing phenotypes.</p>
+
+    {% for item in phenotype_emoji_items %}
+    <div class="form-control">
+        <label class="label">
+            <span class="label-text font-medium">{{ item.label }}</span>
+        </label>
+        <div class="flex items-start gap-4">
+            {% if item.file %}
+            <div class="relative">
+                <img src="{{ item.file.url }}" alt="{{ item.label }}" class="h-12 w-12 object-contain bg-base-300 rounded p-1">
+                <button aria-label="Delete the {{ item.label }} emoji" type="submit" name="delete_{{ item.field_name }}" value="true" class="btn btn-circle btn-xs btn-error absolute -top-2 -right-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                </button>
+            </div>
+            {% endif %}
+            <div class="flex-1">
+                <input type="file"
+                       name="{{ item.field_name }}"
+                       accept="image/*"
+                       class="file-input file-input-bordered w-full">
+                <label class="label">
+                    <span class="label-text-alt">Recommended: 64x64 PNG with transparency</span>
+                </label>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <div class="form-control mt-6">
+        <button type="submit" class="btn btn-primary">
+            <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+            Save Images
+        </button>
+    </div>
+</form>

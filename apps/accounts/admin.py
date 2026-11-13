@@ -1,0 +1,671 @@
+"""Admin configuration for accounts app."""
+
+import csv
+import json
+from typing import TYPE_CHECKING, Any, ClassVar
+
+import logfire
+from allauth.socialaccount.admin import SocialAccountAdmin as BaseSocialAccountAdmin
+from allauth.socialaccount.models import SocialAccount
+from django.contrib import admin, messages
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.http import HttpRequest, HttpResponse
+from django.shortcuts import redirect, render
+from django.urls import path
+from django.utils.html import format_html
+
+from apps.accounts.models import BlockedDiscordId, GuildMember, Permissions, User, YouTubeVideo
+from apps.team.kits import active_kits, apply_kit_fields, build_kit_fields, field_name
+from gotta_bike_platform.csv_utils import csv_safe
+
+if TYPE_CHECKING:
+    from django.db.models import QuerySet
+
+
+@admin.register(User)
+class UserAdmin(BaseUserAdmin):
+    """Admin for custom User model."""
+
+    change_list_template = "admin/accounts/user/change_list.html"
+
+    list_display = (
+        "full_name",
+        "email",
+        "discord_username",
+        "zwid",
+        "is_race_ready",
+        "is_extra_verified",
+        "date_joined",
+        "birth_year",
+        "is_staff",
+    )
+    list_filter = (
+        *BaseUserAdmin.list_filter,
+        "is_race_ready",
+        "is_extra_verified",
+    )
+    search_fields = (
+        *BaseUserAdmin.search_fields,
+        "discord_id",
+        "discord_username",
+        "discord_nickname",
+        "zwid",
+    )
+
+    fieldsets = (
+        *BaseUserAdmin.fieldsets,
+        (
+            "Discord",
+            {
+                "fields": (
+                    "discord_id",
+                    "discord_username",
+                    "discord_nickname",
+                    "discord_avatar",
+                    "discord_roles",
+                ),
+            },
+        ),
+        (
+            "Zwift",
+            {
+                "fields": (
+                    "zwid",
+                    "zwid_verified",
+                    "zwid_verification_method",
+                    "zwid_verified_at",
+                    "is_race_ready",
+                    "is_extra_verified",
+                ),
+            },
+        ),
+        (
+            "Personal Info",
+            {
+                "fields": (
+                    "birth_year",
+                    "gender",
+                    "city",
+                    "country",
+                    "timezone",
+                    "unit_preference",
+                ),
+            },
+        ),
+        (
+            "Social Accounts",
+            {
+                "fields": (
+                    "youtube_channel",
+                    "youtube_channel_id",
+                    "twitch_channel",
+                    "strava_url",
+                    "garmin_url",
+                    "tpv_profile_url",
+                    "instagram_url",
+                    "facebook_url",
+                    "twitter_url",
+                    "tiktok_url",
+                    "bluesky_url",
+                    "mastodon_url",
+                ),
+                "classes": ("collapse",),
+            },
+        ),
+        (
+            "Training Equipment",
+            {
+                "fields": (
+                    "trainer",
+                    "powermeter",
+                    "dual_recording",
+                    "heartrate_monitor",
+                ),
+                "classes": ("collapse",),
+            },
+        ),
+        (
+            "Emergency Contact",
+            {
+                "fields": (
+                    "emergency_contact_name",
+                    "emergency_contact_relation",
+                    "emergency_contact_email",
+                    "emergency_contact_phone",
+                ),
+                "classes": ("collapse",),
+            },
+        ),
+        (
+            "Permissions",
+            {
+                "fields": ("roles", "permission_overrides"),
+                "description": "Legacy roles and manual permission overrides. "
+                "Permissions are primarily granted via Discord roles configured in Constance.",
+            },
+        ),
+    )
+
+    add_fieldsets = (
+        *BaseUserAdmin.add_fieldsets,
+        (
+            "Integrations",
+            {
+                "fields": (
+                    "discord_id",
+                    "discord_username",
+                    "discord_nickname",
+                ),
+            },
+        ),
+    )
+
+    # Zwift verification only comes from the zauth connection now, so none of it is typed in
+    # here: an admin-set zwid or flag is exactly the staff grant that was retired, and for a
+    # connected rider the hourly reconcile would put it back anyway. A zauth verification ends
+    # when the link does (the rider's own "Remove", or a disconnect in the service); the
+    # reconcile then clears the flag and method, leaving zwid and zwid_verified_at. A legacy
+    # or admin verification is never touched by the reconcile and only ends with the rider's
+    # "Remove" or account deletion.
+    ZWIFT_VERIFICATION_FIELDS = ("zwid", "zwid_verified", "zwid_verification_method", "zwid_verified_at")
+
+    def get_readonly_fields(self, request: HttpRequest, obj: User | None = None) -> tuple:
+        """Show the Zwift verification fields on the change form without letting them change.
+
+        Args:
+            request: The HTTP request.
+            obj: The user being edited, or None when adding.
+
+        Returns:
+            The read-only field names.
+
+        """
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        if obj is None:
+            return readonly
+        return (*readonly, *self.ZWIFT_VERIFICATION_FIELDS)
+
+    # --- team kit -------------------------------------------------------------------------
+    #
+    # team_kit is JSON, so it is not edited as a field: that would mean an admin typing kit
+    # slugs and status keys by hand. Instead each active kit gets a select offering all five
+    # statuses -- including "Submitted to Zwift" and "Completed by Zwift", which riders
+    # cannot set themselves -- built by the same helper the rider's profile form uses.
+
+    def get_fieldsets(self, request: HttpRequest, obj: User | None = None) -> tuple:
+        """Append a "Team kit" section with one select per active kit.
+
+        Args:
+            request: The HTTP request.
+            obj: The user being edited, or None when adding.
+
+        Returns:
+            The fieldsets, with the kit section added on the change form.
+
+        """
+        fieldsets = super().get_fieldsets(request, obj)
+        kits = active_kits() if obj is not None else []
+        if not kits:
+            return fieldsets
+        return (*fieldsets, ("Team kit", {"fields": tuple(field_name(kit) for kit in kits)}))
+
+    def get_form(self, request: HttpRequest, obj: User | None = None, change: bool = False, **kwargs: Any):
+        """Declare the kit selects on the admin form class.
+
+        They have to exist on the CLASS, not be added in ``__init__``: the admin builds the
+        form with ``modelform_factory`` from the fieldset field names, and any name that is
+        neither a model field nor a declared field is rejected as unknown.
+
+        Args:
+            request: The HTTP request.
+            obj: The user being edited, or None when adding.
+            change: Whether this is the change form.
+            **kwargs: Passed through to the parent.
+
+        Returns:
+            The form class.
+
+        """
+        if obj is not None:
+            kits = active_kits()
+            if kits:
+                base = kwargs.get("form", self.form)
+                attrs = {**build_kit_fields(obj, for_team=True, kits=kits), "team_kits": kits}
+                kwargs["form"] = type("UserKitAdminForm", (base,), attrs)
+        return super().get_form(request, obj, change=change, **kwargs)
+
+    def save_model(self, request: HttpRequest, obj: User, form: Any, change: bool) -> None:
+        """Merge any submitted kit statuses into ``team_kit`` before saving.
+
+        Args:
+            request: The HTTP request.
+            obj: The user being saved.
+            form: The bound admin form.
+            change: Whether this is an edit.
+
+        """
+        kits = getattr(form, "team_kits", None)
+        if kits and apply_kit_fields(obj, form.data, form.cleaned_data, kits=kits):
+            logfire.info(
+                "Team kit status set in admin",
+                user_id=obj.pk,
+                admin_user_id=request.user.pk,
+                team_kit=obj.team_kit,
+            )
+        super().save_model(request, obj, form, change)
+
+    @admin.display(description="Full Name", ordering="first_name")
+    def full_name(self, obj: User) -> str:
+        """Return user's full name or discord username as fallback.
+
+        Args:
+            obj: The User instance.
+
+        Returns:
+            Full name string.
+
+        """
+        return obj.get_full_name() or obj.discord_username or obj.username
+
+    def get_urls(self) -> list:
+        """Add custom URLs for permission mappings view.
+
+        Returns:
+            List of URL patterns including custom permission mappings URL.
+
+        """
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "permission-mappings/",
+                self.admin_site.admin_view(self.permission_mappings_view),
+                name="accounts_permission_mappings",
+            ),
+        ]
+        return custom_urls + urls
+
+    def permission_mappings_view(self, request: HttpRequest) -> HttpResponse:
+        """Edit permission-to-Discord-role mappings.
+
+        Args:
+            request: The HTTP request.
+
+        Returns:
+            Rendered permission mappings template.
+
+        """
+        from constance import config
+
+        from apps.team.models import DiscordRole
+
+        # Check permissions
+        if not request.user.is_superuser and not request.user.is_app_admin:
+            messages.error(request, "You don't have permission to access this page.")
+            return redirect("admin:index")
+
+        # Get available Discord roles (exclude managed/bot roles)
+        available_roles = DiscordRole.objects.filter(managed=False).order_by("-position")
+
+        if request.method == "POST":
+            # Save each permission's selected roles to Constance
+            for perm_name, constance_key in Permissions.CONSTANCE_MAP.items():
+                selected_role_ids = request.POST.getlist(f"perm_{perm_name}")
+                setattr(config, constance_key, json.dumps(selected_role_ids))
+            messages.success(request, "Permission mappings saved successfully.")
+            return redirect(request.path)
+
+        # Load current mappings from Constance
+        current_mappings: dict[str, list[str]] = {}
+        for perm_name, constance_key in Permissions.CONSTANCE_MAP.items():
+            role_ids_json = getattr(config, constance_key, "[]")
+            try:
+                current_mappings[perm_name] = json.loads(role_ids_json)
+            except json.JSONDecodeError:
+                current_mappings[perm_name] = []
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Permission Mappings",
+            "permissions": Permissions.CHOICES,
+            "available_roles": available_roles,
+            "current_mappings": current_mappings,
+            "opts": self.model._meta,
+        }
+        return render(request, "admin/accounts/permission_mappings.html", context)
+
+
+def _guild_member_status(member: GuildMember) -> str:
+    """Label a GuildMember row for the admin list and its CSV.
+
+    Args:
+        member: The row.
+
+    Returns:
+        "Never seen in the server", "Left" or "Active".
+
+    """
+    from apps.accounts.services import is_never_seen
+
+    if is_never_seen(member):
+        return "Never seen in the server"
+    return "Left" if member.date_left else "Active"
+
+
+@admin.register(GuildMember)
+class GuildMemberAdmin(admin.ModelAdmin):
+    """Admin configuration for GuildMember model."""
+
+    change_list_template = "admin/accounts/guildmember/change_list.html"
+
+    list_display: ClassVar[list[str]] = [
+        "display_name_or_username",
+        "nickname",
+        "display_name",
+        "username",
+        "discord_profile_link",
+        "user_link",
+        "is_bot",
+        "joined_at",
+        "status_display",
+        "date_modified",
+    ]
+    list_filter: ClassVar[list[str]] = ["is_bot", "date_left"]
+    search_fields: ClassVar[list[str]] = ["discord_id", "username", "display_name", "nickname"]
+    ordering: ClassVar[list[str]] = ["-date_modified"]
+    readonly_fields: ClassVar[list[str]] = ["date_created", "date_modified", "date_left"]
+    raw_id_fields: ClassVar[list[str]] = ["user"]
+    actions: ClassVar[list[str]] = ["export_csv"]
+
+    fieldsets: ClassVar[list[tuple[str | None, dict[str, Any]]]] = [
+        (None, {"fields": ["discord_id", "username", "display_name", "nickname"]}),
+        ("Avatar", {"fields": ["avatar_hash"]}),
+        ("Discord Data", {"fields": ["roles", "joined_at", "is_bot"]}),
+        ("Linked Account", {"fields": ["user"]}),
+        ("Tracking", {"fields": ["date_created", "date_modified", "date_left"]}),
+    ]
+
+    def display_name_or_username(self, obj: GuildMember) -> str:
+        """Return display name or username.
+
+        Args:
+            obj: The GuildMember instance.
+
+        Returns:
+            The member's nickname, display name, or username.
+
+        """
+        return obj.nickname or obj.display_name or obj.username
+
+    display_name_or_username.short_description = "Name"  # type: ignore[attr-defined]
+
+    def discord_profile_link(self, obj: GuildMember) -> str:
+        """Return clickable link to Discord profile.
+
+        Args:
+            obj: The GuildMember instance.
+
+        Returns:
+            HTML link to the Discord user profile.
+
+        """
+        return format_html(
+            '<a href="https://discord.com/users/{}" target="_blank" rel="noopener">{}</a>',
+            obj.discord_id,
+            obj.discord_id,
+        )
+
+    discord_profile_link.short_description = "Discord Profile"  # type: ignore[attr-defined]
+
+    def user_link(self, obj: GuildMember) -> str:
+        """Return link to user or dash if none.
+
+        Args:
+            obj: The GuildMember instance.
+
+        Returns:
+            The linked user's username or a dash if not linked.
+
+        """
+        if obj.user:
+            return obj.user.username
+        return "-"
+
+    user_link.short_description = "User Account"  # type: ignore[attr-defined]
+
+    def status_display(self, obj: GuildMember) -> str:
+        """Return membership status.
+
+        Args:
+            obj: The GuildMember instance.
+
+        Returns:
+            'Never seen in the server' for a row recorded for an account no sync has listed,
+            'Left' if the member has left, 'Active' otherwise.
+
+        """
+        return _guild_member_status(obj)
+
+    status_display.short_description = "Status"  # type: ignore[attr-defined]
+
+    @admin.action(description="Export selected to CSV")
+    def export_csv(self, request: HttpRequest, queryset: QuerySet) -> HttpResponse:
+        """Export selected guild members to CSV.
+
+        Returns:
+            CSV file download response.
+
+        """
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="guild_members.csv"'
+        writer = csv.writer(response)
+        headers = ["Discord ID", "Username", "Display Name", "Nickname", "User Account",
+                    "Is Bot", "Joined At", "Status", "Date Left"]
+        writer.writerow(headers)
+        for obj in queryset.select_related("user").order_by("username"):
+            writer.writerow([
+                obj.discord_id,
+                csv_safe(obj.username),
+                csv_safe(obj.display_name),
+                csv_safe(obj.nickname),
+                csv_safe(obj.user.username) if obj.user else "",
+                obj.is_bot,
+                obj.joined_at.strftime("%Y-%m-%d %H:%M") if obj.joined_at else "",
+                _guild_member_status(obj),
+                obj.date_left.strftime("%Y-%m-%d %H:%M") if obj.date_left else "",
+            ])
+        return response
+
+    def get_urls(self) -> list:
+        """Add custom URLs for comparison view.
+
+        Returns:
+            List of URL patterns including custom comparison URL.
+
+        """
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "comparison/",
+                self.admin_site.admin_view(self.comparison_view),
+                name="accounts_guildmember_comparison",
+            ),
+        ]
+        return custom_urls + urls
+
+    def comparison_view(self, request: HttpRequest) -> HttpResponse:
+        """Show comparison of guild members vs user accounts.
+
+        Args:
+            request: The HTTP request.
+
+        Returns:
+            Rendered comparison template.
+
+        """
+        from django.db.models import Count, Exists, OuterRef, Subquery
+
+        from apps.accounts.services import annotate_never_seen, never_seen_in_guild
+
+        # Get filter from query params
+        filter_status = request.GET.get("status", "all")
+
+        # Active guild members (not bots, not left)
+        active_members = GuildMember.objects.filter(
+            is_bot=False,
+            date_left__isnull=True,
+        ).select_related("user")
+
+        # Guild members without user accounts
+        guild_only = active_members.filter(user__isnull=True)
+
+        # Guild members with user accounts
+        guild_and_user = active_members.filter(user__isnull=False)
+
+        # Departed rows are matched to accounts by discord_id, as the access rule reads them
+        # (apps.accounts.membership.has_left_guild), not through the user link: the sync
+        # leaves a row unlinked when several accounts share the id or the account is already
+        # linked to an older row, and those are the accounts an admin most needs to find.
+        accounts_with_id = User.objects.filter(discord_id=OuterRef("discord_id"))
+        departed_accounts = annotate_never_seen(
+            GuildMember.objects
+            .filter(is_bot=False, date_left__isnull=False)
+            .filter(Exists(accounts_with_id))
+            .annotate(
+                account_username=Subquery(accounts_with_id.order_by("pk").values("username")[:1]),
+                account_count=Subquery(
+                    accounts_with_id.order_by().values("discord_id").annotate(n=Count("pk")).values("n")[:1]
+                ),
+            )
+            .select_related("user")
+        )
+        # Rows the sync wrote for accounts it has never listed are not departures: nobody
+        # saw them in the server. Kept apart so "Left Guild" means somebody left.
+        left_guild = departed_accounts.exclude(never_seen_in_guild())
+        never_seen = departed_accounts.filter(never_seen_in_guild())
+
+        # Discord OAuth users with no GuildMember record
+        # NOTE: Only considers users who logged in via Discord OAuth (have discord_id).
+        # Regular Django accounts (staff, admin) without discord_id are NOT included.
+        discord_users_without_member = User.objects.filter(
+            discord_id__isnull=False,
+        ).exclude(
+            discord_id="",
+        ).exclude(
+            discord_id__in=GuildMember.objects.values_list("discord_id", flat=True),
+        )
+
+        # Apply filter
+        if filter_status == "guild_only":
+            display_members: QuerySet = guild_only
+        elif filter_status == "linked":
+            display_members = guild_and_user
+        elif filter_status == "left":
+            display_members = left_guild
+        elif filter_status == "never_seen":
+            display_members = never_seen
+        else:
+            display_members = active_members
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Guild Membership Comparison",
+            "filter_status": filter_status,
+            "display_members": display_members,
+            "guild_only_count": guild_only.count(),
+            "linked_count": guild_and_user.count(),
+            "left_count": left_guild.count(),
+            "never_seen_count": never_seen.count(),
+            "discord_users_no_guild_count": discord_users_without_member.count(),
+            "discord_users_no_guild": discord_users_without_member if filter_status == "discord_no_guild" else [],
+            "total_active": active_members.count(),
+        }
+
+        return render(request, "admin/accounts/guildmember/comparison.html", context)
+
+
+@admin.register(YouTubeVideo)
+class YouTubeVideoAdmin(admin.ModelAdmin):
+    """Admin configuration for YouTubeVideo model."""
+
+    list_display: ClassVar[list[str]] = [
+        "title_truncated",
+        "user",
+        "video_id",
+        "published_at",
+        "date_created",
+    ]
+    list_filter: ClassVar[list[str]] = ["published_at", "date_created"]
+    search_fields: ClassVar[list[str]] = ["title", "video_id", "user__username", "user__discord_username"]
+    ordering: ClassVar[list[str]] = ["-published_at"]
+    readonly_fields: ClassVar[list[str]] = ["date_created", "date_modified"]
+    raw_id_fields: ClassVar[list[str]] = ["user"]
+
+    fieldsets: ClassVar[list[tuple[str | None, dict[str, Any]]]] = [
+        (None, {"fields": ["user", "video_id", "title"]}),
+        ("Media", {"fields": ["thumbnail_url"]}),
+        ("Dates", {"fields": ["published_at", "date_created", "date_modified"]}),
+    ]
+
+    def title_truncated(self, obj: YouTubeVideo) -> str:
+        """Return truncated title for list display.
+
+        Args:
+            obj: The YouTubeVideo instance.
+
+        Returns:
+            Truncated title (max 60 chars).
+
+        """
+        if len(obj.title) > 60:
+            return f"{obj.title[:57]}..."
+        return obj.title
+
+    title_truncated.short_description = "Title"  # type: ignore[attr-defined]
+
+
+@admin.register(BlockedDiscordId)
+class BlockedDiscordIdAdmin(admin.ModelAdmin):
+    """Read/write view of the login blocklist.
+
+    The Compliance section at /site/config/compliance/ is the normal way in; this exists so
+    a superuser can fix an entry without it.
+    """
+
+    list_display = ("discord_id", "note", "blocked_by", "created_at")
+    search_fields = ("discord_id", "note")
+    readonly_fields = ("created_at",)
+    autocomplete_fields = ("blocked_by",)
+
+
+class SocialAccountAdmin(BaseSocialAccountAdmin):
+    """allauth's social account admin, with the login's identity read-only.
+
+    The Zwift carry-over (``apps.accounts.services._logged_in_as_registrant``) trusts this
+    row to say which Discord login an account holds, because ``User.discord_id`` is editable
+    here. With ``user`` and ``uid`` editable too, a staff user could point their own row at a
+    registrant's Discord ID just as easily, and collect that registrant's Zwift link. Rows are
+    written by the Discord login alone, so adding one here is refused as well.
+
+    Deleting a row is still allowed: it is how staff let a rider's next Discord login
+    reconnect to their account by ``discord_id`` (see ``pre_social_login``).
+    """
+
+    readonly_fields = ("user", "provider", "uid", "extra_data")
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        """Refuse adding social accounts by hand.
+
+        Args:
+            request: The admin request.
+
+        Returns:
+            Always False.
+
+        """
+        return False
+
+
+# allauth.socialaccount comes before this app in INSTALLED_APPS, so its admin is registered by now.
+if admin.site.is_registered(SocialAccount):
+    admin.site.unregister(SocialAccount)
+admin.site.register(SocialAccount, SocialAccountAdmin)

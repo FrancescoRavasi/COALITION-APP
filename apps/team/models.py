@@ -1,0 +1,1466 @@
+"""Models for team app."""
+
+import uuid
+from datetime import date, timedelta
+from typing import ClassVar
+
+import logfire
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.utils import timezone
+from django_countries.fields import CountryField
+
+from gotta_bike_platform.retention import RetentionPolicy
+
+
+class RaceReadyRecord(models.Model):
+    """Track race ready verification records for team members.
+
+    Race ready records are used to verify rider measurements (weight, height, power)
+    for competitive racing compliance. Each record includes evidence (file upload or URL)
+    and the measured value, and goes through a review process by team captains.
+
+    Verification Types:
+        - weight_full: Full weight verification (valid for WEIGHT_FULL_DAYS)
+        - weight_light: Light weight verification (valid for WEIGHT_LIGHT_DAYS)
+        - height: Height verification (valid for HEIGHT_VERIFICATION_DAYS, 0=forever)
+        - power: FTP/power verification (valid for POWER_VERIFICATION_DAYS)
+
+    Workflow:
+        1. User submits record with verify_type, measurement value, and evidence
+        2. Record is created with status=PENDING
+        3. Team captain reviews and verifies or rejects
+        4. Verification expires after validity period (configurable in constance)
+        5. Media is stripped once the verification expires, by the daily
+           purge_expired_media task or the manual button on the records page.
+           Rejected records keep their evidence for a grace period, then the same
+           sweep strips those too. Media on a pending or currently-valid record is
+           kept -- it is the evidence for a live claim.
+        6. Deleting a record at any point deletes its uploaded file with it, whatever
+           its status -- see ``delete``.
+
+    Attributes:
+        user: The team member this record belongs to.
+        verify_type: Type of verification (weight_full, weight_light, height, power).
+        media_type: Type of evidence media (video, photo, link, other).
+        media_file: Uploaded photo/video file (stripped once the verification expires).
+        url: External URL to evidence (YouTube, Vimeo, image link).
+        weight: Weight in kg (required for weight verifications).
+        height: Height in cm (required for height verification).
+        ftp: Functional Threshold Power in watts (required for power verification).
+        status: Review status (pending, verified, rejected).
+        reviewed_by: Team captain who reviewed the record.
+        reviewed_date: When the record was reviewed.
+        review_note: Optional reviewer note (for any status change).
+        notes: Optional notes from the user about the measurement.
+        date_created: When the record was submitted.
+
+    """
+
+    # The code on clean()'s "no file and no URL" error, so the submission form can tell it apart.
+    NO_EVIDENCE_CODE = "no_evidence"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="race_ready_records",
+        help_text="User this record belongs to",
+    )
+    verify_type = models.CharField(
+        max_length=15,
+        choices=[
+            ("weight_full", "Weight Full"),
+            ("weight_light", "Weight Light"),
+            ("height", "Height"),
+            ("power", "Power"),
+        ],
+        help_text="Type of verification",
+    )
+    media_type = models.CharField(
+        max_length=10,
+        choices=[
+            ("video", "Video"),
+            ("photo", "Photo"),
+            ("link", "Link"),
+            # Evidence that is none of the above, and neither a file nor a link: the rider
+            # describes it in the notes (see clean()). Which types each verification may use
+            # is RaceReadyRecordForm.MEDIA_TYPES_BY_VERIFY_TYPE.
+            ("other", "Other"),
+        ],
+        help_text="Type of media",
+    )
+    media_file = models.FileField(
+        upload_to="race_ready/%Y/%m/",
+        null=True,
+        blank=True,
+        help_text="Uploaded photo or video file",
+    )
+    url = models.URLField(
+        max_length=500,
+        blank=True,
+        help_text="URL to external evidence (e.g., YouTube video, image link)",
+    )
+    weight = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Weight in kg (for weight verification)",
+    )
+    height = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Height in cm (for height verification)",
+    )
+    ftp = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Functional Threshold Power in watts (for power verification)",
+    )
+
+    class Status(models.TextChoices):
+        """Status choices for verification records."""
+
+        PENDING = "pending", "Pending"
+        VERIFIED = "verified", "Verified"
+        REJECTED = "rejected", "Rejected"
+
+    status = models.CharField(
+        max_length=10,
+        choices=Status.choices,
+        default=Status.PENDING,
+        help_text="Verification status",
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_records",
+        help_text="User who reviewed this record",
+    )
+    reviewed_date = models.DateTimeField(null=True, blank=True, help_text="When this record was reviewed")
+    review_note = models.TextField(blank=True, help_text="Reviewer note (for any status change)")
+    notes = models.TextField(blank=True, help_text="Notes about the measurement")
+    record_date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date of the verification evidence (video/photo/link)",
+    )
+    same_gender = models.BooleanField(
+        default=False,
+        help_text="Same gender as user should review record",
+    )
+    date_created = models.DateTimeField(
+        default=timezone.now,
+        help_text="When this record was created",
+    )
+    last_warned_at = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Date of the most recent expiring-verification DM for this record. "
+        "Used by warn_expiring_verifications to enforce one DM per record per day.",
+    )
+    last_warned_threshold = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Lowest EXPIRE_WARNING_DAYS threshold already warned about for this record. "
+        "Without it the task could only ask 'did we DM today', never 'which warning has this "
+        "rider actually had' -- so a run that missed a threshold day could never make it up.",
+    )
+
+    class Meta:
+        """Meta options for RaceReadyRecord model."""
+
+        verbose_name = "Race Ready Record"
+        verbose_name_plural = "Race Ready Records"
+        ordering: ClassVar[list[str]] = ["-date_created"]
+
+    def __str__(self) -> str:
+        """Return string representation of record.
+
+        Returns:
+            Description with user, type, and date.
+
+        """
+        return f"{self.user.username} - {self.verify_type} ({self.date_created:%Y-%m-%d})"
+
+    def clean(self) -> None:
+        """Validate the evidence against its media type.
+
+        "Other" is evidence that is neither a file nor a link -- so it carries neither, and the
+        note is what the reviewer has to go on. Every other type needs a file or a link.
+
+        Only runs on a full clean (forms, the admin); a plain ``save()`` skips it, so rows
+        written before this rule are not broken by it -- though editing one in the admin will
+        ask for it to be put right.
+
+        Raises:
+            ValidationError: For Other with a file, a link or no note; for any other type
+                with neither a file nor a link.
+
+        """
+        super().clean()
+        if self.media_type == "other":
+            errors = {}
+            if self.media_file:
+                errors["media_file"] = "Other evidence isn't uploaded. Describe it in the notes instead."
+            if self.url:
+                errors["url"] = "Other evidence isn't linked. Describe it in the notes instead."
+            if not (self.notes or "").strip():
+                errors["notes"] = "Describe the evidence. With no file or link, the note is what the reviewer goes on."
+            if errors:
+                raise ValidationError(errors)
+            return
+        if not self.media_file and not self.url:
+            raise ValidationError(
+                "You must provide either a file upload or a URL (or both).", code=self.NO_EVIDENCE_CODE
+            )
+
+    def delete(self, *args, **kwargs):
+        """Delete the record, and take its evidence file with it.
+
+        Django never removes FileField storage on delete. Left to itself the row goes and
+        the photograph stays in the bucket -- and it stays there permanently, because every
+        sweep that strips media works from the rows, so a file whose row is gone is
+        unreachable except by enumerating the storage prefix. Body photography is exactly
+        the thing that must not outlive the record it belongs to.
+
+        A file that cannot be deleted does not stop the row going. That is the rule the
+        rider's own delete already follows (``services.delete_verification_records``): the
+        deletion was asked for, and refusing on a storage error would leave the asker stuck
+        with the record. The path is logged so it can be swept by hand.
+
+        This fires for a per-instance delete -- the review page's Delete button, the Django
+        admin's, the shell. It does **not** fire for a cascade or a queryset delete, where
+        Django's Collector bulk-deletes without instantiating; those paths strip the media
+        themselves first (``purge_user_verification_media``, ``delete_verification_records``).
+
+        Args:
+            *args: Passed through to ``Model.delete``.
+            **kwargs: Passed through to ``Model.delete``.
+
+        Returns:
+            What ``Model.delete`` returns: the total deleted and the per-model breakdown.
+
+        """
+        file_name = self.media_file.name if self.media_file else ""
+        try:
+            self.delete_media_file()
+        except Exception as e:
+            # delete_media_file has logged the storage error itself; what it cannot say is
+            # that the row went anyway, which is what makes this file an orphan.
+            logfire.error(
+                "Verification record deleted but its media file could not be",
+                record_id=self.id,
+                user_id=self.user_id,
+                orphaned_file=file_name,
+                error=str(e),
+            )
+        return super().delete(*args, **kwargs)
+
+    def delete_media_file(self) -> bool:
+        """Delete the uploaded media file if it exists.
+
+        Returns:
+            True if file was deleted, False otherwise.
+
+        """
+        if self.media_file:
+            file_name = self.media_file.name
+            try:
+                self.media_file.delete(save=False)
+                logfire.info(
+                    "Media file deleted from RaceReadyRecord",
+                    record_id=self.id,
+                    user_id=self.user_id,
+                    verify_type=self.verify_type,
+                    file_name=file_name,
+                )
+                return True
+            except Exception as e:
+                logfire.error(
+                    "Failed to delete media file from RaceReadyRecord",
+                    record_id=self.id,
+                    user_id=self.user_id,
+                    file_name=file_name,
+                    error=str(e),
+                )
+                raise
+        logfire.debug(
+            "No media file to delete from RaceReadyRecord",
+            record_id=self.id,
+            user_id=self.user_id,
+        )
+        return False
+
+    @property
+    def is_verified(self) -> bool:
+        """Check if record is verified."""
+        return self.status == self.Status.VERIFIED
+
+    @property
+    def is_rejected(self) -> bool:
+        """Check if record is rejected."""
+        return self.status == self.Status.REJECTED
+
+    @property
+    def is_pending(self) -> bool:
+        """Check if record is pending."""
+        return self.status == self.Status.PENDING
+
+    @property
+    def is_body_measurement(self) -> bool:
+        """Whether the record claims a weight or a height.
+
+        Those are the two values a rider also sets in their Zwift profile, so these are the
+        records worth re-reading Zwift for (``refresh_zwift_profile``). Power is not on it.
+        """
+        return self.verify_type in {"weight_full", "weight_light", "height"}
+
+    @property
+    def url_type(self) -> str:
+        """Determine the type of URL for display purposes.
+
+        Returns:
+            One of: 'youtube', 'vimeo', 'image', or 'other'.
+
+        """
+        if not self.url:
+            return "other"
+        url_lower = self.url.lower()
+        if "youtube.com/watch" in url_lower or "youtu.be/" in url_lower:
+            return "youtube"
+        if "vimeo.com/" in url_lower:
+            return "vimeo"
+        if url_lower.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
+            return "image"
+        return "other"
+
+    @property
+    def embed_url(self) -> str:
+        """The embed URL for YouTube or Vimeo videos.
+
+        Returns:
+            Embed URL if applicable, otherwise empty string.
+
+        """
+        import re
+
+        if not self.url:
+            return ""
+
+        # YouTube: youtube.com/watch?v=VIDEO_ID or youtu.be/VIDEO_ID
+        # Also handle youtube.com/shorts/VIDEO_ID
+        youtube_match = re.search(r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})", self.url)
+        if youtube_match:
+            video_id = youtube_match.group(1)
+            # Use youtube-nocookie.com for better privacy/compatibility
+            # rel=0 prevents showing related videos at the end
+            return f"https://www.youtube-nocookie.com/embed/{video_id}?rel=0"
+
+        # Vimeo: vimeo.com/VIDEO_ID
+        vimeo_match = re.search(r"vimeo\.com/(\d+)", self.url)
+        if vimeo_match:
+            return f"https://player.vimeo.com/video/{vimeo_match.group(1)}"
+
+        return ""
+
+    @property
+    def validity_days(self) -> int:
+        """The validity period in days for this verification type.
+
+        Returns:
+            Number of days the verification is valid (0 = forever).
+
+        """
+        from constance import config
+
+        validity_map = {
+            "weight_full": config.WEIGHT_FULL_DAYS,
+            "weight_light": config.WEIGHT_LIGHT_DAYS,
+            "height": config.HEIGHT_VERIFICATION_DAYS,
+            "power": config.POWER_VERIFICATION_DAYS,
+        }
+        return validity_map.get(self.verify_type, 0)
+
+    @property
+    def expires_date(self) -> date | None:
+        """The expiration date for this verification.
+
+        Expiration is calculated from record_date (the date of the evidence),
+        not the date it was reviewed.
+
+        Returns:
+            Expiration date if applicable, None if never expires or not verified.
+
+        """
+        if not self.is_verified or not self.record_date:
+            return None
+
+        validity = self.validity_days
+        if validity == 0:
+            return None  # Never expires
+
+        return self.record_date + timedelta(days=validity)
+
+    @property
+    def is_expired(self) -> bool:
+        """Check if verification has expired.
+
+        Returns:
+            True if expired, False otherwise.
+
+        """
+        expires = self.expires_date
+        if expires is None:
+            return False
+        is_expired = timezone.now().date() > expires
+        if is_expired:
+            logfire.debug(
+                "RaceReadyRecord is expired",
+                record_id=self.id,
+                user_id=self.user_id,
+                verify_type=self.verify_type,
+                expires_date=expires.isoformat(),
+                record_date=self.record_date.isoformat() if self.record_date else None,
+            )
+        return is_expired
+
+    @property
+    def days_remaining(self) -> int | None:
+        """The number of days remaining until expiration.
+
+        Returns:
+            Days remaining (negative if expired), None if never expires or not verified.
+
+        """
+        expires = self.expires_date
+        if expires is None:
+            return None
+        delta = expires - timezone.now().date()
+        return delta.days
+
+    @property
+    def validity_status(self) -> str:
+        """A human-readable validity status.
+
+        Returns:
+            Status string: 'Valid (X days)', 'Expired', 'Never expires', or 'Not verified'.
+
+        """
+        if not self.is_verified:
+            return "Not verified"
+
+        days = self.days_remaining
+        if days is None:
+            return "Never expires"
+        if days < 0:
+            return "Expired"
+        return f"Valid ({days} days)"
+
+
+class RecordView(models.Model):
+    """Audit trail of who opened a verification record, and whether they saw its media.
+
+    One row per (record, reviewer) pair rather than one per page load: the counters and
+    ``last_viewed_at`` are bumped on each visit, so the trail answers "who looked at this
+    submission, how often, and when" — including reviewers who opened a record but never
+    verified or rejected it — without growing a row per refresh.
+
+    ``media_view_count`` is incremented only when the page actually rendered the evidence
+    (the reviewer passed the media-visibility gate *and* the record still has a file/URL),
+    so it tracks exposure of the sensitive photo/video separately from page opens.
+
+    Both foreign keys cascade **by design**: deleting a verification record also drops its
+    access trail, and deleting a user drops their viewing history everywhere. The trail is
+    scoped to live exactly as long as the thing it describes — don't "fix" this to SET_NULL.
+    The ``"Verification record viewed"`` Logfire events survive either deletion if a
+    longer-lived trail is ever needed.
+
+    Attributes:
+        record: The verification record that was viewed.
+        user: The person who viewed it.
+        view_count: How many times they opened the record detail page.
+        media_view_count: How many of those views actually displayed the media.
+        first_viewed_at: When they first opened the record.
+        last_viewed_at: When they most recently opened it.
+
+    """
+
+    record = models.ForeignKey(
+        RaceReadyRecord,
+        on_delete=models.CASCADE,
+        related_name="record_views",
+        help_text="Verification record that was viewed",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="verification_record_views",
+        help_text="User who viewed the record",
+    )
+    view_count = models.PositiveIntegerField(default=0, help_text="Times this user opened the record detail page")
+    media_view_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Times the record's media (photo/video/link) was actually shown to this user",
+    )
+    first_viewed_at = models.DateTimeField(auto_now_add=True, help_text="When this user first viewed the record")
+    last_viewed_at = models.DateTimeField(default=timezone.now, help_text="When this user most recently viewed it")
+
+    class Meta:
+        """Meta options for RecordView."""
+
+        verbose_name = "Record View"
+        verbose_name_plural = "Record Views"
+        ordering: ClassVar[list[str]] = ["-last_viewed_at"]
+        constraints: ClassVar[list] = [
+            models.UniqueConstraint(fields=["record", "user"], name="unique_record_view_per_user"),
+        ]
+        indexes: ClassVar[list] = [
+            models.Index(fields=["record", "-last_viewed_at"]),
+        ]
+
+    def __str__(self) -> str:
+        """Return a string representation of the view.
+
+        Returns:
+            Description with viewer and record.
+
+        """
+        return f"{self.user} viewed record {self.record_id} ({self.view_count}x)"
+
+
+class TeamLink(models.Model):
+    """External links to team resources, forms, and event information.
+
+    TeamLinks provide a centralized way to share important URLs with team members.
+    Links can be categorized by type, scheduled to appear/disappear at specific times,
+    and filtered by users on the team links page.
+
+    Visibility Rules:
+        A link is visible when ALL conditions are met:
+        - active=True
+        - date_open is None OR date_open <= now
+        - date_closed is None OR date_closed > now
+        - permissions is empty OR user has a role matching any permission
+
+    Use Cases:
+        - Race signup forms (with open/close dates matching registration windows)
+        - Event-specific spreadsheets (availability, results)
+        - Permanent resources (team rules, ZwiftPower page)
+        - Time-limited announcements or forms
+
+    Attributes:
+        title: Display name for the link.
+        description: Optional longer description of the resource.
+        url: The destination URL.
+        link_types: List of LinkType values for categorization/filtering.
+        permissions: List of permission keys required to view (empty = all team members).
+        active: Master toggle to hide link regardless of dates.
+        date_open: When link becomes visible (None = immediately).
+        date_closed: When link stops being visible (None = never).
+        date_added: Auto-set timestamp when created.
+        date_edited: Auto-updated timestamp on save.
+
+    Properties:
+        is_visible: Whether link should be shown based on active and dates.
+        link_types_display: Comma-separated display names of link types.
+
+    """
+
+    retention = RetentionPolicy.keep(
+        "Curated team resource links, reused season to season. No personal content."
+    )
+
+    PERMISSION_CHOICES: ClassVar[list[tuple[str, str]]] = [
+        ("PERM_APP_ADMIN_ROLES", "App Admin"),
+        ("PERM_TEAM_CAPTAIN_ROLES", "Team Captain"),
+        ("PERM_VICE_CAPTAIN_ROLES", "Vice Captain"),
+        ("PERM_LINK_ADMIN_ROLES", "Link Admin"),
+        ("PERM_MEMBERSHIP_ADMIN_ROLES", "Membership Admin"),
+        ("PERM_RACING_ADMIN_ROLES", "Racing Admin"),
+        ("PERM_TEAM_MEMBER_ROLES", "Team Member"),
+        ("PERM_RACE_READY_ROLES", "Race Ready"),
+        ("PERM_APPROVE_VERIFICATION_ROLES", "Verification Approver"),
+        ("PERM_DATA_CONNECTION_ROLES", "Data Connection"),
+        ("PERM_PAGES_ADMIN_ROLES", "Pages Admin"),
+    ]
+
+    class LinkType(models.TextChoices):
+        """Types of external links."""
+
+        AVAILABILITY = "availability", "Availability"
+        EVENT = "event", "Event"
+        FORM = "form", "Form"
+        FRR = "frr", "FRR"
+        SIGNUP = "signup", "Signup"
+        SPREADSHEET = "spreadsheet", "Spreadsheet"
+        TTT = "ttt", "TTT"
+        WEBSITE = "website", "Website"
+        CLUBLADDER = "club_ladder", "Club Ladder"
+        ZRL = "zrl", "ZRL"
+        ZWIFTPOWER = "zwiftpower", "ZwiftPower"
+        ZWIFTRACING = "zwiftracing", "Zwift Racing"
+        OTHER = "other", "Other"
+
+    title = models.CharField(max_length=255, help_text="Title of the link")
+    description = models.TextField(blank=True, help_text="Description of the link")
+    url = models.URLField(max_length=500, help_text="URL to the resource")
+    link_types = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Types/tags for this link (e.g., ['form', 'signup', 'zrl'])",
+    )
+    active = models.BooleanField(default=True, help_text="Whether this link is active")
+    date_open = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this link becomes visible (blank = immediately)",
+    )
+    date_closed = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When this link stops being visible (blank = never)",
+    )
+    date_added = models.DateTimeField(auto_now_add=True, help_text="When this link was added")
+    date_edited = models.DateTimeField(auto_now=True, help_text="When this link was last edited")
+    permissions = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Permission mappings required to view this link (empty = all team members)",
+    )
+
+    class Meta:
+        """Meta options for TeamLink model."""
+
+        verbose_name = "Team Link"
+        verbose_name_plural = "Team Links"
+        ordering: ClassVar[list[str]] = ["title"]
+
+    def __str__(self) -> str:
+        """Return string representation of link.
+
+        Returns:
+            The title of the link.
+
+        """
+        return self.title
+
+    @property
+    def is_visible(self) -> bool:
+        """Check if link is currently visible based on date_open and date_closed.
+
+        Returns:
+            True if link should be visible now.
+
+        """
+        if not self.active:
+            return False
+        now = timezone.now()
+        if self.date_open and now < self.date_open:
+            return False
+        return not (self.date_closed and now >= self.date_closed)
+
+    @property
+    def link_types_display(self) -> str:
+        """Comma-separated display names of link types.
+
+        Returns:
+            Formatted string of link type labels.
+
+        """
+        if not self.link_types:
+            return ""
+        type_map = dict(self.LinkType.choices)
+        return ", ".join(type_map.get(t, t) for t in self.link_types)
+
+    def user_can_view(self, user) -> bool:
+        """Check if user has permission to view this link.
+
+        If permissions list is empty, any team member can view.
+        If permissions are set, user must have a Discord role that matches
+        ANY of the selected permission mappings (OR logic).
+
+        Args:
+            user: The user to check permissions for.
+
+        Returns:
+            True if user can view this link, False otherwise.
+
+        """
+        if not self.permissions:
+            return True  # No restrictions - visible to all team members
+
+        import json
+
+        from constance import config
+
+        user_role_ids = [str(rid) for rid in user.get_discord_role_ids()]
+
+        for perm_key in self.permissions:
+            # Get role IDs from Constance for this permission
+            role_ids_raw = getattr(config, perm_key, []) or []
+            if isinstance(role_ids_raw, str):
+                role_ids = json.loads(role_ids_raw) if role_ids_raw else []
+            else:
+                role_ids = role_ids_raw
+
+            # Check if user has any of these roles
+            if any(str(rid) in user_role_ids for rid in role_ids):
+                return True
+
+        return False
+
+
+class DiscordRole(models.Model):
+    """Discord guild roles synced from the server."""
+
+    retention = RetentionPolicy.keep(
+        "Mirror of the guild's roles, refreshed by sync. Role names and snowflake ids only -- "
+        "which members hold them lives on GuildMember, classified separately."
+    )
+
+    role_id = models.CharField(
+        max_length=20,
+        unique=True,
+        help_text="Discord role ID (snowflake)",
+    )
+    name = models.CharField(
+        max_length=100,
+        help_text="Role name",
+    )
+    color = models.IntegerField(
+        default=0,
+        help_text="Role color as integer",
+    )
+    position = models.IntegerField(
+        default=0,
+        help_text="Role position in hierarchy (higher = more authority)",
+    )
+    managed = models.BooleanField(
+        default=False,
+        help_text="Whether this role is managed by an integration/bot",
+    )
+    mentionable = models.BooleanField(
+        default=False,
+        help_text="Whether this role can be mentioned",
+    )
+    date_synced = models.DateTimeField(
+        auto_now=True,
+        help_text="When this role was last synced from Discord",
+    )
+
+    class Meta:
+        """Meta options for DiscordRole model."""
+
+        verbose_name = "Discord Role"
+        verbose_name_plural = "Discord Roles"
+        ordering: ClassVar[list[str]] = ["-position"]
+
+    def __str__(self) -> str:
+        """Return string representation of role.
+
+        Returns:
+            The role name.
+
+        """
+        return self.name
+
+    @property
+    def color_hex(self) -> str:
+        """The role color as a hex string.
+
+        Returns:
+            Hex color string (e.g., '#3498db') or empty if no color.
+
+        """
+        if self.color == 0:
+            return ""
+        return f"#{self.color:06x}"
+
+
+class DiscordChannel(models.Model):
+    """Discord guild channels synced from the server."""
+
+    retention = RetentionPolicy.keep(
+        "Mirror of the guild's channels, refreshed by sync. Channel names and snowflake ids only."
+    )
+
+    class ChannelType(models.IntegerChoices):
+        """Discord channel type choices."""
+
+        TEXT = 0, "Text"
+        VOICE = 2, "Voice"
+        CATEGORY = 4, "Category"
+        ANNOUNCEMENT = 5, "Announcement"
+        STAGE = 13, "Stage"
+        FORUM = 15, "Forum"
+        MEDIA = 16, "Media"
+
+    channel_id = models.CharField(
+        max_length=20,
+        unique=True,
+        help_text="Discord channel ID (snowflake)",
+    )
+    name = models.CharField(
+        max_length=100,
+        help_text="Channel name",
+    )
+    channel_type = models.IntegerField(
+        choices=ChannelType.choices,
+        default=ChannelType.TEXT,
+        help_text="Discord channel type",
+    )
+    position = models.IntegerField(
+        default=0,
+        help_text="Channel position in the list",
+    )
+    category_id = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        help_text="Parent category channel ID (snowflake)",
+    )
+    category_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Parent category name (denormalized for display)",
+    )
+    date_synced = models.DateTimeField(
+        auto_now=True,
+        help_text="When this channel was last synced from Discord",
+    )
+
+    class Meta:
+        """Meta options for DiscordChannel model."""
+
+        verbose_name = "Discord Channel"
+        verbose_name_plural = "Discord Channels"
+        ordering: ClassVar[list[str]] = ["category_name", "position"]
+
+    def __str__(self) -> str:
+        """Return string representation of channel.
+
+        Returns:
+            Channel name with category prefix if applicable.
+
+        """
+        if self.category_name:
+            return f"{self.category_name} > #{self.name}"
+        return f"#{self.name}"
+
+
+class RosterFilter(models.Model):
+    """Temporary filtered roster view created from Discord channel members.
+
+    Created via the Discord bot /in_channel command to generate a link
+    showing only team members who have access to a specific Discord channel.
+
+    Attributes:
+        id: UUID primary key for URL-safe access.
+        discord_ids: List of Discord user IDs to filter by.
+        channel_name: Name of the Discord channel (for display).
+        created_by_discord_id: Discord ID of user who created the filter.
+        created_at: When the filter was created.
+        expires_at: When the filter expires (default: 5 minutes after creation).
+
+    """
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+        help_text="UUID for URL-safe access",
+    )
+    discord_ids = models.JSONField(
+        default=list,
+        help_text="List of Discord user IDs to filter roster by",
+    )
+    channel_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Name of the Discord channel",
+    )
+    created_by_discord_id = models.CharField(
+        max_length=30,
+        blank=True,
+        help_text="Discord ID of user who created this filter",
+    )
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="When this filter was created",
+    )
+    expires_at = models.DateTimeField(
+        help_text="When this filter expires",
+    )
+
+    class Meta:
+        """Meta options for RosterFilter model."""
+
+        verbose_name = "Roster Filter"
+        verbose_name_plural = "Roster Filters"
+        ordering: ClassVar[list[str]] = ["-created_at"]
+
+    def __str__(self) -> str:
+        """Return string representation of filter.
+
+        Returns:
+            Description with channel name and creation date.
+
+        """
+        return f"Filter for #{self.channel_name} ({self.created_at:%Y-%m-%d %H:%M})"
+
+    @property
+    def is_expired(self) -> bool:
+        """Check if this filter has expired.
+
+        Returns:
+            True if expired, False otherwise.
+
+        """
+        return timezone.now() > self.expires_at
+
+    @property
+    def member_count(self) -> int:
+        """The number of Discord IDs in this filter.
+
+        Returns:
+            Count of Discord IDs.
+
+        """
+        return len(self.discord_ids) if self.discord_ids else 0
+
+
+class MembershipApplication(models.Model):
+    """Membership application submitted via Discord modal.
+
+    Processes new member applications and onboarding. When approved, users can
+    login to the app with Discord OAuth2. Applications are created via the
+    Discord bot's join_the_coalition cog and accessed via UUID-based URLs.
+
+    Workflow:
+        1. User submits modal in Discord (join_the_coalition cog)
+        2. Bot POSTs to API, creates MembershipApplication
+        3. User receives DM with UUID link to complete application
+        4. User fills out required fields (name, agreements)
+        5. Membership admin reviews and approves/rejects
+        6. If approved, user can login via Discord OAuth
+
+    Attributes:
+        id: UUID primary key for secure, unguessable URLs.
+        discord_id: Discord user ID (unique per application).
+        discord_username: Discord username at time of application.
+        server_nickname: Server nickname at time of application.
+        avatar_url: Discord avatar URL.
+        guild_avatar_url: Server-specific avatar URL.
+        discord_user_data: Raw discord.User data for reference.
+        discord_member_data: Raw discord.Member data for reference.
+        modal_form_data: Data from join_the_coalition modal.
+        first_name: Applicant's first name.
+        last_name: Applicant's last name.
+        agree_privacy: Whether applicant agreed to privacy policy.
+        agree_tos: Whether applicant agreed to terms of service.
+        applicant_notes: Notes from the applicant.
+        admin_notes: Internal notes from membership admins.
+        status: Application status (pending, in_progress, etc.).
+        date_created: When application was created.
+        date_modified: When application was last modified.
+        modified_by: Admin who last modified the application.
+
+    """
+
+    class Status(models.TextChoices):
+        """Application status choices."""
+
+        PENDING = "pending", "Pending Review"
+        IN_PROGRESS = "in_progress", "In Progress"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+
+    class Gender(models.TextChoices):
+        """Gender choices."""
+
+        MALE = "male", "Male"
+        FEMALE = "female", "Female"
+        OTHER = "other", "Other"
+
+    class UnitPreference(models.TextChoices):
+        """Unit preference choices for weight and height."""
+
+        METRIC = "metric", "Metric (kg, cm)"
+        IMPERIAL = "imperial", "Imperial (lbs, in)"
+
+    # Primary key - UUID for secure anonymous access
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+        help_text="UUID for secure URL access",
+    )
+
+    # Discord identity fields
+    discord_id = models.CharField(
+        max_length=20,
+        unique=True,
+        db_index=True,
+        help_text="Discord user ID",
+    )
+    discord_username = models.CharField(
+        max_length=100,
+        help_text="Discord username at time of application",
+    )
+    server_nickname = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Server nickname at time of application",
+    )
+    avatar_url = models.URLField(
+        max_length=500,
+        blank=True,
+        help_text="Discord avatar URL",
+    )
+    guild_avatar_url = models.URLField(
+        max_length=500,
+        blank=True,
+        help_text="Server-specific avatar URL",
+    )
+
+    # Raw Discord data (for reference/debugging)
+    discord_user_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Raw discord.User data",
+    )
+    discord_member_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Raw discord.Member data",
+    )
+    modal_form_data = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Data from join_the_coalition modal",
+    )
+
+    # Applicant-editable fields
+    first_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Applicant's first name",
+    )
+    last_name = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Applicant's last name",
+    )
+    agree_privacy = models.BooleanField(
+        default=False,
+        help_text="Whether applicant agreed to privacy policy",
+    )
+    agree_tos = models.BooleanField(
+        default=False,
+        help_text="Whether applicant agreed to terms of service",
+    )
+    applicant_notes = models.TextField(
+        blank=True,
+        help_text="Notes from the applicant",
+    )
+
+    # Profile fields (editable by applicant)
+    zwift_id = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Zwift account ID",
+    )
+    zwift_verified = models.BooleanField(
+        default=False,
+        help_text="Whether Zwift account has been verified via login",
+    )
+    email = models.EmailField(
+        blank=True,
+        help_text="Contact email address",
+    )
+    country = CountryField(
+        blank=True,
+        help_text="Country of residence",
+    )
+    timezone = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="User's timezone (e.g., America/New_York)",
+    )
+    birth_year = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Year of birth",
+    )
+    gender = models.CharField(
+        max_length=10,
+        choices=Gender.choices,
+        blank=True,
+        help_text="Gender",
+    )
+    unit_preference = models.CharField(
+        max_length=10,
+        choices=UnitPreference.choices,
+        blank=True,
+        help_text="Preferred units for weight and height",
+    )
+
+    # Equipment fields
+    trainer = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Primary trainer (from TRAINER_OPTIONS)",
+    )
+    power_meter = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Power meter (from POWERMETER_OPTIONS)",
+    )
+    dual_recording = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Do you dual record data?",
+    )
+    heartrate_monitor = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Heart rate monitor brand (from HEARTRATE_MONITOR_OPTIONS)",
+    )
+
+    # Social links
+    strava_profile = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="Strava profile URL",
+    )
+    tpv_profile_url = models.URLField(
+        max_length=200,
+        blank=True,
+        help_text="TrainingPeaks Virtual profile URL (e.g., https://tpvirtualhub.com/profile/GGGTTTRRRDDD123)",
+    )
+
+    # Admin-only fields
+    admin_notes = models.TextField(
+        blank=True,
+        help_text="Internal notes from membership admins",
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+        db_index=True,
+        help_text="Application status",
+    )
+
+    # Timestamps
+    date_created = models.DateTimeField(
+        auto_now_add=True,
+        help_text="When application was created",
+    )
+    date_modified = models.DateTimeField(
+        auto_now=True,
+        help_text="When application was last modified",
+    )
+
+    # Modified by tracking
+    modified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="modified_applications",
+        help_text="Admin who last modified this application",
+    )
+
+    # Messages from admins to applicant
+    messages = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Messages from admins to applicant",
+    )
+
+    class Meta:
+        """Meta options for MembershipApplication model."""
+
+        ordering: ClassVar[list[str]] = ["-date_created"]
+        verbose_name = "Membership Application"
+        verbose_name_plural = "Membership Applications"
+
+    def __str__(self) -> str:
+        """Return string representation.
+
+        Returns:
+            Discord username and status display.
+
+        """
+        return f"{self.discord_username} - {self.get_status_display()}"
+
+    def save(self, *args, **kwargs) -> None:
+        """Save the model and log status transitions.
+
+        Logs status changes with before/after values and the admin who made the change.
+        """
+        # Check for status transition
+        if self.pk:
+            try:
+                old_instance = MembershipApplication.objects.get(pk=self.pk)
+                old_status = old_instance.status
+                if old_status != self.status:
+                    logfire.info(
+                        "MembershipApplication status changed",
+                        application_id=str(self.pk),
+                        discord_id=self.discord_id,
+                        discord_username=self.discord_username,
+                        old_status=old_status,
+                        new_status=self.status,
+                        modified_by_id=self.modified_by_id,
+                    )
+            except MembershipApplication.DoesNotExist:
+                # New instance, will be logged below
+                pass
+        else:
+            logfire.info(
+                "MembershipApplication created",
+                discord_id=self.discord_id,
+                discord_username=self.discord_username,
+                initial_status=self.status,
+            )
+
+        super().save(*args, **kwargs)
+
+    @property
+    def display_name(self) -> str:
+        """The best display name available.
+
+        Returns:
+            Server nickname if set, otherwise Discord username.
+
+        """
+        return self.server_nickname or self.discord_username
+
+    @property
+    def full_name(self) -> str:
+        """Full name if available.
+
+        Returns:
+            Combined first and last name, or partial if only one set.
+
+        """
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}"
+        return self.first_name or self.last_name or ""
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if applicant has completed required fields.
+
+        Returns:
+            True if all required fields are filled.
+
+        """
+        return bool(self.first_name and self.last_name and self.agree_privacy and self.agree_tos)
+
+    @property
+    def is_pending(self) -> bool:
+        """Check if application is pending review.
+
+        Returns:
+            True if status is PENDING.
+
+        """
+        return self.status == self.Status.PENDING
+
+    @property
+    def is_actionable(self) -> bool:
+        """Check if application can be approved/rejected.
+
+        Returns:
+            True if status is not already APPROVED or REJECTED.
+
+        """
+        return self.status not in [self.Status.APPROVED, self.Status.REJECTED]
+
+    @property
+    def is_editable(self) -> bool:
+        """Check if applicant can still edit their application.
+
+        Returns:
+            True if status allows editing (not approved or rejected).
+
+        """
+        return self.status not in [self.Status.APPROVED, self.Status.REJECTED]
+
+    @property
+    def profile_completion_status(self) -> dict[str, bool]:
+        """Detailed profile completion status for recommended fields.
+
+        Returns:
+            Dictionary mapping field names to completion status.
+
+        """
+        return {
+            "email": bool(self.email and self.email.strip()),
+            "country": bool(self.country),
+            "timezone": bool(self.timezone and self.timezone.strip()),
+            "birth_year": bool(self.birth_year),
+            "gender": bool(self.gender and self.gender.strip()),
+            "unit_preference": bool(self.unit_preference and self.unit_preference.strip()),
+            "trainer": bool(self.trainer and self.trainer.strip()),
+            "heartrate_monitor": bool(self.heartrate_monitor and self.heartrate_monitor.strip()),
+        }
+
+    @property
+    def has_incomplete_profile_fields(self) -> bool:
+        """Check if any recommended profile fields are incomplete.
+
+        Returns:
+            True if any recommended fields are missing.
+
+        """
+        return not all(self.profile_completion_status.values())
+
+    def add_message(self, user: settings.AUTH_USER_MODEL, message: str) -> dict:
+        """Add a message from an admin to the applicant.
+
+        Args:
+            user: The admin user adding the message.
+            message: The message content (supports Markdown).
+
+        Returns:
+            The created message dict.
+
+        """
+        new_message = {
+            "id": str(uuid.uuid4()),
+            "message": message,
+            "author_id": user.id,
+            "author_name": user.discord_nickname or user.first_name or user.username,
+            "created_at": timezone.now().isoformat(),
+        }
+        if self.messages is None:
+            self.messages = []
+        self.messages.append(new_message)
+        return new_message
+
+
+class KitStatus(models.TextChoices):
+    """Where a rider's team kit stands, as stored on ``User.team_kit``.
+
+    One stored value per state, with the label depending on who is looking -- see
+    ``apps.team.kits``. The two lists this came from overlap with different wording: the
+    rider's "What's a kit" and the team's "Unknown" are the same state, as are "I need the
+    kit" and "Need kit". Storing the wording would have made them different values and
+    broken the moment either label was reworded, and would hand the planned import/export a
+    column of display strings to match against.
+    """
+
+    UNKNOWN = "unknown", "Unknown"
+    NEED = "need", "Need kit"
+    SUBMITTED = "submitted", "Submitted to Zwift"
+    COMPLETED = "completed", "Completed by Zwift"
+    HAVE = "have", "I have the kit"
+
+
+class TeamKit(models.Model):
+    """A team kit Zwift issues to members.
+
+    Each rider's status for each kit lives in ``User.team_kit``, keyed by ``slug`` rather
+    than by name or primary key. The slug is fixed once created (read-only in the admin):
+    renaming a kit changes ``name`` and leaves every rider's status attached, which keying
+    by name would not. It is also stable across environments, unlike a primary key, which
+    matters for the import/export that is meant to follow.
+
+    Retire a kit by clearing ``active`` rather than deleting it: riders' statuses for it are
+    kept, and it simply stops being shown and offered.
+    """
+
+    retention = RetentionPolicy.keep(
+        "Configuration: the list of team kits an admin has defined. No personal content -- "
+        "each rider's status for a kit is stored on the User row, not here."
+    )
+
+    name = models.CharField(max_length=100, help_text="Shown to riders, e.g. '2026 Race Kit'")
+    slug = models.SlugField(
+        max_length=100,
+        unique=True,
+        help_text="Permanent key for this kit in each rider's record. Cannot be changed after creation.",
+    )
+    description = models.TextField(blank=True, help_text="Optional detail shown to riders")
+    # The kit's own artwork, shown on the roster card of every rider who has it. Per kit
+    # rather than site-wide because the kit is the thing being pictured: a new kit each year
+    # gets its own image, and the previous one keeps the artwork riders earned it in.
+    # Empty falls back to the site-wide kit icon, and then to the bundled jersey.
+    icon = models.ImageField(
+        upload_to="kit_icons/",
+        blank=True,
+        help_text="Shown on the roster card of riders who have this kit. Leave empty to use the site-wide icon.",
+    )
+    active = models.BooleanField(
+        default=True,
+        help_text="Inactive kits are hidden and not offered, but riders' statuses for them are kept",
+    )
+    sort_order = models.PositiveSmallIntegerField(default=0, help_text="Lower numbers are listed first")
+    # The kit the team is working to get everyone into. Each year or so a new kit is added and
+    # made current; the previous one stays as it was (still active if riders should keep
+    # recording it, or retired). Listed first everywhere, and the one future automations and
+    # exports will target. At most one kit is current, and it must be active -- both enforced
+    # by the database, so no path (the config page, the Django admin, a shell) can break them.
+    is_current = models.BooleanField(
+        default=False,
+        help_text="The kit the team is currently getting everyone into. Only one kit can be current.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        """Model metadata."""
+
+        # Current first, so the kit being chased leads every list without each caller sorting.
+        ordering: ClassVar[list[str]] = ["-is_current", "sort_order", "name"]
+        verbose_name = "Team kit"
+        verbose_name_plural = "Team kits"
+        constraints: ClassVar[list[models.BaseConstraint]] = [
+            # A partial unique index: uniqueness applies only to rows where is_current is
+            # true, so any number of kits may be non-current but only one can be current.
+            models.UniqueConstraint(
+                fields=["is_current"],
+                condition=models.Q(is_current=True),
+                name="team_kit_single_current",
+            ),
+            # Chasing a retired kit makes no sense, and a current kit that is inactive would
+            # be hidden from the very riders it is meant to reach.
+            models.CheckConstraint(
+                condition=models.Q(is_current=False) | models.Q(active=True),
+                name="team_kit_current_is_active",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        """Return the kit name.
+
+        Returns:
+            The display name.
+
+        """
+        return self.name
+
+    def make_current(self) -> None:
+        """Make this the current kit, clearing the previous one.
+
+        In one transaction and in this order -- clear, then set -- because the partial unique
+        index allows only one current row at a time: setting first would collide with the
+        outgoing kit. Also activates this kit, since a current kit must be active.
+
+        """
+        from django.db import transaction
+
+        with transaction.atomic():
+            TeamKit.objects.filter(is_current=True).exclude(pk=self.pk).update(is_current=False)
+            TeamKit.objects.filter(pk=self.pk).update(is_current=True, active=True)
+        self.is_current = True
+        self.active = True

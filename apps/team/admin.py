@@ -1,0 +1,421 @@
+"""Admin configuration for team app."""
+
+import logfire
+from django.contrib import admin, messages
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.shortcuts import render
+from django.urls import path, reverse
+
+from apps.team.models import (
+    DiscordChannel,
+    DiscordRole,
+    MembershipApplication,
+    RaceReadyRecord,
+    TeamKit,
+    TeamLink,
+)
+from apps.team.services import (
+    ZWIFT_LINK_NOT_RELEASED_MESSAGE,
+    get_unified_team_roster,
+    release_application_zwift_links,
+)
+from apps.team.tasks import sync_discord_channels
+
+
+@admin.register(RaceReadyRecord)
+class RaceReadyRecordAdmin(admin.ModelAdmin):
+    """Admin for RaceReadyRecord model."""
+
+    list_display = ("user", "verify_type", "status", "media_type", "date_created", "reviewed_date")
+    list_filter = ("status", "verify_type", "media_type", "date_created")
+    search_fields = ("user__username", "user__email", "user__discord_username", "notes")
+    raw_id_fields = ("user",)
+
+    # The evidence file is deliberately kept out of this form. Django would render it with a
+    # ClearableFileInput -- "Currently: <link>" -- and that link is a presigned storage URL,
+    # which answers to no permission check at all. It would sidestep the rider's same-gender
+    # condition and the rule that decided records stay visible only to the verification team,
+    # both of which the review page enforces via can_view_verification_media. Body photography
+    # is reviewed there, not here. Admins can still see whether a file exists.
+    exclude = ("media_file",)
+    readonly_fields = ("date_created", "media_present")
+
+    @admin.display(boolean=True, description="Media uploaded")
+    def media_present(self, obj: RaceReadyRecord | None) -> bool:
+        """Report whether evidence is attached, without exposing a link to it.
+
+        Args:
+            obj: The record being displayed, or None on the add form.
+
+        Returns:
+            True if the record has an uploaded file.
+
+        """
+        return bool(obj and obj.media_file)
+
+    def get_urls(self) -> list:
+        """Add custom URLs for unified roster view.
+
+        Returns:
+            List of URL patterns including custom roster URL.
+
+        """
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "unified-roster/",
+                self.admin_site.admin_view(self.unified_roster_view),
+                name="team_unified_roster",
+            ),
+        ]
+        return custom_urls + urls
+
+    def unified_roster_view(self, request: HttpRequest) -> HttpResponse:
+        """Display unified team roster.
+
+        Args:
+            request: The HTTP request.
+
+        Returns:
+            Rendered roster page.
+
+        """
+        roster = get_unified_team_roster()
+
+        # Optional filtering
+        filter_status = request.GET.get("status", "all")
+        if filter_status == "active":
+            roster = [r for r in roster if r.is_active_member]
+        elif filter_status == "has_account":
+            roster = [r for r in roster if r.has_account]
+        elif filter_status == "no_account":
+            roster = [r for r in roster if not r.has_account]
+
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Unified Team Roster",
+            "roster": roster,
+            "filter_status": filter_status,
+            "total_count": len(roster),
+            "active_count": sum(1 for r in get_unified_team_roster() if r.is_active_member),
+            "with_account": sum(1 for r in get_unified_team_roster() if r.has_account),
+        }
+        return render(request, "admin/team/unified_roster.html", context)
+
+
+@admin.register(TeamLink)
+class TeamLinkAdmin(admin.ModelAdmin):
+    """Admin for TeamLink model."""
+
+    list_display = (
+        "title",
+        "link_types_display",
+        "active",
+        "is_visible_display",
+        "date_open",
+        "date_closed",
+        "date_added",
+    )
+    list_filter = ("active", "date_open", "date_closed")
+    search_fields = ("title", "description", "url")
+    readonly_fields = ("date_added", "date_edited")
+    list_editable = ("active",)
+    fieldsets = (
+        (None, {"fields": ("title", "description", "url", "link_types", "active")}),
+        ("Visibility Schedule", {"fields": ("date_open", "date_closed")}),
+        ("Timestamps", {"fields": ("date_added", "date_edited"), "classes": ("collapse",)}),
+    )
+
+    @admin.display(description="Types")
+    def link_types_display(self, obj: TeamLink) -> str:
+        """Display link types as comma-separated labels.
+
+        Args:
+            obj: The TeamLink instance.
+
+        Returns:
+            Formatted string of link type labels.
+
+        """
+        return obj.link_types_display or "-"
+
+    @admin.display(description="Visible", boolean=True)
+    def is_visible_display(self, obj: TeamLink) -> bool:
+        """Display whether the link is currently visible.
+
+        Args:
+            obj: The TeamLink instance.
+
+        Returns:
+            True if link is visible, False otherwise.
+
+        """
+        return obj.is_visible
+
+
+@admin.register(DiscordRole)
+class DiscordRoleAdmin(admin.ModelAdmin):
+    """Admin for DiscordRole model."""
+
+    list_display = (
+        "name",
+        "role_id",
+        "color_display",
+        "position",
+        "managed",
+        "mentionable",
+        "date_synced",
+    )
+    list_filter = ("managed", "mentionable")
+    search_fields = ("name", "role_id")
+    readonly_fields = ("date_synced",)
+    ordering = ("-position",)
+
+    @admin.display(description="Color")
+    def color_display(self, obj: DiscordRole) -> str:
+        """Display role color as hex with colored badge.
+
+        Args:
+            obj: The DiscordRole instance.
+
+        Returns:
+            HTML span with colored background or dash if no color.
+
+        """
+        if obj.color == 0:
+            return "-"
+        hex_color = obj.color_hex
+        from django.utils.html import format_html
+
+        return format_html(
+            '<span style="background-color: {}; color: white; padding: 2px 8px; border-radius: 4px;">{}</span>',
+            hex_color,
+            hex_color,
+        )
+
+
+@admin.register(DiscordChannel)
+class DiscordChannelAdmin(admin.ModelAdmin):
+    """Admin for DiscordChannel model."""
+
+    list_display = (
+        "name",
+        "channel_id",
+        "channel_type",
+        "category_name",
+        "position",
+        "date_synced",
+    )
+    list_filter = ("channel_type", "category_name")
+    search_fields = ("name", "channel_id", "category_name")
+    readonly_fields = ("date_synced",)
+    ordering = ("category_name", "position")
+
+    def get_urls(self) -> list:
+        """Add custom URL for sync action.
+
+        Returns:
+            List of URL patterns including custom sync URL.
+
+        """
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "sync/",
+                self.admin_site.admin_view(self.sync_from_discord),
+                name="team_discordchannel_sync",
+            ),
+        ]
+        return custom_urls + urls
+
+    def sync_from_discord(self, request: HttpRequest) -> HttpResponseRedirect:
+        """Handle the sync button click.
+
+        Returns:
+            Redirect to the changelist page.
+
+        """
+        sync_discord_channels.enqueue()
+        self.message_user(
+            request,
+            "Sync Discord channels task has been queued.",
+            messages.SUCCESS,
+        )
+        return HttpResponseRedirect(reverse("admin:team_discordchannel_changelist"))
+
+
+@admin.register(MembershipApplication)
+class MembershipApplicationAdmin(admin.ModelAdmin):
+    """Admin for MembershipApplication model."""
+
+    list_display = (
+        "discord_username",
+        "server_nickname",
+        "full_name_display",
+        "status",
+        "is_complete_display",
+        "date_created",
+        "date_modified",
+    )
+    list_filter = ("status", "agree_privacy", "agree_tos")
+    search_fields = ("discord_id", "discord_username", "server_nickname", "first_name", "last_name")
+    readonly_fields = (
+        "id",
+        "discord_id",
+        "discord_username",
+        "discord_user_data",
+        "discord_member_data",
+        "modal_form_data",
+        "date_created",
+        "date_modified",
+    )
+    raw_id_fields = ("modified_by",)
+    fieldsets = (
+        ("Application ID", {"fields": ("id",)}),
+        (
+            "Discord Identity",
+            {
+                "fields": (
+                    "discord_id",
+                    "discord_username",
+                    "server_nickname",
+                    "avatar_url",
+                    "guild_avatar_url",
+                )
+            },
+        ),
+        (
+            "Applicant Information",
+            {
+                "fields": (
+                    "first_name",
+                    "last_name",
+                    "agree_privacy",
+                    "agree_tos",
+                    "applicant_notes",
+                )
+            },
+        ),
+        ("Admin", {"fields": ("status", "admin_notes", "modified_by")}),
+        (
+            "Raw Data",
+            {
+                "fields": (
+                    "discord_user_data",
+                    "discord_member_data",
+                    "modal_form_data",
+                ),
+                "classes": ("collapse",),
+            },
+        ),
+        ("Timestamps", {"fields": ("date_created", "date_modified")}),
+    )
+
+    @admin.display(description="Full Name")
+    def full_name_display(self, obj: MembershipApplication) -> str:
+        """Display full name or dash if not set.
+
+        Args:
+            obj: The MembershipApplication instance.
+
+        Returns:
+            Full name or dash.
+
+        """
+        return obj.full_name or "-"
+
+    @admin.display(description="Complete", boolean=True)
+    def is_complete_display(self, obj: MembershipApplication) -> bool:
+        """Display whether application is complete.
+
+        Args:
+            obj: The MembershipApplication instance.
+
+        Returns:
+            True if complete, False otherwise.
+
+        """
+        return obj.is_complete
+
+    # A registration's Zwift link lives in the zauth service under the registration's UUID,
+    # and is unreachable once the row is gone -- so both delete paths drop it first.
+
+    def delete_model(self, request: HttpRequest, obj: MembershipApplication) -> None:
+        """Drop the registration's Zwift link, then delete it.
+
+        Args:
+            request: The HTTP request.
+            obj: The registration being deleted.
+
+        """
+        links = release_application_zwift_links(MembershipApplication.objects.filter(pk=obj.pk))
+        logfire.info(
+            "Membership application deleted in admin",
+            application_id=str(obj.pk),
+            deleted_by_id=request.user.pk,
+            zwift_link_removed=bool(links["removed"]),
+            zwift_link_failed=bool(links["failed"]),
+        )
+        if links["failed"]:
+            self.message_user(request, ZWIFT_LINK_NOT_RELEASED_MESSAGE, messages.WARNING)
+        super().delete_model(request, obj)
+
+    def delete_queryset(self, request: HttpRequest, queryset) -> None:
+        """Drop the Zwift links of the selected registrations, then delete them.
+
+        Args:
+            request: The HTTP request.
+            queryset: The registrations being deleted.
+
+        """
+        links = release_application_zwift_links(queryset)
+        logfire.info(
+            "Membership applications bulk deleted in admin",
+            count=queryset.count(),
+            deleted_by_id=request.user.pk,
+            zwift_links_removed=links["removed"],
+            zwift_links_failed=links["failed"],
+        )
+        if links["failed"]:
+            self.message_user(request, ZWIFT_LINK_NOT_RELEASED_MESSAGE, messages.WARNING)
+        super().delete_queryset(request, queryset)
+
+
+@admin.register(TeamKit)
+class TeamKitAdmin(admin.ModelAdmin):
+    """Define the team kits riders are asked about."""
+
+    list_display = ("name", "slug", "active", "sort_order", "created_at")
+    list_editable = ("active", "sort_order")
+    list_filter = ("active",)
+    search_fields = ("name", "slug")
+
+    def get_prepopulated_fields(self, request: HttpRequest, obj: TeamKit | None = None) -> dict:
+        """Suggest a slug from the name, but only while creating.
+
+        Args:
+            request: The HTTP request.
+            obj: The kit being edited, or None when adding.
+
+        Returns:
+            The prepopulation map.
+
+        """
+        return {} if obj else {"slug": ("name",)}
+
+    def get_readonly_fields(self, request: HttpRequest, obj: TeamKit | None = None) -> tuple:
+        """Freeze the slug once a kit exists.
+
+        The slug is the key in every rider's ``team_kit``. Changing it would orphan every
+        status already recorded for this kit, so it is editable only on the add form. Rename
+        a kit through ``name`` instead, which is free to change.
+
+        Args:
+            request: The HTTP request.
+            obj: The kit being edited, or None when adding.
+
+        Returns:
+            Read-only field names.
+
+        """
+        return ("slug", "created_at") if obj else ("created_at",)

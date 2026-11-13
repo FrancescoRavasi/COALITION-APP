@@ -1,0 +1,649 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}{{ grid.title }} - Availability{% endblock %}
+
+{% block extra_css %}
+<style>
+  /* Wrapper becomes the scroll container on mobile so the sticky-top thead
+     stays visible while the user scrolls through hours. On desktop the grid
+     keeps its natural height (page handles scrolling). */
+  .avail-grid-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  @media (max-width: 767px) {
+    .avail-grid-wrap { max-height: calc(100vh - 8rem); overflow-y: auto; }
+  }
+  .avail-grid { border-collapse: collapse; user-select: none; -webkit-user-select: none; }
+  .avail-grid th,
+  .avail-grid td { border: 1px solid color-mix(in oklch, var(--color-base-content) 20%, transparent); text-align: center; min-width: 3rem; }
+  .avail-grid th { position: sticky; z-index: 2; padding: 0.2rem 0.25rem; font-size: 0.65rem; white-space: nowrap; }
+  /* Two-row thead: dates stick to the top, the All/Clear quick-select row
+     stays directly under them. Approximations match the th paddings. */
+  .avail-grid thead tr:first-child th { top: 0; }
+  .avail-grid thead tr:nth-child(2) th { top: 1.6rem; }
+  .avail-grid th.row-header { left: 0; z-index: 3; background: var(--color-base-200); font-size: 0.6rem; padding: 0.15rem 0.3rem; }
+  .avail-grid thead th { background: var(--color-base-200); }
+  /* Scoped to row 1: the timezone corner spans both rows, so in row 2 :first-child
+     is the first date's All/Clear cell, which must not out-stack the sticky
+     left column it scrolls under. */
+  .avail-grid thead tr:first-child th:first-child { z-index: 4; }
+  .avail-cell { width: 3rem; height: 2rem; cursor: pointer; transition: background-color 0.05s; }
+  @media (min-width: 768px) {
+    .avail-grid th,
+    .avail-grid td { min-width: 5rem; }
+    .avail-grid th { padding: 0.35rem 0.5rem; font-size: 0.75rem; }
+    .avail-grid thead tr:nth-child(2) th { top: 2rem; }
+    .avail-grid th.row-header { font-size: 0.75rem; padding: 0.35rem 0.5rem; }
+    .avail-cell { width: 5rem; height: 2.25rem; }
+  }
+  .avail-cell[data-state="available"] { background: var(--color-success); opacity: 0.6; }
+  .avail-cell[data-state="unselected"] { background: var(--color-base-300); }
+  /* Unselectable cells get a diagonal-stripe overlay so they remain
+     unmistakable from "unselected" cells in both light and dark themes. */
+  .avail-cell.cell-blocked,
+  .avail-cell.cell-inactive {
+    cursor: not-allowed;
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0,
+      transparent 4px,
+      color-mix(in oklch, var(--color-base-content) 30%, transparent) 4px,
+      color-mix(in oklch, var(--color-base-content) 30%, transparent) 5px
+    );
+  }
+  .avail-cell.cell-blocked { background-color: color-mix(in oklch, var(--color-error) 20%, var(--color-base-100)); }
+  .avail-cell.cell-inactive { background-color: var(--color-base-100); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto">
+  <div class="mb-4">
+    <a href="{% url 'events:event_detail' event.pk %}" class="link link-primary text-sm">&larr; Back to Event</a>
+  </div>
+
+  <div class="flex flex-wrap items-start justify-between gap-3 mb-2">
+    <div>
+      <h1 class="text-2xl font-bold mb-1">{{ grid.title }}</h1>
+      <p class="text-base-content/70">{{ event.title }} &mdash; {{ squad.name }}</p>
+    </div>
+    {% comment %}
+      Captains-only reminder control, mirroring the one in the squad availability actions
+      menu. It sits here because this is the page a captain is on when they notice the
+      sheet is thin, and the alternative is navigating back to the squad page to send it.
+    {% endcomment %}
+    {% comment %}
+      A paper plane, not the pencil this codebase uses for Edit -- on a page whose whole job
+      is editing, an Edit glyph on a "send a message" control is actively misleading.
+    {% endcomment %}
+    {% if can_manage_availability and grid.is_published and squad.discord_channel_id %}
+    {% if grid.in_notify_cooldown %}
+    <span class="btn btn-sm btn-outline btn-disabled shrink-0"
+          title="The squad was notified {{ grid.last_notified_at|timesince }} ago. You can re-post again shortly.">
+      Re-Post sent recently
+    </span>
+    {% else %}
+    <button type="button" class="btn btn-sm btn-outline shrink-0"
+            onclick="document.getElementById('repost-modal').showModal()">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+      </svg>
+      Re-Post to Discord
+    </button>
+    {% endif %}
+    {% endif %}
+  </div>
+
+  {% if can_manage_availability and grid.is_published and squad.discord_channel_id and not grid.in_notify_cooldown %}
+  <dialog id="repost-modal" class="modal">
+    <div class="modal-box">
+      <h3 class="font-bold text-lg">Re-post "{{ grid.title|default:'Availability Grid' }}"?</h3>
+      <p class="py-2 text-sm">
+        Posts a reminder to {{ squad.name }}'s Discord channel with a link to this sheet
+        {% if squad.team_discord_role %}and <strong>@-mentions the squad role</strong>{% endif %},
+        asking everyone to check their availability is still correct.
+        Nothing about the sheet or the responses changes.
+      </p>
+      {% if grid.last_notified_at %}
+      <p class="text-xs text-base-content/60">Squad last notified {{ grid.last_notified_at|timesince }} ago.</p>
+      {% endif %}
+      <div class="modal-action flex flex-wrap gap-2">
+        <form method="dialog" class="inline"><button class="btn btn-sm">Cancel</button></form>
+        <form method="post" action="{% url 'events:availability_repost' event.pk squad.pk grid.pk %}" class="inline">
+          {% csrf_token %}
+          <input type="hidden" name="return_to" value="respond">
+          <button type="submit" class="btn btn-sm btn-primary">Post reminder</button>
+        </form>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button>close</button></form>
+  </dialog>
+  {% endif %}
+
+  {% if race_verified_required and not user_is_race_ready %}
+  <div role="alert" class="alert alert-warning mb-4">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+    <div>
+      <h3 class="font-bold">Race Verified required</h3>
+      <div class="text-sm">This event requires <strong>Race Verified</strong> status before you can submit availability. <a href="{% url 'accounts:verification' %}" class="link">Complete your verification</a> to unlock submitting.</div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Toast -->
+  <div id="save-toast" class="toast toast-end toast-top hidden z-50">
+    <div id="save-toast-inner" class="alert">
+      <span id="save-toast-msg"></span>
+    </div>
+  </div>
+
+  {% comment %}
+    Captain-authored context, shown only when Expand Features is on. The description
+    renders markdown -- same trust level as an event description, since only someone
+    who can manage the squad can write it. The links are URLField-validated and get
+    rel="noopener" as they point off-site.
+  {% endcomment %}
+  {% if grid.expanded_features %}
+  {% if grid.description or grid.website_url or grid.course_url or grid.recon_url or grid.invite_url %}
+  <div class="card bg-base-200 shadow-md mb-4 p-4">
+    {% if grid.description %}
+    <div class="prose prose-sm max-w-none mb-3">{{ grid.description|render_markdown_untrusted }}</div>
+    {% endif %}
+    {% if grid.website_url or grid.course_url or grid.recon_url or grid.invite_url %}
+    <div class="flex flex-wrap gap-2">
+      {% if grid.website_url %}<a href="{{ grid.website_url }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline">Event website</a>{% endif %}
+      {% if grid.course_url %}<a href="{{ grid.course_url }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline">Course</a>{% endif %}
+      {% if grid.recon_url %}<a href="{{ grid.recon_url }}" target="_blank" rel="noopener" class="btn btn-sm btn-outline">Recon</a>{% endif %}
+      {% if grid.invite_url %}<a href="{{ grid.invite_url }}" target="_blank" rel="noopener" class="btn btn-sm btn-primary">Event invite</a>{% endif %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% endif %}
+
+  <!-- Optional Questions -->
+  {% if grid.max_races_question or grid.rest_days_question %}
+  <div class="card bg-base-200 shadow-md mb-4 p-4">
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+      {% if grid.max_races_question %}
+      <div class="form-control">
+        <label class="label" for="q-max-races">
+          <span class="label-text">What is the max number of races you would like to do? <span class="text-error">*</span></span>
+        </label>
+        <input type="number" id="q-max-races" min="0" max="365" step="1" class="input input-bordered input-sm w-32"
+               {% if existing_max_races is not None %}value="{{ existing_max_races }}"{% endif %}>
+      </div>
+      {% endif %}
+      {% if grid.rest_days_question %}
+      <div class="form-control">
+        <label class="label" for="q-rest-days">
+          <span class="label-text">How many days rest between races do you require? <span class="text-error">*</span></span>
+        </label>
+        <input type="number" id="q-rest-days" min="0" max="365" step="1" class="input input-bordered input-sm w-32"
+               {% if existing_rest_days is not None %}value="{{ existing_rest_days }}"{% endif %}>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endif %}
+
+  <p class="text-sm text-base-content/50 mb-4">
+    Click cells to mark when you are available. Striped cells cannot be selected.
+  </p>
+
+  <label class="label cursor-pointer gap-2 mb-3 py-0 justify-start">
+    <span class="text-base-content/70 text-sm">24 h</span>
+    <input type="checkbox" id="time-format-toggle" class="toggle toggle-sm" aria-label="Time format toggle (24 h / 12 h)">
+    <span class="text-base-content/70 text-sm">12 h</span>
+  </label>
+
+  {% if grid.single_slot %}
+  <div id="single-slot-answer" class="card bg-base-200 shadow-md mb-4 p-4">
+    <p class="text-sm text-base-content/70 mb-1">{{ single_slot_label }}</p>
+    <p class="font-semibold mb-3">I am available</p>
+    <div class="flex gap-2">
+      <button type="button" id="single-slot-yes" class="btn btn-sm">Yes</button>
+      <button type="button" id="single-slot-no" class="btn btn-sm">No</button>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Grid Container with scroll arrows on mobile -->
+  <div class="relative">
+    <button aria-label="Scroll the availability grid left" id="btn-scroll-left" class="md:hidden absolute left-0 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm btn-neutral opacity-70 active:opacity-100" style="display:none;">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    </button>
+    <button aria-label="Scroll the availability grid right" id="btn-scroll-right" class="md:hidden absolute right-0 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm btn-neutral opacity-70 active:opacity-100" style="display:none;">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+    </button>
+    <div id="grid-container" class="avail-grid-wrap mb-4"></div>
+  </div>
+
+  <!-- Legend -->
+  <div id="avail-legend" class="flex flex-wrap items-center gap-3 mb-4 text-sm">
+    <span class="text-base-content/70">Legend:</span>
+    <div class="flex items-center gap-1">
+      <span class="inline-block rounded avail-cell" data-state="available" style="width: 1.5rem; height: 1rem; cursor: default;"></span>
+      <span>Available</span>
+    </div>
+    <div class="flex items-center gap-1">
+      <span class="inline-block rounded avail-cell" data-state="unselected" style="width: 1.5rem; height: 1rem; cursor: default;"></span>
+      <span>Unselected</span>
+    </div>
+    {% comment %}
+    Both states are conditional on the built grid actually containing one. Blocked
+    cells come from the grid config, but "not in your timezone" only appears once the
+    client converts, and changes as the viewer's timezone does -- so buildGrid decides,
+    not the server. Hidden until it says otherwise.
+    {% endcomment %}
+    <div class="flex items-center gap-1 hidden" data-legend-for="cell-blocked">
+      <span class="inline-block rounded avail-cell cell-blocked" style="width: 1.5rem; height: 1rem; cursor: default;"></span>
+      <span>Blocked</span>
+    </div>
+    <div class="flex items-center gap-1 hidden" data-legend-for="cell-inactive">
+      <span class="inline-block rounded avail-cell cell-inactive" style="width: 1.5rem; height: 1rem; cursor: default;"></span>
+      <span>Not in your timezone</span>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="flex flex-wrap items-center gap-2 mb-6">
+    <button id="btn-submit" class="btn btn-success btn-sm">Submit Availability</button>
+    <a href="{% url 'events:availability_results' event.pk squad.pk grid.pk %}" class="btn btn-outline btn-sm">View Results</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{{ display_dates_json|json_script:"display-dates" }}
+{{ display_time_slots_json|json_script:"display-time-slots" }}
+{{ display_blocked_json|json_script:"display-blocked" }}
+{{ existing_local_keys_json|json_script:"existing-local-keys" }}
+{{ cell_utc_map_json|json_script:"cell-utc-map" }}
+{{ valid_cells_json|json_script:"valid-cells" }}
+<script>
+(function() {
+  var CSRF_TOKEN = '{{ csrf_token }}';
+  var EVENT_DETAIL_URL = '{% url "events:event_detail" event.pk %}';
+  var RACE_VERIFIED_BLOCKED = {% if race_verified_required and not user_is_race_ready %}true{% else %}false{% endif %};
+  var dates = JSON.parse(document.getElementById('display-dates').textContent);
+  var timeSlots = JSON.parse(document.getElementById('display-time-slots').textContent);
+  var blockedKeys = JSON.parse(document.getElementById('display-blocked').textContent);
+  var existingLocalKeys = JSON.parse(document.getElementById('existing-local-keys').textContent);
+  var cellUtcMap = JSON.parse(document.getElementById('cell-utc-map').textContent);
+  var validCellsList = JSON.parse(document.getElementById('valid-cells').textContent);
+  var displayTimezone = '{{ display_timezone }}';
+
+  var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  var DAY_SHORT = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+  var MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var isMobile = window.innerWidth < 768;
+  window.addEventListener('resize', function() { isMobile = window.innerWidth < 768; });
+
+  // Time format toggle (24h / 12h). Persists in localStorage so the rider's
+  // preference sticks across visits. formatTimeForDisplay() is called every
+  // time a row header is created and again when the toggle flips.
+  var TIME_FORMAT_KEY = 'availability.time_format';
+  function currentTimeFormat() {
+    try {
+      var stored = window.localStorage.getItem(TIME_FORMAT_KEY);
+      return stored === '12' ? '12' : '24';
+    } catch (e) { return '24'; }
+  }
+  function formatTimeForDisplay(hhmm) {
+    if (currentTimeFormat() !== '12') return hhmm;
+    var parts = hhmm.split(':');
+    var h = parseInt(parts[0], 10);
+    var m = parts[1];
+    var period = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12 === 0 ? 12 : h % 12;
+    return h12 + ':' + m + ' ' + period;
+  }
+  function applyTimeFormat() {
+    document.querySelectorAll('.row-header[data-raw-time]').forEach(function(th) {
+      th.textContent = formatTimeForDisplay(th.dataset.rawTime);
+    });
+  }
+  var timeFormatToggle = document.getElementById('time-format-toggle');
+  if (timeFormatToggle) {
+    timeFormatToggle.checked = currentTimeFormat() === '12';
+    timeFormatToggle.addEventListener('change', function() {
+      var v = timeFormatToggle.checked ? '12' : '24';
+      try { window.localStorage.setItem(TIME_FORMAT_KEY, v); } catch (e2) {}
+      applyTimeFormat();
+    });
+  }
+
+  var gridContainer = document.getElementById('grid-container');
+  var btnScrollLeft = document.getElementById('btn-scroll-left');
+  var btnScrollRight = document.getElementById('btn-scroll-right');
+
+  // Build blocked set for fast lookup
+  var blockedSet = {};
+  blockedKeys.forEach(function(k) { blockedSet[k] = true; });
+
+  // Build valid cells set
+  var validSet = {};
+  validCellsList.forEach(function(k) { validSet[k] = true; });
+
+  // Build existing set from local keys
+  var selectedSet = {};
+  existingLocalKeys.forEach(function(k) { selectedSet[k] = true; });
+
+  function parseDateStr(s) {
+    var parts = s.split('-');
+    return new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+  }
+
+  function cellKey(date, time) { return date + '|' + time; }
+
+  // Drag state
+  var isDragging = false;
+  var paintMode = '';
+
+  function buildGrid() {
+    var table = document.createElement('table');
+    table.className = 'avail-grid';
+
+    // Header row
+    var thead = document.createElement('thead');
+    var headerRow = document.createElement('tr');
+    var cornerTh = document.createElement('th');
+    cornerTh.className = 'row-header';
+    cornerTh.textContent = displayTimezone;
+    headerRow.appendChild(cornerTh);
+
+    // One time slot means one cell per column, so "All / Clear" would just be a
+    // slower way to click that cell. Dropping the row also removes the empty corner
+    // beneath the timezone label, which read as a selectable cell.
+    var showQuickSelect = timeSlots.length > 1;
+    if (showQuickSelect) {
+      // Span both header rows rather than leaving a second, empty corner cell.
+      cornerTh.rowSpan = 2;
+    }
+
+    dates.forEach(function(date) {
+      var th = document.createElement('th');
+      var d = parseDateStr(date);
+      var dayLabel = isMobile ? DAY_SHORT[d.getDay()] : DAY_NAMES[d.getDay()];
+      var dateLabel = MONTH_NAMES[d.getMonth()] + ' ' + d.getDate();
+      th.innerHTML = dayLabel + '<br>' + dateLabel;
+      headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+
+    // Quick-select row
+    var quickRow = document.createElement('tr');
+    dates.forEach(function(date) {
+      var th = document.createElement('th');
+      th.style.padding = '0.2rem 0.25rem';
+      var btnAll = document.createElement('button');
+      btnAll.className = 'btn btn-success btn-xs px-1 mr-0.5';
+      btnAll.textContent = 'All';
+      btnAll.style.minHeight = '0';
+      btnAll.style.height = '1.25rem';
+      btnAll.style.fontSize = '0.65rem';
+      btnAll.addEventListener('click', function() { selectColumn(date, true); });
+      var btnNone = document.createElement('button');
+      btnNone.className = 'btn btn-ghost btn-xs px-1';
+      btnNone.textContent = 'Clear';
+      btnNone.style.minHeight = '0';
+      btnNone.style.height = '1.25rem';
+      btnNone.style.fontSize = '0.65rem';
+      btnNone.addEventListener('click', function() { selectColumn(date, false); });
+      th.appendChild(btnAll);
+      th.appendChild(btnNone);
+      quickRow.appendChild(th);
+    });
+    if (showQuickSelect) { thead.appendChild(quickRow); }
+    table.appendChild(thead);
+
+    // Body rows
+    var tbody = document.createElement('tbody');
+    timeSlots.forEach(function(time) {
+      var tr = document.createElement('tr');
+      var rowTh = document.createElement('th');
+      rowTh.className = 'row-header';
+      rowTh.dataset.rawTime = time;
+      rowTh.textContent = formatTimeForDisplay(time);
+      tr.appendChild(rowTh);
+
+      dates.forEach(function(date) {
+        var td = document.createElement('td');
+        var key = cellKey(date, time);
+        td.className = 'avail-cell';
+        td.dataset.key = key;
+
+        // Store UTC coordinates from the cell map
+        var utcData = cellUtcMap[key];
+        if (utcData) {
+          td.dataset.utcDate = utcData.date;
+          td.dataset.utcTime = utcData.time;
+        }
+
+        if (blockedSet[key]) {
+          td.classList.add('cell-blocked');
+          td.dataset.state = 'blocked';
+        } else if (!validSet[key]) {
+          // Grid edge gap from timezone conversion
+          td.classList.add('cell-inactive');
+          td.dataset.state = 'inactive';
+        } else {
+          td.dataset.state = selectedSet[key] ? 'available' : 'unselected';
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+
+    gridContainer.innerHTML = '';
+    gridContainer.appendChild(table);
+    attachGridEvents(table);
+    syncLegend(table);
+  }
+
+  // Show a legend entry only when the grid has a cell in that state. Re-run on every
+  // build, since switching timezone can add or remove the inactive edge cells.
+  function syncLegend(table) {
+    document.querySelectorAll('[data-legend-for]').forEach(function(item) {
+      var present = !!table.querySelector('.' + item.dataset.legendFor);
+      item.classList.toggle('hidden', !present);
+    });
+  }
+
+  function attachGridEvents(table) {
+    table.addEventListener('mousedown', function(e) {
+      var td = e.target.closest('.avail-cell');
+      if (!td || td.classList.contains('cell-blocked') || td.classList.contains('cell-inactive')) return;
+      e.preventDefault();
+      isDragging = true;
+      var newState = td.dataset.state === 'available' ? 'unselected' : 'available';
+      td.dataset.state = newState;
+      selectedSet[td.dataset.key] = newState === 'available';
+      paintMode = newState;
+    });
+
+    table.addEventListener('mouseover', function(e) {
+      if (!isDragging) return;
+      var td = e.target.closest('.avail-cell');
+      if (!td || td.classList.contains('cell-blocked') || td.classList.contains('cell-inactive')) return;
+      td.dataset.state = paintMode;
+      selectedSet[td.dataset.key] = paintMode === 'available';
+    });
+
+    document.addEventListener('mouseup', function() { isDragging = false; });
+
+    table.addEventListener('touchstart', function(e) {
+      var td = e.target.closest('.avail-cell');
+      if (!td || td.classList.contains('cell-blocked') || td.classList.contains('cell-inactive')) return;
+      e.preventDefault();
+      isDragging = true;
+      var newState = td.dataset.state === 'available' ? 'unselected' : 'available';
+      td.dataset.state = newState;
+      selectedSet[td.dataset.key] = newState === 'available';
+      paintMode = newState;
+    }, { passive: false });
+
+    table.addEventListener('touchmove', function(e) {
+      if (!isDragging) return;
+      e.preventDefault();
+      var touch = e.touches[0];
+      var el = document.elementFromPoint(touch.clientX, touch.clientY);
+      var td = el ? el.closest('.avail-cell') : null;
+      if (!td || td.classList.contains('cell-blocked') || td.classList.contains('cell-inactive')) return;
+      td.dataset.state = paintMode;
+      selectedSet[td.dataset.key] = paintMode === 'available';
+    }, { passive: false });
+
+    table.addEventListener('touchend', function() { isDragging = false; });
+  }
+
+  function selectColumn(date, selectAll) {
+    gridContainer.querySelectorAll('.avail-cell').forEach(function(td) {
+      var key = td.dataset.key;
+      if (!key || !key.startsWith(date + '|')) return;
+      if (td.classList.contains('cell-blocked') || td.classList.contains('cell-inactive')) return;
+      var newState = selectAll ? 'available' : 'unselected';
+      td.dataset.state = newState;
+      selectedSet[key] = selectAll;
+    });
+  }
+
+  function showToast(msg, isError) {
+    var toast = document.getElementById('save-toast');
+    var inner = document.getElementById('save-toast-inner');
+    var msgEl = document.getElementById('save-toast-msg');
+    msgEl.textContent = msg;
+    inner.className = 'alert ' + (isError ? 'alert-error' : 'alert-success');
+    toast.classList.remove('hidden');
+    setTimeout(function() { toast.classList.add('hidden'); }, 4000);
+  }
+
+  // Submit — read UTC coordinates from data attributes
+  var btnSubmit = document.getElementById('btn-submit');
+  var maxRacesInput = document.getElementById('q-max-races');
+  var restDaysInput = document.getElementById('q-rest-days');
+
+  btnSubmit.addEventListener('click', function() {
+    // Race Verified gate — mirrors the server-side enforcement so the rider
+    // gets an immediate, clear reason instead of a rejected network request.
+    if (RACE_VERIFIED_BLOCKED) {
+      showToast('You must be Race Verified to submit availability for this event.', true);
+      return;
+    }
+
+    // Validate required questions
+    if (maxRacesInput && maxRacesInput.value === '') {
+      showToast('Please answer: max number of races.', true);
+      maxRacesInput.focus();
+      return;
+    }
+    if (restDaysInput && restDaysInput.value === '') {
+      showToast('Please answer: rest days between races.', true);
+      restDaysInput.focus();
+      return;
+    }
+
+    var availableCells = [];
+    gridContainer.querySelectorAll('.avail-cell').forEach(function(td) {
+      if (td.dataset.state === 'available' && td.dataset.utcDate && td.dataset.utcTime) {
+        availableCells.push({ date: td.dataset.utcDate, time: td.dataset.utcTime });
+      }
+    });
+
+    var payload = { available_cells: availableCells };
+    if (maxRacesInput) payload.max_races = parseInt(maxRacesInput.value);
+    if (restDaysInput) payload.rest_days = parseInt(restDaysInput.value);
+
+    btnSubmit.disabled = true;
+    btnSubmit.textContent = 'Submitting...';
+
+    fetch(window.location.pathname, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': CSRF_TOKEN
+      },
+      body: JSON.stringify(payload)
+    })
+    .then(function(resp) {
+      return resp.json().then(function(data) { return { ok: resp.ok, data: data }; });
+    })
+    .then(function(result) {
+      if (result.ok) {
+        showToast('Availability saved!', false);
+        setTimeout(function() { window.location.href = EVENT_DETAIL_URL; }, 800);
+      } else {
+        showToast(result.data.error || 'Save failed.', true);
+        btnSubmit.disabled = false;
+        btnSubmit.textContent = 'Submit Availability';
+      }
+    })
+    .catch(function() {
+      showToast('Network error. Please try again.', true);
+      btnSubmit.disabled = false;
+      btnSubmit.textContent = 'Submit Availability';
+    });
+  });
+
+  // --- Scroll arrows ---
+  function getColumnWidth() {
+    var cell = gridContainer.querySelector('.avail-cell');
+    return cell ? cell.offsetWidth : 60;
+  }
+
+  function updateScrollArrows() {
+    var sl = gridContainer.scrollLeft;
+    var maxScroll = gridContainer.scrollWidth - gridContainer.clientWidth;
+    btnScrollLeft.style.display = sl > 0 ? '' : 'none';
+    btnScrollRight.style.display = sl < maxScroll - 1 ? '' : 'none';
+  }
+
+  btnScrollLeft.addEventListener('click', function() {
+    gridContainer.scrollBy({ left: -getColumnWidth(), behavior: 'smooth' });
+  });
+  btnScrollRight.addEventListener('click', function() {
+    gridContainer.scrollBy({ left: getColumnWidth(), behavior: 'smooth' });
+  });
+  gridContainer.addEventListener('scroll', updateScrollArrows);
+
+  buildGrid();
+
+  // Single-slot grids render as one Yes/No question. The grid is still built -- and
+  // still hidden -- so its single cell carries the UTC date/time the submit path reads,
+  // which means nothing about saving or reporting changes for these grids.
+  var singleSlotAnswer = document.getElementById('single-slot-answer');
+  if (singleSlotAnswer) {
+    var gridWrap = gridContainer.closest('.relative') || gridContainer;
+    gridWrap.classList.add('hidden');
+    var legend = document.getElementById('avail-legend');
+    if (legend) { legend.classList.add('hidden'); }
+
+    var yesBtn = document.getElementById('single-slot-yes');
+    var noBtn = document.getElementById('single-slot-no');
+
+    function singleCell() {
+      return gridContainer.querySelector('.avail-cell[data-utc-date]');
+    }
+    function paintAnswer() {
+      var cell = singleCell();
+      var available = cell && cell.dataset.state === 'available';
+      yesBtn.classList.toggle('btn-success', !!available);
+      yesBtn.classList.toggle('btn-outline', !available);
+      noBtn.classList.toggle('btn-error', available === false && !!cell);
+      noBtn.classList.toggle('btn-outline', !(available === false && !!cell));
+    }
+    function setAnswer(available) {
+      var cell = singleCell();
+      if (!cell) { return; }
+      cell.dataset.state = available ? 'available' : 'unselected';
+      paintAnswer();
+    }
+    yesBtn.addEventListener('click', function () { setAnswer(true); });
+    noBtn.addEventListener('click', function () { setAnswer(false); });
+    paintAnswer();
+  }
+  updateScrollArrows();
+})();
+</script>
+{% endblock %}

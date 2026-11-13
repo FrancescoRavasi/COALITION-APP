@@ -1,0 +1,287 @@
+<nav id="main-drawer-side" aria-label="Main" class="bg-base-200 w-64 h-full flex flex-col overflow-y-auto">
+    <!-- Navigation Menu -->
+    <ul class="menu p-4 flex-1">
+        <!-- Main Navigation -->
+        <li class="menu-title">Navigation</li>
+        <li>
+            <a href="{% url 'home' %}" {% if request.resolver_match.url_name == 'home' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+                </svg>
+                Home
+            </a>
+        </li>
+        {% if not user.is_authenticated %}
+        {% if config.ABOUT_URL %}
+        <li>
+            <a href="{{ config.ABOUT_URL }}" target="_blank" rel="noopener">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                About
+            </a>
+        </li>
+        {% endif %}
+        {% if config.CONTACT_URL %}
+        <li>
+            <a href="{{ config.CONTACT_URL }}" target="_blank" rel="noopener">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                </svg>
+                Contact
+            </a>
+        </li>
+        {% endif %}
+        {% endif %}
+        {% if user.is_authenticated %}
+        <li>
+            <a href="{% url 'events:event_list' %}" {% if request.resolver_match.namespace == 'events' and request.resolver_match.url_name != 'all_races' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                Calendar
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'team:roster' %}" {% if request.resolver_match.url_name == 'roster' or request.resolver_match.url_name == 'roster_table' or request.resolver_match.url_name == 'filtered_roster' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+                Team Roster
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'team:links' %}" {% if request.resolver_match.url_name == 'links' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                </svg>
+                Team Links
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'team:team_feed' %}" {% if request.resolver_match.url_name == 'team_feed' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                Team Feed
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'club_strava:activity_list' %}" {% if request.resolver_match.namespace == 'club_strava' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                Strava Activities
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'zwiftpower:team_results' %}" {% if request.resolver_match.url_name == 'team_results' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-6a1 1 0 011-1h4a1 1 0 011 1v6m-4 0V7m-6 10h16" />
+                </svg>
+                Team Results
+            </a>
+        </li>
+
+        <!-- Racing Section -->
+        <li class="menu-title mt-4">Racing</li>
+        <li>
+            <a href="{% url 'events:all_races' %}" {% if request.resolver_match.url_name == 'all_races' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 21v-4m0 0V5a2 2 0 012-2h6l1 2h6v8h-7l-1-2H5a2 2 0 00-2 2z" />
+                </svg>
+                Sch. Races
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'ttt_planner:list' %}" {% if request.resolver_match.namespace == 'ttt_planner' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                TTT Planner
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'ladder_planner:list' %}" {% if request.resolver_match.namespace == 'ladder_planner' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+                </svg>
+                Ladder Planner
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'routes:list' %}" {% if request.resolver_match.namespace == 'routes' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
+                </svg>
+                Routes
+            </a>
+        </li>
+        <li>
+            <a href="https://zwiftspeedlab.coalitionracing.com" target="_blank" rel="noopener">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                SpeedLab
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5 ml-auto opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+            </a>
+        </li>
+
+        <!-- CMS Pages (dynamic) -->
+        {% if cms_nav_pages %}
+        <li class="menu-title mt-4">Pages</li>
+        {% for cms_page in cms_nav_pages %}
+        <li>
+            <a href="{{ cms_page.get_absolute_url }}" {% if request.path == cms_page.get_absolute_url %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                {{ cms_page.display_nav_title }}
+            </a>
+        </li>
+        {% endfor %}
+        {% endif %}
+
+        <!-- Captains Section (conditional) -->
+        {% if user.is_any_captain or user.is_link_admin %}
+        <li class="menu-title mt-4">Captains</li>
+        {% if user.is_link_admin or user.is_any_captain %}
+        <li>
+            <a href="{% url 'team:submit_link' %}" {% if request.resolver_match.url_name == 'submit_link' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                </svg>
+                Submit Link
+            </a>
+        </li>
+        {% endif %}
+        {% if user.is_any_captain %}
+        <li>
+            <a href="{% url 'data_connection:connection_list' %}" {% if request.resolver_match.namespace == 'data_connection' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+                </svg>
+                Spreadsheets
+            </a>
+        </li>
+        {% endif %}
+        {% endif %}
+
+        <!-- Membership Section (conditional) -->
+        {# Every view in this section requires membership_admin and raises 403, so captains #}
+        {# must not be offered it: the old condition drew the whole menu for a captain #}
+        {# and every link in it refused them. #}
+        {% if user.is_membership_admin %}
+        <li class="menu-title mt-4">Membership</li>
+        <li>
+            <a href="{% url 'team:application_list' %}" {% if request.resolver_match.url_name == 'application_list' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                Registrations
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'team:discord_review' %}" {% if request.resolver_match.url_name == 'discord_review' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Discord Review
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'team:zwift_connections' %}" {% if request.resolver_match.url_name == 'zwift_connections' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 010 5.656l-3 3a4 4 0 01-5.656-5.656l1.5-1.5m6.656-6.656l1.5-1.5a4 4 0 015.656 5.656l-3 3a4 4 0 01-5.656 0" />
+                </svg>
+                Zwift Connections
+            </a>
+        </li>
+        {% endif %}
+
+        <!-- Team Performance Section (conditional) -->
+        {% if user.can_approve_verification or user.is_performance_verification_team %}
+        <li class="menu-title mt-4">Team Performance</li>
+        {% if user.can_approve_verification %}
+        <li>
+            <a href="{% url 'team:verification_records' %}" {% if request.resolver_match.url_name == 'verification_records' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                Verification Records
+                {% if pending_verification_count %}
+                <span class="badge badge-warning badge-xs ml-auto">{{ pending_verification_count }}</span>
+                {% endif %}
+            </a>
+        </li>
+        {% endif %}
+        {% if user.is_performance_verification_team %}
+        <li>
+            <a href="{% url 'team:performance_review' %}" {% if request.resolver_match.url_name == 'performance_review' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                Performance Review
+            </a>
+        </li>
+        {% endif %}
+        {% endif %}
+
+        <!-- Admin Section (conditional) -->
+        {% if user.is_app_admin or user.is_superuser %}
+        <li class="menu-title mt-4">Admin</li>
+        <!-- Configuration Submenu -->
+        <li>
+            <details {% if 'config' in request.path %}open{% endif %}>
+                <summary>
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                    Configuration
+                </summary>
+                <ul>
+                    <li><a href="{% url 'config_section_page' 'site_settings' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'site_settings' in request.path %}class="menu-active" aria-current="page"{% endif %}>Site Settings</a></li>
+                    <li><a href="{% url 'config_section_page' 'social_links' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'social_links' in request.path %}class="menu-active" aria-current="page"{% endif %}>Social Links</a></li>
+                    <li><a href="{% url 'config_section_page' 'discord_guild' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'discord_guild' in request.path %}class="menu-active" aria-current="page"{% endif %}>Discord Guild</a></li>
+                    <li><a href="{% url 'config_section_page' 'zwift_credentials' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'zwift_credentials' in request.path %}class="menu-active" aria-current="page"{% endif %}>Zwift Credentials</a></li>
+                    <li><a href="{% url 'config_section_page' 'zwift_racing_app' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'zwift_racing_app' in request.path %}class="menu-active" aria-current="page"{% endif %}>Zwift Racing App</a></li>
+                    <li><a href="{% url 'config_section_page' 'user_api' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'user_api' in request.path %}class="menu-active" aria-current="page"{% endif %}>User API</a></li>
+                    <li><a href="{% url 'config_section_page' 'permission_mappings' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'permission_mappings' in request.path %}class="menu-active" aria-current="page"{% endif %}>Permissions</a></li>
+                    <li><a href="{% url 'config_section_page' 'verification_settings' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'verification_settings' in request.path %}class="menu-active" aria-current="page"{% endif %}>Verification</a></li>
+                    <li><a href="{% url 'config_section_page' 'equipment' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'equipment' in request.path %}class="menu-active" aria-current="page"{% endif %}>Equipment</a></li>
+                    <li><a href="{% url 'config_section_page' 'team_kit' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'team_kit' in request.path %}class="menu-active" aria-current="page"{% endif %}>Team Kit</a></li>
+                    <li><a href="{% url 'config_section_page' 'registration' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'registration' in request.path %}class="menu-active" aria-current="page"{% endif %}>Registration</a></li>
+                    <li><a href="{% url 'config_section_page' 'seo_settings' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'seo_settings' in request.path %}class="menu-active" aria-current="page"{% endif %}>SEO Settings</a></li>
+                    <li><a href="{% url 'config_section_page' 'google_settings' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'google_settings' in request.path %}class="menu-active" aria-current="page"{% endif %}>Google Settings</a></li>
+                    <li><a href="{% url 'config_section_page' 'strava' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'strava' in request.path %}class="menu-active" aria-current="page"{% endif %}>Strava</a></li>
+                    <li><a href="{% url 'config_section_page' 'events' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'events' in request.path %}class="menu-active" aria-current="page"{% endif %}>Events</a></li>
+                    <li><a href="{% url 'config_section_page' 'site_images' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'site_images' in request.path %}class="menu-active" aria-current="page"{% endif %}>Site Images</a></li>
+                    <li><a href="{% url 'config_section_page' 'background_tasks' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'background_tasks' in request.path %}class="menu-active" aria-current="page"{% endif %}>Background Tasks</a></li>
+                    <li><a href="{% url 'config_section_page' 'compliance' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'compliance' in request.path %}class="menu-active" aria-current="page"{% endif %}>Compliance</a></li>
+                    <li><a href="{% url 'config_section_page' 'scheduler' %}" {% if request.resolver_match.url_name == 'config_section_page' and 'scheduler' in request.path %}class="menu-active" aria-current="page"{% endif %}>Scheduler</a></li>
+                </ul>
+            </details>
+        </li>
+        <li>
+            <a href="{% url 'cms:page_list' %}" {% if request.resolver_match.namespace == 'cms' and request.resolver_match.url_name == 'page_list' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                Manage Pages
+            </a>
+        </li>
+        <li>
+            <a href="{% url 'analytics:dashboard' %}" {% if request.resolver_match.namespace == 'analytics' %}class="menu-active" aria-current="page"{% endif %}>
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                Analytics
+            </a>
+        </li>
+        {% endif %}
+        {% endif %}
+    </ul>
+</nav>

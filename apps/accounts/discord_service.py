@@ -1,0 +1,1029 @@
+"""Discord API service for sending direct messages and syncing roles."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import httpx
+import logfire
+from constance import config
+from django.core.cache import cache
+
+from gotta_bike_platform.log_utils import log_id
+
+if TYPE_CHECKING:
+    from apps.accounts.models import User
+
+DISCORD_API_BASE = "https://discord.com/api/v10"
+
+# Discord's own JSON error codes (the ``code`` in an error body) that tell a person what to
+# fix: https://discord.com/developers/docs/topics/opcodes-and-status-codes#json
+DISCORD_UNKNOWN_CHANNEL = 10003
+DISCORD_MISSING_ACCESS = 50001  # the bot cannot see the channel at all
+DISCORD_NON_TEXT_CHANNEL = 50008  # "Cannot send messages in a non-text channel"
+DISCORD_MISSING_PERMISSIONS = 50013  # it can see the channel but may not do this there
+
+
+@dataclass(frozen=True)
+class ChannelPostResult:
+    """What became of one channel message (``post_discord_channel_message``).
+
+    Attributes:
+        ok: The message was posted.
+        status_code: Discord's HTTP status, or None when nothing was sent or no answer came.
+        discord_code: The ``code`` in Discord's error body, such as 50001 (Missing Access) or
+            50013 (Missing Permissions); None when it gave none.
+        skipped: Why nothing was sent: ``"no_channel"`` or ``"no_token"``; ``""`` otherwise.
+
+    """
+
+    ok: bool
+    status_code: int | None = None
+    discord_code: int | None = None
+    skipped: str = ""
+
+
+def _discord_error(response: httpx.Response) -> tuple[int | None, str]:
+    """Read Discord's error code and message out of a failed response.
+
+    The message is Discord's own short text ("Missing Access"), never the content sent, so it
+    is safe to log. Anything that is not Discord's JSON error shape gives nothing.
+
+    Args:
+        response: The failed response.
+
+    Returns:
+        ``(code, message)``; ``(None, "")`` when the body says neither.
+
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return None, ""
+    if not isinstance(body, dict):
+        return None, ""
+    code = body.get("code")
+    return (code if isinstance(code, int) else None), str(body.get("message") or "")[:200]
+
+
+_BOT_USER_ID_CACHE_KEY = "discord_bot_user_id"
+_BOT_ROLE_IDS_CACHE_KEY = "discord_bot_role_ids"  # per-guild suffix appended
+_BOT_USER_ID_TTL = 60 * 60 * 24  # 24h — the bot's own id is stable
+_BOT_ROLE_IDS_TTL = 300  # 5 min
+
+
+def get_bot_user_id() -> str | None:
+    """Return the bot account's own Discord user id.
+
+    Cached for a day (the id never changes). Returns None when the bot token is
+    not configured or the lookup fails.
+
+    Returns:
+        The bot's user id as a string, or None.
+
+    """
+    cached = cache.get(_BOT_USER_ID_CACHE_KEY)
+    if cached:
+        return cached
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        return None
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{DISCORD_API_BASE}/users/@me",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+            response.raise_for_status()
+            user_id = str(response.json().get("id") or "")
+    except httpx.HTTPError as e:
+        logfire.error("Failed to fetch bot user id", error=str(e))
+        return None
+    if user_id:
+        cache.set(_BOT_USER_ID_CACHE_KEY, user_id, _BOT_USER_ID_TTL)
+    return user_id or None
+
+
+def get_bot_role_ids(*, force: bool = False) -> list[str] | None:
+    """Return the role ids the bot account holds in the configured guild.
+
+    Cached briefly. Returns None when the bot token / guild aren't configured or
+    the lookup fails (so callers can distinguish "unknown" from "no roles").
+
+    Args:
+        force: Skip the cache and re-fetch from Discord.
+
+    Returns:
+        List of role-id strings, or None if it can't be determined.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    guild_id = config.GUILD_ID
+    if not bot_token or not guild_id:
+        return None
+    cache_key = f"{_BOT_ROLE_IDS_CACHE_KEY}:{guild_id}"
+    if not force:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+    bot_user_id = get_bot_user_id()
+    if not bot_user_id:
+        return None
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{bot_user_id}",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+            response.raise_for_status()
+            roles = [str(r) for r in response.json().get("roles", [])]
+    except httpx.HTTPError as e:
+        logfire.error("Failed to fetch bot guild-member roles", guild_id=str(guild_id), error=str(e))
+        return None
+    cache.set(cache_key, roles, _BOT_ROLE_IDS_TTL)
+    return roles
+
+
+def bot_has_role(role_id: str | int, *, force: bool = False) -> bool | None:
+    """Whether the bot account holds the given role in the guild.
+
+    Args:
+        role_id: The Discord role id to check.
+        force: Skip the cache and re-fetch the bot's roles from Discord.
+
+    Returns:
+        True/False, or None if it can't be determined (unconfigured or API error).
+
+    """
+    role_id = str(role_id or "")
+    if not role_id or role_id == "0":
+        return None
+    roles = get_bot_role_ids(force=force)
+    if roles is None:
+        return None
+    return role_id in roles
+
+
+# Discord's own guidance is to wait the interval it names. Bounded, because a task holding a
+# worker open indefinitely is worse than one dropped message.
+_MAX_RATE_LIMIT_RETRIES = 3
+_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
+def _post_with_retry(client: httpx.Client, url: str, **kwargs) -> httpx.Response:
+    """POST to Discord, waiting out a 429 instead of treating it as a failure.
+
+    Opening a DM channel is itself rate limited, and the expiring-verification task sends in a
+    loop with only a short sleep between riders -- so on a busy threshold day the first few
+    succeed and the rest are refused. A 429 was indistinguishable from a real failure, and
+    each one cost a rider their warning.
+
+    Only 429 is retried. Any other status is returned as-is for the caller to raise on: a 403
+    (the rider has DMs closed) or a 404 will not improve by asking again.
+
+    Args:
+        client: An open httpx client.
+        url: The endpoint to post to.
+        **kwargs: Passed through to ``client.post``.
+
+    Returns:
+        The final response, which may still be an error status for the caller to raise on.
+
+    """
+    response = client.post(url, **kwargs)
+    for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+        if response.status_code != 429:
+            return response
+
+        # Discord puts retry_after in the JSON body (fractional seconds) and also sends a
+        # Retry-After header; prefer the body, fall back to the header, then to one second.
+        wait = None
+        try:
+            wait = float(response.json().get("retry_after"))
+        except (ValueError, TypeError, AttributeError):
+            header = response.headers.get("Retry-After")
+            if header:
+                try:
+                    wait = float(header)
+                except ValueError:
+                    wait = None
+        if wait is None:
+            wait = 1.0
+        wait = min(wait, _MAX_RETRY_AFTER_SECONDS)
+
+        logfire.warning(
+            "Discord rate limited, backing off",
+            url=url,
+            retry_after=wait,
+            attempt=attempt + 1,
+        )
+        time.sleep(wait)
+        response = client.post(url, **kwargs)
+    return response
+
+
+def send_discord_dm(discord_id: str, message: str) -> bool:
+    """Send a direct message to a Discord user.
+
+    A member who has opted out of DMs, or has left the Discord server, is skipped here, so
+    every caller gets the behaviour without having to know about it.
+
+    Args:
+        discord_id: The Discord user ID to send the message to.
+        message: The message content to send.
+
+    Returns:
+        True if there is nothing left to do -- the message was sent, or the member has opted
+        out or left the server. False only on an actual failure. A deliberate skip has to read
+        as success: callers use the return value to decide whether to retry and whether to
+        stamp "already warned", so returning False for a skip would re-send on every run.
+
+    """
+    # One gate for every DM the app sends. Enforced here rather than at the five call sites
+    # so a new caller cannot forget it.
+    from apps.accounts.membership import discord_id_has_left_guild
+    from apps.accounts.models import User
+
+    if User.objects.filter(discord_id=discord_id, discord_dm_opt_out=True).exists():
+        logfire.info("DM skipped: member has opted out of Discord DMs", discord_id=discord_id)
+        return True
+    # Someone who has left the team's server is no longer on the team: no reminders, notices
+    # or confirmations, whatever their account still holds. The guild sync's stamp decides it,
+    # as it decides access (apps.accounts.membership).
+    if discord_id_has_left_guild(discord_id):
+        logfire.info("DM skipped: member has left the Discord server", discord_id=discord_id)
+        return True
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping DM")
+        return False
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            # Step 1: Create a DM channel with the user
+            create_dm_response = _post_with_retry(
+                client,
+                f"{DISCORD_API_BASE}/users/@me/channels",
+                headers=headers,
+                json={"recipient_id": discord_id},
+            )
+            create_dm_response.raise_for_status()
+            channel_id = create_dm_response.json()["id"]
+
+            # Step 2: Send the message to the DM channel
+            send_response = _post_with_retry(
+                client,
+                f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+                headers=headers,
+                json={"content": message},
+            )
+            send_response.raise_for_status()
+
+            logfire.info("Discord DM sent successfully", discord_id=discord_id)
+            return True
+
+    except httpx.HTTPStatusError as e:
+        logfire.error(
+            "Failed to send Discord DM",
+            discord_id=discord_id,
+            status_code=e.response.status_code,
+            error=str(e),
+        )
+        return False
+    except httpx.RequestError as e:
+        logfire.error(
+            "Discord API request failed",
+            discord_id=discord_id,
+            error=str(e),
+        )
+        return False
+
+
+def send_discord_channel_message(
+    channel_id: str | int,
+    message: str,
+    *,
+    silent: bool = False,
+    allowed_user_ids: list[str] | None = None,
+    allowed_role_ids: list[str] | None = None,
+) -> bool:
+    """Send a message to a Discord channel.
+
+    The plain yes/no form of ``post_discord_channel_message``, for callers with nobody to
+    explain a failure to; that function logs Discord's reason either way.
+
+    Args:
+        channel_id: The Discord channel ID to send the message to.
+        message: The message content to send.
+        silent: If True, suppress push/desktop notifications for this message.
+        allowed_user_ids: Optional list of Discord user IDs whose @mentions should
+            actually trigger notifications. When provided, sets ``allowed_mentions``
+            to restrict pings to exactly those users (everyone/role mentions are
+            disabled unless ``allowed_role_ids`` is also provided).
+        allowed_role_ids: Optional list of Discord role IDs whose @mentions should
+            actually trigger notifications. When provided, ``allowed_mentions``
+            includes the listed roles so ``<@&role_id>`` syntax pings members of
+            those roles.
+
+    Returns:
+        True if the message was sent successfully, False otherwise.
+
+    """
+    return post_discord_channel_message(
+        channel_id,
+        message,
+        silent=silent,
+        allowed_user_ids=allowed_user_ids,
+        allowed_role_ids=allowed_role_ids,
+    ).ok
+
+
+def post_discord_channel_message(
+    channel_id: str | int,
+    message: str,
+    *,
+    silent: bool = False,
+    allowed_user_ids: list[str] | None = None,
+    allowed_role_ids: list[str] | None = None,
+) -> ChannelPostResult:
+    """Send a message to a Discord channel, and say what became of it.
+
+    On a refusal it logs, and returns, Discord's own error code, which tells "the bot cannot
+    see the channel" (50001) from "it can see it but may not post" (50013) -- the 403 alone
+    does not.
+
+    Args:
+        channel_id: The Discord channel ID to send the message to.
+        message: The message content to send.
+        silent: If True, suppress push/desktop notifications for this message.
+        allowed_user_ids: Discord user IDs whose @mentions should notify (see
+            ``send_discord_channel_message``).
+        allowed_role_ids: Discord role IDs whose @mentions should notify.
+
+    Returns:
+        The result: posted or not, with Discord's status and error code when it answered.
+
+    """
+    if not channel_id or channel_id == 0:
+        logfire.debug("Channel ID is 0 or not set, skipping channel message")
+        return ChannelPostResult(ok=False, skipped="no_channel")
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping channel message")
+        return ChannelPostResult(ok=False, skipped="no_token")
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json",
+    }
+
+    # Build message payload
+    payload: dict = {"content": message}
+    if silent:
+        # Flag 4096 (1 << 12) = SUPPRESS_NOTIFICATIONS
+        payload["flags"] = 4096
+    if allowed_user_ids is not None or allowed_role_ids is not None:
+        payload["allowed_mentions"] = {
+            "parse": [],
+            "users": allowed_user_ids or [],
+            "roles": allowed_role_ids or [],
+        }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            logfire.info("Discord channel message sent", channel_id=str(channel_id), silent=silent)
+            return ChannelPostResult(ok=True, status_code=response.status_code)
+
+    except httpx.HTTPStatusError as e:
+        discord_code, discord_message = _discord_error(e.response)
+        logfire.error(
+            "Failed to send Discord channel message",
+            channel_id=str(channel_id),
+            status_code=e.response.status_code,
+            discord_code=discord_code,
+            discord_message=discord_message,
+            error=str(e),
+        )
+        return ChannelPostResult(ok=False, status_code=e.response.status_code, discord_code=discord_code)
+    except httpx.RequestError as e:
+        logfire.error(
+            "Discord API request failed for channel message",
+            channel_id=str(channel_id),
+            error=str(e),
+        )
+        return ChannelPostResult(ok=False)
+
+
+def create_discord_thread(
+    channel_id: str | int,
+    name: str,
+    auto_archive_minutes: int = 4320,
+) -> tuple[int | None, str | None]:
+    """Create a public thread in a Discord text channel.
+
+    POSTs to ``/channels/{channel_id}/threads`` with ``type=11`` (GUILD_PUBLIC_THREAD).
+    Discord caps thread names at 100 characters; the name is truncated if longer.
+
+    Args:
+        channel_id: The parent Discord channel ID.
+        name: The thread name. Truncated to 100 characters.
+        auto_archive_minutes: Auto-archive duration in minutes. Allowed: 60, 1440, 4320, 10080.
+
+    Returns:
+        Tuple of (thread_id, error_message). On success, error_message is None.
+        On failure, thread_id is None and error_message describes the problem.
+
+    """
+    if not channel_id or channel_id == 0:
+        return None, "No Discord channel configured."
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        return None, "Discord bot token is not configured."
+
+    truncated_name = name[:100]
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "name": truncated_name,
+        "type": 11,
+        "auto_archive_duration": auto_archive_minutes,
+    }
+
+    with logfire.span("create_discord_thread", channel_id=str(channel_id), name=truncated_name):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.post(
+                    f"{DISCORD_API_BASE}/channels/{channel_id}/threads",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                thread_id = int(response.json()["id"])
+                logfire.info(
+                    "Discord thread created",
+                    channel_id=str(channel_id),
+                    thread_id=str(thread_id),
+                )
+                return thread_id, None
+        except httpx.HTTPStatusError as e:
+            try:
+                err_body = e.response.json()
+                err_msg = err_body.get("message") or str(e)
+            except ValueError:
+                err_msg = e.response.text or str(e)
+            logfire.error(
+                "Failed to create Discord thread",
+                channel_id=str(channel_id),
+                status_code=e.response.status_code,
+                error=err_msg,
+            )
+            return None, err_msg
+        except httpx.RequestError as e:
+            logfire.error(
+                "Discord API request failed for thread creation",
+                channel_id=str(channel_id),
+                error=str(e),
+            )
+            return None, f"Discord API request failed: {e}"
+
+
+def rename_discord_thread(thread_id: str | int, name: str) -> tuple[bool, str | None]:
+    """Rename an existing Discord thread.
+
+    PATCHes ``/channels/{thread_id}`` with a new ``name``. Discord caps thread
+    names at 100 characters; the name is truncated if longer. Note Discord rate
+    limits thread renames aggressively (~2 per 10 minutes per thread), so callers
+    should only rename when the name has actually changed.
+
+    Args:
+        thread_id: The Discord thread (channel) ID.
+        name: The new thread name. Truncated to 100 characters.
+
+    Returns:
+        Tuple of (success, error_message). On success, error_message is None.
+
+    """
+    return _patch_discord_thread(thread_id, {"name": name[:100]}, action="rename")
+
+
+def archive_discord_thread(thread_id: str | int) -> tuple[bool, str | None]:
+    """Archive (close) an existing Discord thread.
+
+    PATCHes ``/channels/{thread_id}`` with ``archived=true``. Archiving is
+    reversible — the thread keeps its history and URL, and posting in it (or an
+    explicit un-archive) reopens it.
+
+    Args:
+        thread_id: The Discord thread (channel) ID.
+
+    Returns:
+        Tuple of (success, error_message). On success, error_message is None.
+
+    """
+    return _patch_discord_thread(thread_id, {"archived": True}, action="archive")
+
+
+def _patch_discord_thread(
+    thread_id: str | int, payload: dict, *, action: str
+) -> tuple[bool, str | None]:
+    """PATCH a Discord thread's metadata (shared by rename/archive).
+
+    Args:
+        thread_id: The Discord thread (channel) ID.
+        payload: The JSON body to send (e.g. ``{"name": ...}`` or ``{"archived": True}``).
+        action: Short label used in log messages (e.g. "rename", "archive").
+
+    Returns:
+        Tuple of (success, error_message). On success, error_message is None.
+
+    """
+    if not thread_id or str(thread_id) == "0":
+        return False, "No Discord thread configured."
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        return False, "Discord bot token is not configured."
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json",
+    }
+
+    with logfire.span(f"{action}_discord_thread", thread_id=str(thread_id)):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.patch(
+                    f"{DISCORD_API_BASE}/channels/{thread_id}",
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                logfire.info(f"Discord thread {action}d", thread_id=str(thread_id))
+                return True, None
+        except httpx.HTTPStatusError as e:
+            try:
+                err_body = e.response.json()
+                err_msg = err_body.get("message") or str(e)
+            except ValueError:
+                err_msg = e.response.text or str(e)
+            logfire.error(
+                f"Failed to {action} Discord thread",
+                thread_id=str(thread_id),
+                status_code=e.response.status_code,
+                error=err_msg,
+            )
+            return False, err_msg
+        except httpx.RequestError as e:
+            logfire.error(
+                f"Discord API request failed for thread {action}",
+                thread_id=str(thread_id),
+                error=str(e),
+            )
+            return False, f"Discord API request failed: {e}"
+
+
+def delete_discord_thread(thread_id: str | int) -> tuple[bool, str | None]:
+    """Permanently delete a Discord thread and all of its messages.
+
+    DELETEs ``/channels/{thread_id}``. This is irreversible — callers should
+    clear any stored thread link afterward so it no longer points at a dead URL.
+
+    Args:
+        thread_id: The Discord thread (channel) ID.
+
+    Returns:
+        Tuple of (success, error_message). On success, error_message is None.
+
+    """
+    if not thread_id or str(thread_id) == "0":
+        return False, "No Discord thread configured."
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        return False, "Discord bot token is not configured."
+
+    headers = {"Authorization": f"Bot {bot_token}"}
+
+    with logfire.span("delete_discord_thread", thread_id=str(thread_id)):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.delete(
+                    f"{DISCORD_API_BASE}/channels/{thread_id}",
+                    headers=headers,
+                )
+                response.raise_for_status()
+                logfire.info("Discord thread deleted", thread_id=str(thread_id))
+                return True, None
+        except httpx.HTTPStatusError as e:
+            try:
+                err_body = e.response.json()
+                err_msg = err_body.get("message") or str(e)
+            except ValueError:
+                err_msg = e.response.text or str(e)
+            logfire.error(
+                "Failed to delete Discord thread",
+                thread_id=str(thread_id),
+                status_code=e.response.status_code,
+                error=err_msg,
+            )
+            return False, err_msg
+        except httpx.RequestError as e:
+            logfire.error(
+                "Discord API request failed for thread deletion",
+                thread_id=str(thread_id),
+                error=str(e),
+            )
+            return False, f"Discord API request failed: {e}"
+
+
+def send_verification_notification(
+    discord_id: str,
+    is_verified: bool,
+    verify_type: str,
+    review_note: str | None = None,
+) -> bool:
+    """Send a verification status notification to a user.
+
+    Args:
+        discord_id: The Discord user ID to notify.
+        is_verified: True if verified, False if rejected.
+        verify_type: The type of verification (e.g., "weight_full", "height").
+        review_note: Optional reviewer note.
+
+    Returns:
+        True if the message was sent successfully, False otherwise.
+
+    """
+    # Format verify type for display
+    type_display = verify_type.replace("_", " ").title()
+
+    if is_verified:
+        message = (
+            f"✅ **Verification Approved**\n\n"
+            f"Your **{type_display}** verification record has been approved.\n\n"
+            f"Thank you for completing the verification process!"
+        )
+        if review_note:
+            message += f"\n\n**Note:** {review_note}"
+    else:
+        message = (
+            f"❌ **Verification Rejected**\n\n"
+            f"Your **{type_display}** verification record has been rejected."
+        )
+        if review_note:
+            message += f"\n\n**Reason:** {review_note}"
+        message += "\n\nPlease submit a new verification record with the required corrections."
+
+    return send_discord_dm(discord_id, message)
+
+
+def get_channel(channel_id: str | int) -> dict | None:
+    """Fetch one channel, including its permission overwrites.
+
+    Args:
+        channel_id: The Discord channel ID.
+
+    Returns:
+        The channel object, or None if it could not be fetched.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping channel fetch")
+        return None
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{DISCORD_API_BASE}/channels/{channel_id}",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logfire.error(
+            "Failed to fetch Discord channel",
+            channel_id=str(channel_id),
+            status_code=e.response.status_code,
+            error=str(e),
+        )
+        return None
+    except httpx.RequestError as e:
+        logfire.error("Discord API request failed for channel fetch", channel_id=str(channel_id), error=str(e))
+        return None
+
+
+def get_guild_channels() -> list[dict] | None:
+    """Fetch every channel in the guild, each with its permission overwrites.
+
+    One request for the whole guild rather than one per channel: a page showing many squads
+    would otherwise make a Discord call per squad and hit rate limits for no reason.
+
+    Returns:
+        A list of channel objects, or None if they could not be fetched.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    guild_id = config.GUILD_ID
+    if not bot_token or not guild_id:
+        logfire.warning("Discord bot token or guild not configured, skipping channel list fetch")
+        return None
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/channels",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logfire.error(
+            "Failed to fetch Discord channel list",
+            status_code=e.response.status_code,
+            error=str(e),
+        )
+        return None
+    except httpx.RequestError as e:
+        logfire.error("Discord API request failed for channel list fetch", error=str(e))
+        return None
+
+
+def get_guild_roles() -> list[dict] | None:
+    """Fetch the guild's roles, including their permission bitfields.
+
+    ``DiscordRole`` mirrors names and positions but not ``permissions``, and the
+    permission bits are what decide whether a role can see a channel before any
+    channel-level overwrite applies -- so this reads them live.
+
+    Returns:
+        The guild's role objects, or None if they could not be fetched.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    guild_id = config.GUILD_ID
+    if not bot_token or not guild_id:
+        logfire.warning("Discord bot token or guild id not configured, skipping roles fetch")
+        return None
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/roles",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logfire.error("Failed to fetch Discord roles", status_code=e.response.status_code, error=str(e))
+        return None
+    except httpx.RequestError as e:
+        logfire.error("Discord API request failed for roles fetch", error=str(e))
+        return None
+
+
+def add_discord_role(discord_id: str, role_id: str) -> bool:
+    """Add a role to a Discord guild member.
+
+    Args:
+        discord_id: The Discord user ID.
+        role_id: The Discord role ID to add.
+
+    Returns:
+        True if the role was added successfully, False otherwise.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping role add")
+        return False
+
+    guild_id = config.GUILD_ID
+    if not guild_id:
+        logfire.warning("GUILD_ID not configured, skipping role add")
+        return False
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.put(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{discord_id}/roles/{role_id}",
+                headers=headers,
+            )
+            response.raise_for_status()
+
+            logfire.info(
+                "Discord role added",
+                discord_id=discord_id,
+                role_id=role_id,
+                guild_id=log_id(guild_id),
+            )
+            return True
+
+    except httpx.HTTPStatusError as e:
+        logfire.error(
+            "Failed to add Discord role",
+            discord_id=discord_id,
+            role_id=role_id,
+            status_code=e.response.status_code,
+            error=str(e),
+        )
+        return False
+    except httpx.RequestError as e:
+        logfire.error(
+            "Discord API request failed for role add",
+            discord_id=discord_id,
+            role_id=role_id,
+            error=str(e),
+        )
+        return False
+
+
+def remove_discord_role(discord_id: str, role_id: str) -> bool:
+    """Remove a role from a Discord guild member.
+
+    Args:
+        discord_id: The Discord user ID.
+        role_id: The Discord role ID to remove.
+
+    Returns:
+        True if the role was removed successfully, False otherwise.
+
+    """
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping role remove")
+        return False
+
+    guild_id = config.GUILD_ID
+    if not guild_id:
+        logfire.warning("GUILD_ID not configured, skipping role remove")
+        return False
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.delete(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{discord_id}/roles/{role_id}",
+                headers=headers,
+            )
+            # A 404 means the member is no longer in the guild (or the role no
+            # longer exists). Either way the desired end-state — the member does
+            # not have this role — already holds, so treat removal as a no-op
+            # success. This keeps removals idempotent for users who left the
+            # guild and lets callers clear their local role cache.
+            if response.status_code == 404:
+                logfire.warning(
+                    "Discord role remove skipped: member or role not found (already removed)",
+                    discord_id=discord_id,
+                    role_id=role_id,
+                    guild_id=log_id(guild_id),
+                )
+                return True
+
+            response.raise_for_status()
+
+            logfire.info(
+                "Discord role removed",
+                discord_id=discord_id,
+                role_id=role_id,
+                guild_id=log_id(guild_id),
+            )
+            return True
+
+    except httpx.HTTPStatusError as e:
+        logfire.error(
+            "Failed to remove Discord role",
+            discord_id=discord_id,
+            role_id=role_id,
+            status_code=e.response.status_code,
+            error=str(e),
+        )
+        return False
+    except httpx.RequestError as e:
+        logfire.error(
+            "Discord API request failed for role remove",
+            discord_id=discord_id,
+            role_id=role_id,
+            error=str(e),
+        )
+        return False
+
+
+def sync_user_discord_roles(user: User) -> bool:
+    """Fetch and sync Discord guild roles for a user.
+
+    Uses the bot token to fetch the user's guild member data from Discord API
+    and updates the user's discord_roles field.
+
+    Args:
+        user: The User object with discord_id set.
+
+    Returns:
+        True if roles were synced successfully, False otherwise.
+
+    """
+    if not user.discord_id:
+        logfire.warning("Cannot sync roles: user has no discord_id", user_id=user.id)
+        return False
+
+    bot_token = config.DISCORD_BOT_TOKEN
+    if not bot_token:
+        logfire.warning("DISCORD_BOT_TOKEN not configured, skipping role sync")
+        return False
+
+    guild_id = config.GUILD_ID
+    if not guild_id:
+        logfire.warning("GUILD_ID not configured, skipping role sync")
+        return False
+
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+    }
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            # Fetch guild member data
+            response = client.get(
+                f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user.discord_id}",
+                headers=headers,
+            )
+            response.raise_for_status()
+            member_data = response.json()
+
+        # Extract role IDs from member data
+        role_ids = member_data.get("roles", [])
+
+        # Look up role names from our DiscordRole model
+        from apps.team.models import DiscordRole
+
+        role_map: dict[str, str] = {}
+        for role_id in role_ids:
+            try:
+                role = DiscordRole.objects.get(role_id=role_id)
+                role_map[role_id] = role.name
+            except DiscordRole.DoesNotExist:
+                # Role not synced yet, use placeholder
+                role_map[role_id] = f"Unknown Role ({role_id})"
+
+        # Update user's discord_roles
+        user.discord_roles = role_map
+        user.save(update_fields=["discord_roles"])
+
+        logfire.info(
+            "Discord roles synced for user",
+            user_id=user.id,
+            discord_id=user.discord_id,
+            roles_count=len(role_map),
+        )
+        return True
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            logfire.warning(
+                "User not found in guild",
+                user_id=user.id,
+                discord_id=user.discord_id,
+                guild_id=log_id(guild_id),
+            )
+        else:
+            logfire.error(
+                "Failed to fetch guild member data",
+                user_id=user.id,
+                discord_id=user.discord_id,
+                status_code=e.response.status_code,
+                error=str(e),
+            )
+        return False
+    except httpx.RequestError as e:
+        logfire.error(
+            "Discord API request failed",
+            user_id=user.id,
+            discord_id=user.discord_id,
+            error=str(e),
+        )
+        return False

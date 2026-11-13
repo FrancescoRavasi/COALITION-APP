@@ -1,0 +1,431 @@
+{% load ttt_extras %}
+{# Roster table + results panel. Returned by every mutating endpoint. #}
+{% if result.riders %}
+{# ---- Pull schedule: what each rider rides, and the copies to share it in Discord ---- #}
+<section class="card bg-base-200 shadow-xl mb-6" aria-labelledby="ttt-schedule-heading">
+  <div class="card-body gap-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 id="ttt-schedule-heading" class="card-title">Pull schedule</h2>
+      {# Outside the can_edit gate: someone opening a shared link wants to share it as much as the owner does. #}
+      <div class="flex flex-wrap gap-1">
+        <button type="button" class="btn btn-neutral btn-xs" data-ttt-copy-text="ttt-discord-text"
+                aria-describedby="ttt-copy-status">Copy for Discord</button>
+        <button type="button" class="btn btn-ghost btn-xs ttt-capture-btn" data-ttt-capture-btn
+                aria-label="Copy the pull schedule as an image">Copy image</button>
+      </div>
+    </div>
+    <p class="text-sm text-base-content/70">
+      In pull order, at {{ result.target_speed_kph }} kph on the flat. After a pull a rider drops to the back and works
+      up the line a wheel at a time, 2nd being right behind the rider on the front. Each wheel column gives the watts to
+      hold the speed sitting in there and, below, how long the rider sits there each rotation: as long as the rider
+      that many places ahead pulls. Riders who take no pulls come through and swing straight off.
+    </p>
+    <div class="overflow-x-auto">
+      <table class="table table-sm table-pin-col">
+        <thead>
+          <tr>
+            <th scope="col">Rider</th>
+            <th scope="col" class="text-right">Pull (s)</th>
+            <th scope="col" class="text-right">Pull W/kg</th>
+            <th scope="col" class="text-right">Pull W</th>
+            {% for position in result.wheel_positions %}<th scope="col" class="text-right">{{ position|wheel_name }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for rr in result.riders %}
+          <tr>
+            <td class="font-medium whitespace-nowrap">{{ rr.rider.name }}</td>
+            {% if rr.rider.zero_pull or not rr.rider.pull_duration_s %}
+            <td class="text-right whitespace-nowrap">no pull</td><td class="text-right">—</td><td class="text-right">—</td>
+            {% else %}
+            <td class="text-right">{{ rr.rider.pull_duration_s }}</td>
+            <td class="text-right">{{ rr.pull_wkg|floatformat:1 }}</td>
+            <td class="text-right font-semibold">{{ rr.pull_power_w }}</td>
+            {% endif %}
+            {% for watts, seconds in rr.wheels %}
+            <td class="text-right">
+              <span aria-hidden="true">{{ watts }}<span class="block text-xs text-base-content/70 whitespace-nowrap">{{ seconds }} s</span></span>
+              <span class="sr-only">{{ watts }} watts for {{ seconds }} seconds</span>
+            </td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p id="ttt-copy-status" role="status" class="text-sm"></p>
+    <details>
+      <summary class="text-sm cursor-pointer w-fit">Show as text</summary>
+      {# Discord shows a code block in a monospace font, so the padded columns line up there (services/schedule.py). #}
+      <textarea id="ttt-discord-text" readonly rows="{{ result.riders|length|add:7 }}" spellcheck="false"
+                aria-label="Pull schedule as text for Discord"
+                class="textarea textarea-bordered w-full font-mono text-xs mt-2 whitespace-pre">{{ result|discord_schedule:plan }}</textarea>
+    </details>
+    {% comment %}
+      The capture stage for Copy image. html-to-image clones the target with its own computed
+      styles, so an off-screen offset on the sheet itself travels into the clone and the PNG
+      comes out blank -- verified. The offset therefore lives on this wrapper, which is not
+      part of the capture, leaving the sheet normally positioned. opacity is used rather than
+      visibility because visibility inherits and would blank the clone too.
+    {% endcomment %}
+    <div style="position:fixed; left:0; top:0; opacity:0; pointer-events:none; z-index:-1;" aria-hidden="true">
+    <div data-ttt-capture-sheet style="width:max-content; min-width:460px;"
+         class="bg-base-100 text-base-content p-4 rounded-box">
+      <div class="font-bold text-lg leading-tight">{{ plan.name|default:"TTT Plan" }}</div>
+      {% if plan.course_name or plan.route %}
+      <div class="text-sm text-base-content/70 mb-1">
+        {% if plan.course_name %}{{ plan.course_name }}{% else %}{{ plan.route.name }}{% endif %}
+      </div>
+      {% endif %}
+      <div class="text-sm text-base-content/70 mb-2">{{ result.target_speed_kph }} kph on the flat</div>
+      <table class="table table-sm">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Rider</th>
+            <th class="text-right">Pull (s)</th>
+            <th class="text-right">W/kg</th>
+            <th class="text-right">Pull W</th>
+            {% for position in result.wheel_positions %}<th class="text-right">{{ position|wheel_name }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for rr in result.riders %}
+          <tr>
+            <td class="text-base-content/70">{{ forloop.counter }}</td>
+            <td class="font-medium">{{ rr.rider.name }}</td>
+            {% if rr.rider.zero_pull or not rr.rider.pull_duration_s %}
+            <td class="text-right">no pull</td><td class="text-right">&mdash;</td><td class="text-right">&mdash;</td>
+            {% else %}
+            <td class="text-right">{{ rr.rider.pull_duration_s }}</td>
+            <td class="text-right">{{ rr.pull_wkg|floatformat:1 }}</td>
+            <td class="text-right font-semibold">{{ rr.pull_power_w }}</td>
+            {% endif %}
+            {% for watts in rr.wheel_powers %}<td class="text-right">{{ watts }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    </div>
+  </div>
+</section>
+{% endif %}
+
+{% if can_edit %}
+{% comment %}
+  Optimize carries out the goal set in Parameters, just above Pull Stats, which shows what it did.
+  The click sends the whole Parameters form, open or closed, so what is on screen there counts
+  even if a field's own save has not landed. Its answer replaces this block: the result below is
+  plain text, read out from #ttt-optimize-announcer outside the body, and focus goes back to the
+  new button (planner_detail.html).
+{% endcomment %}
+<div class="mb-6 space-y-2" data-ttt-optimize>
+  <button type="button" id="ttt-optimize" class="btn btn-accent btn-block"
+          hx-post="{% url 'ttt_planner:optimize' plan.pk %}"
+          hx-include="#ttt-params-form"
+          hx-target="#ttt-plan-body" hx-swap="innerHTML"
+          hx-on::confirm="tttConfirmOptimize(event)"
+          aria-describedby="ttt-goal-sentence"
+          {% if plan.speed_goal == "hold" and plan.pull_rule == "keep" %}disabled{% endif %}>Optimize</button>
+  <p class="text-sm">
+    <span id="ttt-goal-sentence">{{ goal_sentence }}</span>
+    <a href="#ttt-params" class="link whitespace-nowrap" data-ttt-open-params>Change in Parameters</a>
+  </p>
+  {% if optimized %}
+  <p class="text-sm rounded-box bg-base-200 p-3" data-ttt-optimize-result>{% include "ttt_planner/_optimize_message.html" %}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
+
+  {# ---- Pull Stats: the planning view of every rider's load ---- #}
+  <section class="xl:col-span-3 card bg-base-200 shadow-xl" aria-labelledby="ttt-stats-heading">
+    <div class="card-body">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 id="ttt-stats-heading" class="card-title">Pull Stats</h2>
+        {% if can_edit and result.riders %}
+        <button type="button" class="btn btn-ghost btn-xs"
+                hx-post="{% url 'ttt_planner:riders_remove_selected' plan.pk %}"
+                hx-include="[name='rider_ids']"
+                hx-target="#ttt-plan-body" hx-swap="innerHTML"
+                hx-confirm="Remove the selected riders?">Remove selected</button>
+        {% endif %}
+      </div>
+      {% if result.riders and result.status %}
+      {% with s=result.status %}
+      {# Whether the plan as it stands fits the limits, and who stops it going faster. #}
+      <div class="rounded-box bg-base-100 p-3 text-sm flex flex-wrap items-baseline gap-x-2 gap-y-1" data-ttt-fit>
+        {% if not s.judged %}
+          <span class="badge badge-ghost badge-sm">Not judged</span>
+          <p>Add an FTP to a rider to see whether the plan fits the limits.</p>
+        {% elif not s.anyone_pulls %}
+          <span class="badge badge-warning badge-sm">No pulls</span>
+          <p>Nobody is pulling. Give someone a pull length, or let Optimize set them.</p>
+        {% elif s.fits %}
+          <span class="badge badge-success badge-sm">Fits</span>
+          <p>
+            Every rider is inside the limits at {{ s.speed_kph }} kph.
+            {% if s.at_fastest %}That is the fastest these pull lengths allow{% elif s.fastest_kph %}These pull lengths allow up to {{ s.fastest_kph }} kph{% endif %}{% if s.held_back_by %}: any faster and {% include "ttt_planner/_held_back.html" %}{% endif %}.
+          </p>
+        {% else %}
+          <span class="badge badge-warning badge-sm">Over a limit</span>
+          <p>
+            At {{ s.speed_kph }} kph,
+            {% for r in s.over %}{% if not forloop.first %}{% if forloop.last %} and {% else %}, {% endif %}{% endif %}{{ r.rider.name }}
+              ({% if r.over_if %}IF {{ r.intensity_factor|floatformat:2 }}, limit {{ result.target_if|floatformat:2 }}{% elif r.w_prime_empty %}runs out of W′{% else %}W′ down to {{ r.w_prime_low_pct }}%, reserve {{ result.w_prime_reserve_pct }}%{% endif %}){% endfor %}
+            {% if s.over|length == 1 %}is{% else %}are{% endif %} past a limit.
+            {% if s.fastest_kph %}These pull lengths fit up to {{ s.fastest_kph }} kph{% if s.held_back_by %}: any faster and {% include "ttt_planner/_held_back.html" %}{% endif %}.{% else %}No speed keeps every rider inside the limits with these pull lengths.{% endif %}
+          </p>
+        {% endif %}
+      </div>
+      {% endwith %}
+      {% endif %}
+      {% if result.riders %}
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              {% if can_edit %}<th><span class="sr-only">Select</span></th>{% endif %}
+              <th>#</th>
+              <th>Rider</th>
+              <th class="text-right">kg</th>
+              <th class="text-right">CdA</th>
+              <th class="text-right">FTP</th>
+              <th class="text-right">CP</th>
+              <th class="text-right">W′ kJ</th>
+              <th class="text-right">Pull W</th>
+              <th class="text-right">W/kg</th>
+              <th class="text-right">Pull %FTP</th>
+              <th class="text-right">Avg W</th>
+              <th class="text-right">NP</th>
+              <th class="text-right">IF</th>
+              <th class="text-right">TSS</th>
+              <th class="text-right">Low W′bal</th>
+              {% if can_edit %}<th>Pull (s)</th><th>No pull</th><th><span class="sr-only">Order and remove</span></th>{% else %}<th class="text-right">Pull (s)</th>{% endif %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for rr in result.riders %}
+            <tr class="hover">
+              {% if can_edit %}
+              <td>
+                <input type="checkbox" name="rider_ids" value="{{ rr.rider.pk }}"
+                       class="checkbox checkbox-xs" aria-label="Select {{ rr.rider.name }}" />
+              </td>
+              {% endif %}
+              <td class="text-base-content/70">{{ forloop.counter }}</td>
+              <td class="font-medium whitespace-nowrap">
+                {{ rr.rider.name }}
+                {% if rr.missing_data %}
+                  <span class="badge badge-warning badge-xs">est<span class="sr-only">imated: weight or height missing</span></span>
+                {% endif %}
+                {% if rr.rider.zero_pull %}
+                  <span class="badge badge-ghost badge-xs">no pull</span>
+                {% endif %}
+                {% if rr.over_target %}
+                  <span class="badge badge-error badge-xs">over target</span>
+                {% endif %}
+              </td>
+              <td class="text-right">{{ rr.weight_kg|floatformat:0 }}</td>
+              <td class="text-right">{{ rr.cda|floatformat:3 }}</td>
+              <td class="text-right">{{ rr.rider.ftp_w|default:"—" }}</td>
+              <td class="text-right">{% if rr.cp_w %}{% if rr.cp_estimated %}<span aria-hidden="true">~</span><span class="sr-only">about </span>{% endif %}{{ rr.cp_w }}{% else %}—{% endif %}</td>
+              <td class="text-right">{% if rr.w_prime_kj %}{% if rr.w_prime_estimated %}<span aria-hidden="true">~</span><span class="sr-only">about </span>{% endif %}{{ rr.w_prime_kj|floatformat:1 }}{% else %}—{% endif %}</td>
+              <td class="text-right font-semibold">{% if rr.rider.zero_pull %}—{% else %}{{ rr.pull_power_w }}{% endif %}</td>
+              <td class="text-right">{% if rr.rider.zero_pull %}—{% else %}{{ rr.pull_wkg }}{% endif %}</td>
+              <td class="text-right">{% if rr.pull_pct_ftp is not None %}{{ rr.pull_pct_ftp }}%{% else %}—{% endif %}</td>
+              <td class="text-right">{{ rr.avg_power_w }}</td>
+              <td class="text-right">{{ rr.normalized_power_w|default:"—" }}</td>
+              <td class="text-right">
+                {% if rr.intensity_factor is None %}—
+                {% elif rr.over_if %}<span class="badge badge-warning badge-sm">{{ rr.intensity_factor|floatformat:2 }}<span class="sr-only">, over Target IF</span></span>
+                {% else %}{{ rr.intensity_factor|floatformat:2 }}{% endif %}
+              </td>
+              <td class="text-right">{% if rr.tss is not None %}{{ rr.tss|floatformat:"-1" }}{% else %}—{% endif %}</td>
+              <td class="text-right">
+                {% if rr.w_prime_empty %}<span class="badge badge-error badge-sm">empty<span class="sr-only">: runs out of W′</span></span>
+                {% elif rr.w_prime_low_pct is None %}—
+                {% elif rr.below_reserve %}<span class="badge badge-warning badge-sm">{{ rr.w_prime_low_pct }}%<span class="sr-only">, under the W′ reserve</span></span>
+                {% else %}{{ rr.w_prime_low_pct }}%{% endif %}
+              </td>
+              {% if can_edit %}
+              <td>
+                <input type="number" name="pull_duration_s" value="{{ rr.rider.pull_duration_s }}"
+                       min="0" max="{{ rr.rider.MAX_PULL_DURATION_S }}"
+                       aria-label="Pull length for {{ rr.rider.name }}, seconds (0 to {{ rr.rider.MAX_PULL_DURATION_S }})"
+                       class="input input-bordered input-xs w-16"
+                       hx-post="{% url 'ttt_planner:rider_update' plan.pk rr.rider.pk %}"
+                       hx-trigger="change" hx-target="#ttt-plan-body" hx-swap="innerHTML" />
+              </td>
+              <td>
+                {# hx-vals marks this request as about zero_pull: an unchecked box sends nothing. #}
+                <input type="checkbox" name="zero_pull" class="checkbox checkbox-xs"
+                       aria-label="{{ rr.rider.name }} takes no pulls"
+                       {% if rr.rider.zero_pull %}checked{% endif %}
+                       hx-post="{% url 'ttt_planner:rider_update' plan.pk rr.rider.pk %}"
+                       hx-vals='{"zero_pull_submitted": "1"}'
+                       hx-trigger="change" hx-target="#ttt-plan-body" hx-swap="innerHTML" />
+              </td>
+              <td class="whitespace-nowrap">
+                <button aria-label="Move {{ rr.rider.name }} up in the pull order" class="btn btn-ghost btn-xs"
+                        hx-post="{% url 'ttt_planner:rider_reorder' plan.pk rr.rider.pk 'up' %}"
+                        hx-target="#ttt-plan-body" hx-swap="innerHTML"
+                        {% if forloop.first %}disabled{% endif %}>↑</button>
+                <button aria-label="Move {{ rr.rider.name }} down in the pull order" class="btn btn-ghost btn-xs"
+                        hx-post="{% url 'ttt_planner:rider_reorder' plan.pk rr.rider.pk 'down' %}"
+                        hx-target="#ttt-plan-body" hx-swap="innerHTML"
+                        {% if forloop.last %}disabled{% endif %}>↓</button>
+                <button aria-label="Remove {{ rr.rider.name }} from the plan" class="btn btn-ghost btn-xs"
+                        hx-post="{% url 'ttt_planner:rider_remove' plan.pk rr.rider.pk %}"
+                        hx-target="#ttt-plan-body" hx-swap="innerHTML"
+                        hx-confirm="Remove {{ rr.rider.name }}?">✕</button>
+              </td>
+              {% else %}
+              <td class="text-right">{{ rr.rider.pull_duration_s }}</td>
+              {% endif %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="text-sm text-base-content/70 mt-2 space-y-1">
+        <p>
+          <strong class="text-base-content">Pull W</strong> holds the target flat speed on the front.
+          <strong class="text-base-content">Pull %FTP</strong> is that pull against FTP, so it sits above 100% for most riders.
+          <strong class="text-base-content">IF</strong> is NP ÷ FTP, planned to stay at or under Target IF
+          ({{ result.target_if|floatformat:2 }}). <strong class="text-base-content">Low W′bal</strong> is the least W′ a rider has
+          left at any point in the race, planned to stay at {{ result.w_prime_reserve_pct }}% or more. TSS needs a route.
+          <a href="{% url 'ttt_planner:help' %}#metrics" class="link">What every column means</a>
+        </p>
+        {% if result.any_power_estimated %}
+        <p><span aria-hidden="true">~</span> Estimated: the rider has no Zwift Racing CP or W′, so the planner uses their FTP as CP
+          and {{ result.fallback_w_prime_kj|floatformat:0 }} kJ as W′.</p>
+        {% endif %}
+        {% if result.any_estimated %}
+        <p><span class="badge badge-warning badge-xs" aria-hidden="true">est</span> Weight or height is missing, so the
+          model uses {{ result.fallback_weight_kg|floatformat:0 }} kg and {{ result.fallback_height_cm|floatformat:0 }} cm
+          for that rider.</p>
+        {% endif %}
+      </div>
+      {% else %}
+      <p class="text-base-content/70">No riders yet. {% if can_edit %}Add riders above.{% endif %}</p>
+      {% endif %}
+    </div>
+  </section>
+
+  {# ---- Results summary ---- #}
+  <section class="card bg-base-200 shadow-xl" aria-labelledby="ttt-team-heading">
+    <div class="card-body">
+      <h2 id="ttt-team-heading" class="card-title">Team</h2>
+      <div class="stats stats-vertical bg-base-100">
+        <div class="stat">
+          <div class="stat-title">Target flat speed</div>
+          <div class="stat-value text-2xl">{{ result.target_speed_kph }}<span class="text-sm"> kph</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Avg team power</div>
+          <div class="stat-value text-2xl">{{ result.avg_team_power_w }}<span class="text-sm"> W</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-title">Est. finish time</div>
+          <div class="stat-value text-2xl">
+            {% if result.estimated_time_s %}
+              {{ result.estimated_time_s|duration_hms }}
+            {% else %}—{% endif %}
+          </div>
+          <div class="stat-desc whitespace-normal">
+            {% if plan.route %}{{ plan.route.name }} · {{ result.course_km }} km{% if result.leadin_km %} incl. {{ result.leadin_km }} km lead-in{% endif %}{% if result.course_avg_kph %} · {{ result.course_avg_kph }} kph on the course{% endif %}{% else %}Pick a route in the Course card{% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+{% if result.course_chart %}
+{# ---- On the course: the team's speed and every rider's watts along the route (course_plot.js draws it) ---- #}
+<section class="card bg-base-200 shadow-xl mt-6" aria-labelledby="ttt-on-course-heading">
+  <div class="card-body gap-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 id="ttt-on-course-heading" class="card-title">On the course</h2>
+      <a href="{% url 'ttt_planner:help' %}#course" class="link text-sm">How this works</a>
+    </div>
+    <p class="text-sm text-base-content/70" id="ttt-course-help">
+      The team at a steady effort: the power that holds {{ result.target_speed_kph }} kph on the flat, held over every
+      climb and descent of {{ plan.route.name }}, lead-in included. Move along the profile, or focus it and use the
+      arrow keys, to see what each rider needs to hold the team's speed there, on the front and sitting in (averaged
+      over the wheels they ride).
+    </p>
+    <div id="ttt-course-plot" class="ttt-course-plot" tabindex="0" role="slider"
+         aria-label="Position along the course, in km" aria-describedby="ttt-course-help"></div>
+    <ul id="ttt-course-key" class="ttt-course-key flex flex-wrap gap-x-4 gap-y-1 text-xs text-base-content/80"
+        aria-label="Key"></ul>
+    <div id="ttt-course-readout" class="space-y-1">
+      <p id="ttt-course-where" class="font-semibold text-sm"></p>
+      <div class="overflow-x-auto">
+        <table class="table table-sm">
+          <thead>
+            <tr>
+              <th scope="col">Rider</th>
+              <th scope="col" class="text-right">On the front</th>
+              <th scope="col" class="text-right">Sitting in</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for rr in result.riders %}
+            <tr data-rider-index="{{ forloop.counter0 }}">
+              <th scope="row" class="font-medium whitespace-nowrap align-top">{{ rr.rider.name }}</th>
+              <td class="cc-front text-right whitespace-nowrap align-top"></td>
+              <td class="cc-sit text-right whitespace-nowrap align-top"></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {{ result.course_chart|json_script:"ttt-course-data" }}
+  </div>
+</section>
+{% endif %}
+
+{# ---- Climb compare (per-rider climb-strength) ---- #}
+<section class="card bg-base-200 shadow-xl mt-6" aria-labelledby="ttt-climb-heading">
+  <div class="card-body">
+    <h2 id="ttt-climb-heading" class="card-title">Climb compare</h2>
+    <p class="text-sm text-base-content/70 mb-3">
+      Each rider's time gap behind the squad's fastest climber up a {{ climb.grade_pct|default:"8" }}% climb, by length.
+      Steady best effort, no draft.
+    </p>
+    {% if climb.available %}
+    <p class="text-sm mb-2 flex flex-wrap items-center gap-2">
+      <span class="px-2 rounded text-black font-medium" style="background:rgb(34,197,94)">0</span> sets the pace
+      <span class="px-2 rounded text-black font-medium" style="background:rgb(250,204,21)">+20s</span> slips back
+      <span class="px-2 rounded text-black font-medium" style="background:rgb(239,68,68)">+1:20</span> first to be dropped
+    </p>
+    <div class="overflow-x-auto">
+      <table class="table table-sm text-center">
+        <thead>
+          <tr>
+            <th class="text-left">Rider</th>
+            {% for L in climb.lengths %}<th class="text-center">{{ L }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in climb.rows %}
+          <tr>
+            <td class="font-medium whitespace-nowrap text-left">{{ row.name }}</td>
+            {% for c in row.cells %}<td class="text-center font-medium{% if c.rgb %} text-black{% endif %}" {% if c.rgb %}style="background:{{ c.rgb }}"{% endif %}>{{ c.label }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% include "_climb_method.html" %}
+    {% else %}
+    <p class="text-base-content/70 py-6 text-center">Add team riders whose profile has a power curve (from Zwift Racing) to compare climbs.</p>
+    {% endif %}
+  </div>
+</section>

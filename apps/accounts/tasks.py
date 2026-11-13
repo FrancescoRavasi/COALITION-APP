@@ -1,0 +1,1014 @@
+"""Background tasks for accounts app."""
+
+import time
+
+import logfire
+from constance import config
+from django.tasks import task  # ty:ignore[unresolved-import]
+from django.utils import timezone
+
+from apps.accounts.discord_service import (
+    add_discord_role,
+    remove_discord_role,
+    send_discord_channel_message,
+)
+from apps.accounts.models import GuildMember, User
+
+
+@task
+def notify_rider_left_team(zwid: int, rider_name: str, source: str) -> dict:
+    """Send Discord notification when a rider leaves the team.
+
+    Args:
+        zwid: The Zwift ID of the rider who left.
+        rider_name: The display name of the rider.
+        source: The data source ("ZwiftPower" or "Zwift Racing").
+
+    Returns:
+        dict with notification status.
+
+    """
+    with logfire.span("notify_rider_left_team", zwid=zwid, source=source):
+        channel_id = config.USER_CHANGE_LOG
+
+        if not channel_id or channel_id == 0:
+            logfire.debug("USER_CHANGE_LOG channel not configured")
+            return {"status": "skipped", "reason": "channel_not_configured"}
+
+        # Try to find user's Discord info for mention
+        discord_mention = ""
+        try:
+            user = User.objects.get(zwid=zwid)
+            if user.discord_id:
+                discord_mention = f" (<@{user.discord_id}>)"
+        except User.DoesNotExist:
+            pass
+
+        message = (
+            f"**Rider Left Team**\n"
+            f"{rider_name}{discord_mention} has left the {source} team roster.\n"
+            f"Zwift ID: `{zwid}`"
+        )
+
+        success = send_discord_channel_message(channel_id, message)
+
+        return {
+            "status": "sent" if success else "failed",
+            "zwid": zwid,
+            "source": source,
+        }
+
+
+@task
+def clear_expired_sessions() -> dict:
+    """Delete expired rows from the session table.
+
+    Sessions are database-backed, and an expired row keeps ``_auth_user_id`` in its
+    payload -- so it is personal data retained past its purpose. There is no security
+    urgency: Django checks expiry when it reads a session, so a stale row was never usable
+    for authentication. This is about not keeping it.
+
+    Wraps Django's own ``clearsessions``, which knows how to ask the configured session
+    backend to prune itself, rather than deleting from the table directly.
+
+    Returns:
+        Summary dict with status and the number of rows removed.
+
+    """
+    from django.contrib.sessions.models import Session
+    from django.core.management import call_command
+    from django.utils import timezone as dj_timezone
+
+    with logfire.span("clear_expired_sessions"):
+        # Counted rather than inferred: clearsessions reports nothing back, and the
+        # number is the only way to see the first run drain a backlog.
+        expired = Session.objects.filter(expire_date__lt=dj_timezone.now()).count()
+        call_command("clearsessions")
+        logfire.info("Expired sessions cleared", deleted=expired)
+        return {"status": "complete", "deleted": expired}
+
+
+@task
+def sync_guild_members(allow_mass_departure: bool = False) -> dict:
+    """Fetch the full guild roster from Discord and reconcile GuildMember.
+
+    Replaces the bot-side polling job: the platform calls the Discord REST API
+    directly with ``DISCORD_BOT_TOKEN`` (requires the ``GUILD_MEMBERS`` privileged
+    intent, which the existing bot already uses) and feeds the result through
+    :func:`apps.accounts.services.apply_guild_member_sync`. Members who fell
+    out of the roster have ``date_left`` stamped and a Membership ticket filed.
+
+    This is the only driver whose list decides who has left: the fetch is paginated and
+    raises rather than return a list missing a page. The bot's push is not trusted for
+    that (see ``apps.dbot_api.api.sync_guild_members``).
+
+    Args:
+        allow_mass_departure: Sign members out even when more than the sync's sanity limit
+            would go at once -- for a real purge, confirmed by an admin from the Run Now
+            page. The scheduled run never sets it.
+
+    Returns:
+        dict with sync results and ``status`` ``"ok"``, or ``{"status": "skipped",
+        "reason": ...}`` if ``DISCORD_BOT_TOKEN`` or ``GUILD_ID`` is unset.
+
+    Raises:
+        GuildSyncRefusedError: The sanity limit held departures or never-listed accounts
+            back. Raised after the members received are saved, so the run is recorded as
+            failed -- a refusal repeats on every run until an admin acts on it, and the
+            ticket it opens is otherwise the only sign of it outside Logfire.
+
+    """
+    from apps.accounts.services import (
+        GuildSyncRefusedError,
+        apply_guild_member_sync,
+        describe_sync_refusal,
+        fetch_guild_members_from_discord,
+    )
+
+    with logfire.span("sync_guild_members"):
+        bot_token = config.DISCORD_BOT_TOKEN
+        guild_id = config.GUILD_ID
+
+        if not bot_token:
+            logfire.warning("DISCORD_BOT_TOKEN not configured, skipping guild member sync")
+            return {"status": "skipped", "reason": "bot_token_not_configured"}
+        if not guild_id:
+            logfire.warning("GUILD_ID not configured, skipping guild member sync")
+            return {"status": "skipped", "reason": "guild_id_not_configured"}
+
+        # Taken before the fetch: an account that signs in while it runs has passed a
+        # newer, live guild check than the list, so the sync must not overrule it.
+        observed_at = timezone.now()
+        members = fetch_guild_members_from_discord(guild_id, bot_token)
+        result = apply_guild_member_sync(
+            members,
+            source="discord_api",
+            authoritative=True,
+            allow_mass_departure=allow_mass_departure,
+            observed_at=observed_at,
+        )
+        # The worker runs a task outside any transaction, so the upserts above are already
+        # committed; raising only changes how the run is recorded.
+        if result["departures_refused"] or result["unseen_refused"]:
+            raise GuildSyncRefusedError(describe_sync_refusal(result))
+        return {"status": "ok", **result}
+
+
+def _last_completed_guild_sync():
+    """When the scheduled guild member sync last finished and did its job.
+
+    Read from the task backend rather than ``GuildMember.date_modified``, which the bot's
+    leave report and every Discord login bump on their own: that would show a fresh sync
+    while the sync had stopped running. A refused run is recorded as failed, and a run with
+    no bot token or guild returns ``status: skipped``; neither counts.
+
+    Returns:
+        The finish time as an aware datetime, or None if no run has completed.
+
+    """
+    from django.apps import apps as django_apps
+
+    results = django_apps.get_model("django_tasks_database", "DBTaskResult")
+    return (
+        results.objects
+        .filter(
+            task_path=sync_guild_members.module_path,
+            status="SUCCESSFUL",
+            finished_at__isnull=False,
+            return_value__status="ok",
+        )
+        .order_by("-finished_at")
+        .values_list("finished_at", flat=True)
+        .first()
+    )
+
+
+@task
+def guild_member_sync_status() -> dict:
+    """Report on guild member sync health and statistics.
+
+    This task checks the GuildMember table for sync health metrics.
+    The actual sync is performed by the ``sync_guild_members`` background task.
+
+    Returns:
+        dict with sync status and statistics. ``last_sync`` and ``hours_since_sync`` describe
+        the last completed ``sync_guild_members`` run (see :func:`_last_completed_guild_sync`);
+        ``last_member_change`` is the newest ``GuildMember.date_modified``, whatever wrote it.
+
+    """
+    from apps.accounts.services import never_seen_in_guild
+
+    with logfire.span("guild_member_sync_status"):
+        now = timezone.now()
+
+        # Get counts
+        total_members = GuildMember.objects.count()
+        active_members = GuildMember.objects.filter(date_left__isnull=True).count()
+        # Rows recorded for accounts no sync has ever listed are not departures; counting them
+        # as such would inflate "left" by every one of them after the first sweep.
+        never_seen = GuildMember.objects.filter(never_seen_in_guild()).count()
+        left_members = GuildMember.objects.filter(date_left__isnull=False).count() - never_seen
+        linked_members = GuildMember.objects.filter(user__isnull=False, date_left__isnull=True).count()
+        bot_members = GuildMember.objects.filter(is_bot=True, date_left__isnull=True).count()
+
+        last_sync = _last_completed_guild_sync()
+        # Any change to any row: a sync, a bot push, a leave report, a Discord login. Not a sign
+        # that the scheduled sync -- the backstop for leave reports that never arrive -- still runs.
+        last_modified = GuildMember.objects.order_by("-date_modified").values_list("date_modified", flat=True).first()
+
+        hours_since_sync = None
+        if last_sync:
+            delta = now - last_sync
+            hours_since_sync = round(delta.total_seconds() / 3600, 1)
+
+        status = {
+            "total_records": total_members,
+            "active_members": active_members,
+            "left_members": left_members,
+            "never_seen_members": never_seen,
+            "linked_to_users": linked_members,
+            "bot_accounts": bot_members,
+            "last_sync": last_sync.isoformat() if last_sync else None,
+            "hours_since_sync": hours_since_sync,
+            "last_member_change": last_modified.isoformat() if last_modified else None,
+            "sync_source": "platform",
+            "note": "Guild member sync is performed by the sync_guild_members background task",
+        }
+
+        logfire.info("Guild member sync status", **status)
+
+        return status
+
+
+def _users_in_the_guild():
+    """Users whose Discord roles are worth syncing: linked, and not known to have left.
+
+    Discord answers 404 Unknown Member for anyone who is no longer in the server, so every
+    role call for a departed rider is a wasted round trip, a logged error, and -- in the ZR
+    sync -- half a second of sleep. Worse than the noise, the ZR sync goes on to post an
+    upgrade announcement for them, naming and @-mentioning somebody who left.
+
+    A rider with NO ``GuildMember`` row is deliberately kept. The row is created by the guild
+    sync, so its absence means "never seen by that sync", not "gone" -- excluding them would
+    quietly stop role management for anyone the sync has not reached yet. Only a stamped
+    ``date_left``, which the sync sets when a previously-active member disappears (or, on a
+    new departed row, for an account it has never listed), counts as having left.
+
+    Returns:
+        The queryset of users to sync roles for.
+
+    """
+    return (
+        User.objects.exclude(discord_id="")
+        .exclude(discord_id__isnull=True)
+        .exclude(guild_member__date_left__isnull=False)
+    )
+
+
+@task
+def sync_race_ready_roles() -> dict:
+    """Sync race ready Discord roles for all users.
+
+    Checks each user's is_race_ready status and ensures their Discord
+    role matches. Adds the role if they should have it, removes if not.
+
+    Returns:
+        dict with sync results summary.
+
+    """
+    with logfire.span("sync_race_ready_roles"):
+        # Get race ready role ID from constance
+        race_ready_role_id = config.RACE_READY_ROLE_ID
+        if not race_ready_role_id or race_ready_role_id == 0:
+            logfire.info("RACE_READY_ROLE_ID not configured, skipping sync")
+            return {"status": "skipped", "reason": "role_not_configured"}
+
+        role_id_str = str(race_ready_role_id)
+
+        # Everyone linked to Discord who has not left the guild -- see _users_in_the_guild.
+        users_with_discord = _users_in_the_guild()
+        total_users = users_with_discord.count()
+
+        logfire.info("Starting race ready role sync", total_users=total_users)
+
+        # Track results
+        added = 0
+        removed = 0
+        unchanged = 0
+        errors = 0
+        users_added = []
+        users_removed = []
+
+        for user in users_with_discord.iterator():
+            # Read cached race ready status (updated by refresh_all_race_ready task)
+            is_race_ready = user.is_race_ready
+
+            # Check if user currently has the role
+            has_role = role_id_str in (user.discord_roles or {})
+
+            # Determine action needed
+            if is_race_ready and not has_role:
+                # User should have the role but doesn't - add it
+                success = add_discord_role(user.discord_id, role_id_str)
+                if success:
+                    added += 1
+                    users_added.append(user)
+                    # Update local discord_roles to reflect the change
+                    if user.discord_roles is None:
+                        user.discord_roles = {}
+                    user.discord_roles[role_id_str] = "Race Ready"
+                    user.save(update_fields=["discord_roles"])
+                else:
+                    errors += 1
+                # Rate limit: 0.5s delay between API calls
+                time.sleep(0.5)
+
+            elif not is_race_ready and has_role:
+                # User has the role but shouldn't - remove it
+                success = remove_discord_role(user.discord_id, role_id_str)
+                if success:
+                    removed += 1
+                    users_removed.append(user)
+                    # Update local discord_roles to reflect the change
+                    if user.discord_roles and role_id_str in user.discord_roles:
+                        del user.discord_roles[role_id_str]
+                        user.save(update_fields=["discord_roles"])
+                else:
+                    errors += 1
+                # Rate limit: 0.5s delay between API calls
+                time.sleep(0.5)
+
+            else:
+                # No change needed
+                unchanged += 1
+
+        # Send notifications for role changes
+        channel_id = config.USER_CHANGE_LOG
+        if channel_id and channel_id != 0:
+            # Notify about users who gained the role
+            for user in users_added:
+                name = _get_user_display_name(user)
+                mention = f"<@{user.discord_id}>"
+                message = (
+                    f"🏁 **Race Ready Role Added** (scheduled sync)\n"
+                    f"{name} ({mention}) gained the race ready role."
+                )
+                send_discord_channel_message(channel_id, message, silent=True)
+                time.sleep(0.2)  # Rate limit notifications
+
+            # Notify about users who lost the role
+            for user in users_removed:
+                name = _get_user_display_name(user)
+                mention = f"<@{user.discord_id}>"
+                message = (
+                    f"⚠️ **Race Ready Role Removed** (scheduled sync)\n"
+                    f"{name} ({mention}) lost the race ready role due to expired/missing verifications."
+                )
+                send_discord_channel_message(channel_id, message, silent=True)
+                time.sleep(0.2)  # Rate limit notifications
+
+        result = {
+            "status": "completed",
+            "total_users": total_users,
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+            "errors": errors,
+        }
+
+        logfire.info("Race ready role sync completed", **result)
+
+        return result
+
+
+@task
+def refresh_all_race_ready() -> dict:
+    """Refresh cached is_race_ready field for all users with a discord_id.
+
+    Recalculates race ready status from verification records and bulk-updates
+    any users whose cached value differs. This handles expiration — records
+    that expired since the last run get caught here.
+
+    Returns:
+        dict with refresh results summary.
+
+    """
+    with logfire.span("refresh_all_race_ready"):
+        users = (
+            User.objects
+            .exclude(discord_id="")
+            .exclude(discord_id__isnull=True)
+            .prefetch_related("race_ready_records")
+        )
+        total = users.count()
+        logfire.info("Starting race ready refresh", total_users=total)
+
+        updated = 0
+        for user in users.iterator(chunk_size=200):
+            new_race_ready = user.calculate_race_ready()
+            new_extra_verified = user.calculate_extra_verified()
+            update_fields = []
+            if user.is_race_ready != new_race_ready:
+                user.is_race_ready = new_race_ready
+                update_fields.append("is_race_ready")
+            if user.is_extra_verified != new_extra_verified:
+                user.is_extra_verified = new_extra_verified
+                update_fields.append("is_extra_verified")
+            if update_fields:
+                user.save(update_fields=update_fields)
+                updated += 1
+
+        result = {
+            "status": "completed",
+            "total_users": total,
+            "updated": updated,
+        }
+        logfire.info("Race ready refresh completed", **result)
+        return result
+
+
+def _get_user_display_name(user: User) -> str:
+    """Get display name for a user.
+
+    Args:
+        user: User instance.
+
+    Returns:
+        Best available display name for the user.
+
+    """
+    if user.first_name and user.last_name:
+        return f"{user.first_name} {user.last_name}"
+    if user.first_name:
+        return user.first_name
+    return user.discord_nickname or user.discord_username or f"User {user.id}"
+
+
+@task
+def sync_zr_category_roles() -> dict:
+    """Sync Zwift Racing category Discord roles for all users.
+
+    For each user with a discord_id, looks up their ZRRider record to determine
+    their current ZR category, then ensures the correct Discord role is assigned.
+    Removes any stale ZR category roles and posts upgrade announcements.
+
+    Returns:
+        dict with sync results summary.
+
+    """
+    from apps.zwiftracing.models import ZRRider
+
+    # Category order from highest to lowest
+    ZR_CATEGORY_ORDER = [
+        "Diamond",
+        "Ruby",
+        "Emerald",
+        "Sapphire",
+        "Amethyst",
+        "Platinum",
+        "Gold",
+        "Silver",
+        "Bronze",
+        "Copper",
+    ]
+
+    def _get_zr_role_config() -> dict[str, str]:
+        """Return mapping of category name to role ID string, excluding unconfigured (0) entries.
+
+        Returns:
+            Dict mapping category name to role ID string.
+
+        """
+        role_map = {
+            "Diamond": config.ZR_ROLE_DIAMOND,
+            "Ruby": config.ZR_ROLE_RUBY,
+            "Emerald": config.ZR_ROLE_EMERALD,
+            "Sapphire": config.ZR_ROLE_SAPPHIRE,
+            "Amethyst": config.ZR_ROLE_AMETHYST,
+            "Platinum": config.ZR_ROLE_PLATINUM,
+            "Gold": config.ZR_ROLE_GOLD,
+            "Silver": config.ZR_ROLE_SILVER,
+            "Bronze": config.ZR_ROLE_BRONZE,
+            "Copper": config.ZR_ROLE_COPPER,
+        }
+        return {cat: str(rid) for cat, rid in role_map.items() if rid and rid != 0}
+
+    with logfire.span("sync_zr_category_roles"):
+        role_config = _get_zr_role_config()
+        if not role_config:
+            logfire.info("No ZR category roles configured, skipping sync")
+            return {"status": "skipped", "reason": "no_roles_configured"}
+
+        # All configured ZR role IDs (for detecting stale roles)
+        all_zr_role_ids = set(role_config.values())
+        unassigned_role_id = str(config.ZR_ROLE_UNASSIGNED) if config.ZR_ROLE_UNASSIGNED else None
+        if unassigned_role_id and unassigned_role_id != "0":
+            all_zr_role_ids.add(unassigned_role_id)
+        else:
+            unassigned_role_id = None
+
+        # Reverse lookup: role_id → category name
+        role_id_to_category = {rid: cat for cat, rid in role_config.items()}
+
+        # Build ZRRider lookup by zwid
+        suffix = config.ZR_CATEGORY_SUFFIX or ""
+
+        # Everyone linked to Discord who has not left the guild -- see _users_in_the_guild.
+        # Without this the sync 404s on departed riders and, worse, announces their "upgrade".
+        users_with_discord = _users_in_the_guild()
+        total_users = users_with_discord.count()
+
+        logfire.info("Starting ZR category role sync", total_users=total_users, configured_roles=len(role_config))
+
+        added = 0
+        removed = 0
+        upgraded = 0
+        unchanged = 0
+        errors = 0
+
+        upgrade_channel_id = config.ZR_UPGRADE_NOTICE_CHANNEL
+
+        for user in users_with_discord.iterator():
+            try:
+                # Determine desired category
+                desired_category = None
+                if user.zwid:
+                    try:
+                        zr_rider = ZRRider.objects.get(zwid=user.zwid)
+                        desired_category = zr_rider.race_current_category or None
+                    except ZRRider.DoesNotExist:
+                        pass
+
+                # Determine desired role ID
+                if desired_category and desired_category in role_config:
+                    desired_role_id = role_config[desired_category]
+                elif unassigned_role_id:
+                    desired_role_id = unassigned_role_id
+                    desired_category = None
+                else:
+                    desired_role_id = None
+
+                # Find current ZR roles the user has
+                current_roles = user.discord_roles or {}
+                current_zr_role_ids = set(current_roles.keys()) & all_zr_role_ids
+
+                # Determine old category from current roles
+                old_category = None
+                for rid in current_zr_role_ids:
+                    if rid in role_id_to_category:
+                        old_category = role_id_to_category[rid]
+                        break
+
+                # Check if already correct
+                if desired_role_id and current_zr_role_ids == {desired_role_id}:
+                    unchanged += 1
+                    continue
+
+                if not desired_role_id and not current_zr_role_ids:
+                    unchanged += 1
+                    continue
+
+                # Remove stale ZR roles
+                roles_to_remove = current_zr_role_ids - ({desired_role_id} if desired_role_id else set())
+                for old_role_id in roles_to_remove:
+                    success = remove_discord_role(user.discord_id, old_role_id)
+                    if success:
+                        removed += 1
+                        if old_role_id in current_roles:
+                            del current_roles[old_role_id]
+                    else:
+                        errors += 1
+                    time.sleep(0.5)
+
+                # Add new role if not already present
+                if desired_role_id and desired_role_id not in current_zr_role_ids:
+                    role_name = desired_category or "Unassigned"
+                    if suffix:
+                        role_name = f"{role_name} {suffix}"
+                    success = add_discord_role(user.discord_id, desired_role_id)
+                    if success:
+                        added += 1
+                        current_roles[desired_role_id] = role_name
+                    else:
+                        errors += 1
+                    time.sleep(0.5)
+
+                # Save updated discord_roles
+                user.discord_roles = current_roles
+                user.save(update_fields=["discord_roles"])
+
+                # Check for upgrade
+                if (
+                    desired_category
+                    and old_category
+                    and desired_category != old_category
+                    and desired_category in ZR_CATEGORY_ORDER
+                    and old_category in ZR_CATEGORY_ORDER
+                ):
+                    new_index = ZR_CATEGORY_ORDER.index(desired_category)
+                    old_index = ZR_CATEGORY_ORDER.index(old_category)
+                    if new_index < old_index:
+                        upgraded += 1
+                        # Post upgrade announcement
+                        if upgrade_channel_id and upgrade_channel_id != 0:
+                            name = _get_user_display_name(user)
+                            mention = f"<@{user.discord_id}>"
+                            message = (
+                                f"⬆️ **ZR Category Upgrade**\n"
+                                f"{name} ({mention}) upgraded from **{old_category}** to **{desired_category}**!"
+                            )
+                            send_discord_channel_message(upgrade_channel_id, message)
+                            time.sleep(0.2)
+
+            except Exception as e:
+                errors += 1
+                logfire.error(
+                    "Error syncing ZR category role for user",
+                    user_id=user.id,
+                    discord_id=user.discord_id,
+                    error=str(e),
+                )
+
+        result = {
+            "status": "completed",
+            "total_users": total_users,
+            "added": added,
+            "removed": removed,
+            "upgraded": upgraded,
+            "unchanged": unchanged,
+            "errors": errors,
+        }
+
+        logfire.info("ZR category role sync completed", **result)
+
+        return result
+
+
+@task
+def sync_new_member_roles() -> dict:
+    """Sync New Member Discord role for all guild members.
+
+    Adds the role to members who joined within NEW_MEMBER_DAYS,
+    and removes it from members who have been around longer.
+    Works on GuildMember records directly — no User account needed.
+
+    Returns:
+        dict with sync results summary.
+
+    """
+    with logfire.span("sync_new_member_roles"):
+        new_member_role_id = config.NEW_MEMBER_ROLE_ID
+        if not new_member_role_id or new_member_role_id == 0:
+            logfire.info("NEW_MEMBER_ROLE_ID not configured, skipping sync")
+            return {"status": "skipped", "reason": "role_not_configured"}
+
+        role_id_str = str(new_member_role_id)
+        new_member_days = config.NEW_MEMBER_DAYS
+        team_member_role_id = config.TEAM_MEMBER_ROLE_ID
+        team_member_role_str = str(team_member_role_id) if team_member_role_id else None
+        now = timezone.now()
+
+        members = GuildMember.objects.filter(date_left__isnull=True, is_bot=False)
+        total = members.count()
+
+        logfire.info("Starting new member role sync", total_members=total, new_member_days=new_member_days)
+
+        added = 0
+        removed = 0
+        unchanged = 0
+        errors = 0
+        skipped_no_join_date = 0
+
+        for member in members.iterator():
+            if not member.joined_at:
+                skipped_no_join_date += 1
+                continue
+
+            days = (now - member.joined_at).days
+            roles = member.roles or []
+            has_role = role_id_str in roles
+            has_team_member_role = team_member_role_str and team_member_role_str in roles
+
+            try:
+                if days < new_member_days and has_team_member_role and not has_role:
+                    success = add_discord_role(member.discord_id, role_id_str)
+                    if success:
+                        added += 1
+                        roles.append(role_id_str)
+                        member.roles = roles
+                        member.save(update_fields=["roles"])
+                        # Also update User.discord_roles if linked
+                        if member.user:
+                            user_roles = member.user.discord_roles or {}
+                            user_roles[role_id_str] = "New Member"
+                            member.user.discord_roles = user_roles
+                            member.user.save(update_fields=["discord_roles"])
+                    else:
+                        errors += 1
+                    time.sleep(0.5)
+
+                elif (days >= new_member_days or not has_team_member_role) and has_role:
+                    success = remove_discord_role(member.discord_id, role_id_str)
+                    if success:
+                        removed += 1
+                        roles.remove(role_id_str)
+                        member.roles = roles
+                        member.save(update_fields=["roles"])
+                        # Also update User.discord_roles if linked
+                        if member.user and role_id_str in (member.user.discord_roles or {}):
+                            del member.user.discord_roles[role_id_str]
+                            member.user.save(update_fields=["discord_roles"])
+                    else:
+                        errors += 1
+                    time.sleep(0.5)
+
+                else:
+                    unchanged += 1
+
+            except Exception as e:
+                errors += 1
+                logfire.error(
+                    "Error syncing new member role",
+                    discord_id=member.discord_id,
+                    error=str(e),
+                )
+
+        result = {
+            "status": "completed",
+            "total_members": total,
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+            "errors": errors,
+            "skipped_no_join_date": skipped_no_join_date,
+        }
+
+        logfire.info("New member role sync completed", **result)
+
+        return result
+
+
+@task
+def sync_youtube_channel_ids() -> dict:
+    """Extract YouTube channel IDs from user YouTube URLs.
+
+    Finds users who have a youtube_channel URL but no youtube_channel_id,
+    then extracts the channel ID from the URL by fetching the page.
+
+    Returns:
+        dict with sync results summary.
+
+    """
+    from apps.accounts.utils import extract_youtube_channel_id, youtube_url_form
+
+    with logfire.span("sync_youtube_channel_ids"):
+        # Find users with YouTube URL but no channel ID
+        users_to_process = User.objects.filter(
+            youtube_channel__isnull=False,
+        ).exclude(
+            youtube_channel="",
+        ).filter(
+            youtube_channel_id="",
+        )
+
+        total = users_to_process.count()
+        logfire.info("Starting YouTube channel ID sync", users_to_process=total)
+
+        success = 0
+        failed = 0
+        users_updated = []
+
+        for user in users_to_process.iterator():
+            channel_id = extract_youtube_channel_id(user.youtube_channel)
+
+            if channel_id:
+                user.youtube_channel_id = channel_id
+                user.save(update_fields=["youtube_channel_id"])
+                success += 1
+                users_updated.append(user.id)
+                logfire.debug(
+                    "Extracted YouTube channel ID",
+                    user_id=user.id,
+                    channel_id=channel_id,
+                )
+            else:
+                failed += 1
+                logfire.warning(
+                    "Failed to extract YouTube channel ID",
+                    user_id=user.id,
+                    url_form=youtube_url_form(user.youtube_channel),
+                )
+
+            # Rate limit: avoid hammering YouTube
+            time.sleep(1)
+
+        result = {
+            "status": "completed",
+            "total_processed": total,
+            "success": success,
+            "failed": failed,
+            "users_updated": users_updated,
+        }
+
+        logfire.info("YouTube channel ID sync completed", **result)
+
+        return result
+
+
+@task
+def sync_youtube_videos() -> dict:
+    """Fetch new videos from YouTube RSS feeds for all users with channel IDs.
+
+    Fetches videos from each user's YouTube channel RSS feed and stores
+    new videos in the database.
+
+    Returns:
+        dict with sync results summary.
+
+    """
+    from apps.accounts.models import YouTubeVideo
+    from apps.accounts.utils import fetch_youtube_videos
+
+    with logfire.span("sync_youtube_videos"):
+        # Find users with YouTube channel IDs
+        users_with_channels = User.objects.filter(
+            youtube_channel_id__isnull=False,
+        ).exclude(
+            youtube_channel_id="",
+        )
+
+        total_users = users_with_channels.count()
+        logfire.info("Starting YouTube video sync", users_to_process=total_users)
+
+        total_new_videos = 0
+        users_processed = 0
+        errors = 0
+
+        for user in users_with_channels.iterator():
+            try:
+                # Fetch videos from RSS
+                videos = fetch_youtube_videos(user.youtube_channel_id, limit=10)
+
+                new_count = 0
+                for video_data in videos:
+                    # Create or update video record
+                    _video, created = YouTubeVideo.objects.update_or_create(
+                        user=user,
+                        video_id=video_data["video_id"],
+                        defaults={
+                            "title": video_data["title"],
+                            "thumbnail_url": video_data.get("thumbnail", ""),
+                            "published_at": video_data.get("published"),
+                        },
+                    )
+                    if created:
+                        new_count += 1
+
+                total_new_videos += new_count
+                users_processed += 1
+
+                logfire.debug(
+                    "Synced YouTube videos for user",
+                    user_id=user.id,
+                    channel_id=user.youtube_channel_id,
+                    videos_fetched=len(videos),
+                    new_videos=new_count,
+                )
+
+            except Exception as e:
+                errors += 1
+                logfire.error(
+                    "Error syncing YouTube videos for user",
+                    user_id=user.id,
+                    channel_id=user.youtube_channel_id,
+                    error=str(e),
+                )
+
+            # Rate limit: avoid hammering YouTube
+            time.sleep(1)
+
+        result = {
+            "status": "completed",
+            "total_users": total_users,
+            "users_processed": users_processed,
+            "new_videos": total_new_videos,
+            "errors": errors,
+        }
+
+        logfire.info("YouTube video sync completed", **result)
+
+        return result
+
+
+@task
+def refresh_zwift_racing_metrics() -> dict:
+    """Mirror every connected rider's zFTP/zMAP from the zauth service into the User row.
+
+    The service exposes these one user at a time, which is fine for a profile page but
+    hopeless for a roster: squad eligibility, the signup table and the assign-rider
+    filters all need them for a whole list at once. So everything else reads this local
+    copy, and this task keeps it current.
+
+    Normally that is a single call: the connections listing carries the metrics
+    inline. A service that predates that still answers without those keys, so this
+    falls back to one ``/profile`` call per rider -- slow, but it means the two repos
+    can be deployed in either order. The fallback keys off *key presence*, not a null
+    value, because "this rider has no metrics" and "this service can't tell me" need
+    opposite handling: the first should clear the values, the second must not.
+
+    Riders who are no longer connected keep their last known values rather than being
+    blanked -- a service outage should not silently un-qualify a squad.
+
+    Returns:
+        dict with the number of riders updated, skipped, and failed.
+
+    """
+    from apps.zwift import client as zwift_client
+
+    if not zwift_client.is_configured():
+        logfire.info("Zwift metrics refresh skipped - service not configured")
+        return {"status": "skipped", "reason": "zauth service not configured"}
+
+    interval = config.SCHEDULER_REFRESH_ZWIFT_METRICS_MINUTES
+    fallback_allowed = interval >= config.ZWIFT_METRICS_FALLBACK_MIN_MINUTES
+
+    connections = zwift_client.list_connections()
+    if connections is None:
+        logfire.error("Zwift metrics refresh aborted - connection list unavailable")
+        return {"status": "error", "reason": "could not list connections"}
+
+    updated = 0
+    skipped = 0
+    failed = 0
+    per_user_fetches = 0
+    now = timezone.now()
+    for conn in connections:
+        user_id = str(conn.get("user_id") or "")
+        # A membership registration connects under its UUID, which is not a User pk and
+        # would make the lookup below raise ValueError, ending the whole sweep.
+        if not (user_id.isascii() and user_id.isdigit()):
+            skipped += 1
+            continue
+        user = User.objects.filter(pk=user_id).first()
+        if user is None:
+            skipped += 1
+            continue
+
+        if "z_ftp" in conn:
+            metrics = conn
+        elif fallback_allowed:
+            per_user_fetches += 1
+            metrics = zwift_client.get_racing_profile(user_id)
+            if not metrics:
+                failed += 1
+                continue
+        else:
+            # One call per rider, and /profile reaches Zwift when the service holds no
+            # snapshot. At a short cadence that multiplies into a rate-limit problem, so
+            # the fallback is refused rather than throttled. Stale metrics for a cycle
+            # beat a ban; the loud log says which is happening.
+            skipped += 1
+            continue
+
+        # An all-null row means the service holds no profile for this rider. Leave the
+        # last known values alone rather than writing the nulls through: these numbers
+        # gate squad membership, and a transient upstream gap that blanked the roster
+        # would reject every rider from every power-bounded squad at once. A rider
+        # keeping slightly stale metrics is the far cheaper failure.
+        if metrics.get("z_ftp") is None and metrics.get("z_map") is None:
+            skipped += 1
+            continue
+
+        user.z_ftp = metrics.get("z_ftp")
+        user.z_map = metrics.get("z_map")
+        user.z_metrics_weight_grams = metrics.get("weight_in_grams")
+        user.z_metrics_updated_at = now
+        # Narrow save: this task runs alongside profile edits and must not clobber them.
+        user.save(update_fields=["z_ftp", "z_map", "z_metrics_weight_grams", "z_metrics_updated_at"])
+        updated += 1
+
+    logfire.info(
+        "Zwift racing metrics refreshed",
+        updated=updated,
+        skipped=skipped,
+        failed=failed,
+        connections=len(connections),
+        per_user_fetches=per_user_fetches,
+        bulk=per_user_fetches == 0,
+        fallback_allowed=fallback_allowed,
+        interval_minutes=interval,
+    )
+    if not fallback_allowed and skipped:
+        logfire.warning(
+            "Per-rider metric fallback suppressed by the refresh interval",
+            interval_minutes=interval,
+            floor_minutes=config.ZWIFT_METRICS_FALLBACK_MIN_MINUTES,
+            skipped=skipped,
+        )
+    return {
+        "status": "ok",
+        "updated": updated,
+        "skipped": skipped,
+        "failed": failed,
+        "per_user_fetches": per_user_fetches,
+    }

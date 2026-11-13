@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block title %}{{ route.name }}{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'zwift_data/chart.css' %}" />
+{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto space-y-6">
+  <a href="{% url 'routes:list' %}" class="btn btn-ghost btn-sm">&larr; All routes</a>
+
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div class="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 class="card-title text-2xl">{{ route.name }}</h2>
+          <p class="text-sm text-base-content/70">
+            {{ route.world }} · {{ route.total_distance_km }} km · {{ route.ascent_m }} m · avg {{ route.avg_gradient_pct }}%
+            <span class="badge badge-ghost badge-sm ml-1">{{ route.get_sport_display }}</span>
+          </p>
+        </div>
+        <div class="flex flex-wrap gap-1">
+          {% if route.event_only %}<span class="badge badge-warning badge-sm">event-only</span>{% endif %}
+          {% if route.supports_tt %}<span class="badge badge-info badge-sm">TT mode</span>{% endif %}
+          {% if route.level_locked %}<span class="badge badge-ghost badge-sm">Level {{ route.level_locked }}</span>{% endif %}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# ---- Details ---- #}
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <h3 class="font-semibold mb-3">Details</h3>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+        <div>
+          <div class="text-xs text-base-content/60">Distance</div>
+          <div class="font-medium">{{ route.distance_km }} km</div>
+        </div>
+        <div>
+          <div class="text-xs text-base-content/60">Elevation gain</div>
+          <div class="font-medium">{{ route.ascent_m }} m</div>
+        </div>
+        <div>
+          <div class="text-xs text-base-content/60">Lead-in</div>
+          <div class="font-medium">{{ route.leadin_km }} km · {{ route.leadin_ascent_m }} m</div>
+        </div>
+        <div>
+          <div class="text-xs text-base-content/60">Total w/ lead-in</div>
+          <div class="font-medium">{{ route.total_distance_km }} km</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  {# ---- vELO2 Race factor weights (from the ZwiftRacing routes import) ---- #}
+  {% with bars=route.velo_factor_bars %}
+  {% if bars %}
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <h3 class="font-semibold mb-3">vELO2 Event Factor Weights</h3>
+      <div class="space-y-2 max-w-lg">
+        {% for f in bars %}
+        <div class="flex items-center gap-3">
+          <span class="w-5 text-center shrink-0">{{ f.icon }}</span>
+          <span class="w-20 text-sm shrink-0">{{ f.label }}</span>
+          <div class="flex-1 h-5 rounded bg-base-300 overflow-hidden">
+            <div class="h-full rounded flex items-center justify-end pr-1.5 text-[10px] font-semibold text-white"
+                 style="width: {{ f.value }}%; background: {{ f.color }};">{% if f.value >= 12 %}{{ f.value }}%{% endif %}</div>
+          </div>
+          <span class="w-12 text-right text-sm tabular-nums shrink-0">{{ f.value }}%</span>
+        </div>
+        {% endfor %}
+      </div>
+      <p class="text-xs text-base-content/50 mt-3">ZwiftRacing vELO2 Race-rating blend{% if route.velo_num_events %} · {{ route.velo_num_events }} events{% endif %} (factors sum to ~100%).</p>
+    </div>
+  </div>
+  {% endif %}
+  {% endwith %}
+
+  {# ---- Elevation profile, map & segments (Speed Lab charts) ---- #}
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <div id="zsl-route" class="zsl-chart"
+           data-name="{{ route.name }}"
+           data-world-id="{{ route.world_id }}"
+           data-name-hash="{{ route.name_hash }}"
+           data-distance-km="{{ route.distance_km }}"
+           data-leadin-km="{{ route.leadin_km }}"
+           data-ascent-m="{{ route.ascent_m }}"
+           data-avg-gradient="{{ route.avg_gradient_pct }}"
+           data-profile-url="{% url 'routes:profile_json' route.world_id route.name_hash %}"
+           data-segments-url="{% url 'routes:route_segments_json' route.world_id route.name_hash %}"
+           data-seg-detail-url0="{% url 'routes:segment_detail' 0 %}">
+
+        <div class="route-chart">
+          <div class="rp-head">
+            <span class="rp-title">Elevation profile<span class="rp-maxgrade"></span></span>
+            <label class="seg-toggle-l" hidden><input type="checkbox" class="seg-toggle" checked /> segments</label>
+            <span class="rp-legend">
+              <i style="background:#6cc551"></i>&lt;3%
+              <i style="background:#f2c744"></i>3–6
+              <i style="background:#ef9f27"></i>6–9
+              <i style="background:#e2622f"></i>9–12
+              <i style="background:#d03b3b"></i>&gt;12
+            </span>
+          </div>
+          <div class="rp-body"><span class="rp-msg">Loading…</span></div>
+        </div>
+
+        <div class="route-shape">
+          <div class="rp-title">Map</div>
+          <div class="rs-row">
+            <div class="rs-shape-body"><span class="rp-msg">Loading…</span></div>
+            <div class="rs-side">
+              <div class="rp-legend rs-grades">
+                <i style="background:#6cc551"></i>&lt;3%
+                <i style="background:#f2c744"></i>3–6
+                <i style="background:#ef9f27"></i>6–9
+                <i style="background:#e2622f"></i>9–12
+                <i style="background:#d03b3b"></i>&gt;12
+              </div>
+              <span class="rs-leadnote">lead-in shown dashed</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="route-segs">
+          <div class="route-segs-title">Segments on this route</div>
+          <div class="route-segs-body"><span class="rp-msg">Loading…</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{% static 'zwift_data/profile_chart.js' %}"></script>
+<script src="{% static 'zwift_data/route_detail.js' %}"></script>
+{% endblock %}

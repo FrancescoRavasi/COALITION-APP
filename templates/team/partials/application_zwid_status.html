@@ -1,0 +1,16 @@
+<div id="application-zwid-section">
+  {% if application.zwift_id and application.zwift_verified %}
+  {# Verified through Zwift Link, or, for older rows, by a retired path (the Sauce password flow or a staff grant). Staff can no longer verify a registration: only the applicant's own connection does. #}
+  <div class="alert alert-success mb-6">
+    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+    <div>
+      <span class="font-bold">Zwift ID Verified:</span>
+      <span class="font-mono">{{ application.zwift_id }}</span>
+      <a href="https://zwiftpower.com/profile.php?z={{ application.zwift_id }}" target="_blank" rel="noopener" class="ml-2 inline-block px-1 text-xs font-bold text-orange-400 bg-gray-700 rounded">ZP</a>
+      <a href="https://www.zwiftracing.app/riders/{{ application.zwift_id }}" target="_blank" rel="noopener" class="ml-1 inline-block px-1 text-xs font-bold text-white bg-sky-500 rounded">ZR</a>
+    </div>
+  </div>
+  {% endif %}
+</div>

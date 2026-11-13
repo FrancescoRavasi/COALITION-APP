@@ -1,0 +1,162 @@
+# Ruff configuration file
+target-version = "py314"
+line-length = 120
+preview = true
+
+[lint]
+# W′ (W-prime, a rider's anaerobic work capacity, in the TTT planner) is written with the
+# real prime, U+2032, which RUF001-003 would otherwise flag as a look-alike.
+allowed-confusables = ["′"]
+select = [
+    # flake8-bugbear
+    "B",
+    # flake8-comprehensions
+    "C4",
+    # flake8-builtins (shadowing builtins)
+    "A",
+    # flake8-pie (misc lints)
+    "PIE",
+    # flake8-raise (unnecessary parens on raise)
+    "RSE",
+    # flake8-tidy-imports (ban relative imports)
+    "TID",
+    # flake8-future-annotations
+    "FA",
+    # flake8-2020 (sys.version misuse)
+    "YTT",
+    # Pylint errors only (genuine bugs, no style opinions)
+    "PLE",
+    # pygrep-hooks (blanket noqa/type-ignore, eval)
+    "PGH",
+    #pydoclint
+    "DOC",
+    # pydocstyle
+    "D",
+    # - ERRORS
+    "E",
+    # eradicate (commented-out code)
+#    "ERA",
+    # Pyflakes
+    "F",
+    "FLY",
+    # isort
+    "I",
+    # Fast API
+    "FAST",
+    # NumPy-specific rules (NPY)
+    "NPY",
+    # Perflint (PERF)
+    "PERF",
+    # flake8-use-pathlib
+    "PTH",
+    # pyupgrade
+    "UP",
+    # flake8-simplify
+    "SIM",
+    # Django
+    "DJ",
+    # flake8-datetimez (timezone-aware datetimes)
+    "DTZ",
+    # flake8-type-checking (move type-only imports into TYPE_CHECKING)
+    "TC",
+    # Ruff
+    "RUF",
+    # flake8-bandit (security)
+    "S",
+    # flake8-print
+    "T20",
+    # flake8-async (async safety; supersedes the old ASYNC1/flake8-trio subset)
+    "ASYNC",
+    # - Warning
+    "W",
+    # The rules below were all at zero violations when enabled, so they add no
+    # backlog -- they exist to keep it that way.
+    # flake8-debugger (stray breakpoint()/pdb.set_trace())
+    "T10",
+    # flake8-no-pep420 (a Django app dir that lost its __init__.py)
+    "INP",
+    # flake8-executable (shebang vs exec bit)
+    "EXE",
+    # flake8-slots (str/tuple subclasses without __slots__)
+    "SLOT",
+    # flake8-import-conventions
+    "ICN",
+    # flake8-logging + flake8-logging-format. Nothing here uses stdlib logging --
+    # logfire is the house standard -- so these only fire if that changes.
+    "LOG",
+    "G",
+    # flake8-pyi (redundant numeric unions, e.g. `int | float` -> `float`)
+    "PYI",
+    # flake8-return (superfluous else-after-return)
+    "RET",
+    # One rule out of refurb, not the whole family: the rest of FURB leaves ~29
+    # style findings, but this one catches a real staleness -- fromisoformat has
+    # parsed a trailing "Z" natively since 3.11, so `.replace("Z", "+00:00")` is
+    # dead weight that hides how the string is really being parsed.
+    "FURB162",
+
+]
+ignore = [
+    "D203",  # Conflicts with D211 (no blank line before class)
+    "D213",  # Conflicts with D212 (multi-line summary first line)
+    # ruff 0.15 wants its own suppression syntax (`# ruff:ignore[rule-name]`) and
+    # long rule names in this file. We keep `# noqa: RUF012` style on purpose: the
+    # short codes are what ruff's own docs and default error output use, and
+    # `# noqa` is understood by every other Python linter and editor. Adopting the
+    # ruff-only spelling would churn ~60 comments for no diagnostic gain.
+    "RUF105",  # noqa-comments: prefers `# ruff:ignore[...]` over `# noqa: ...`
+    "RUF201",  # rule-codes-in-selectors: prefers rule names over codes above
+]
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[lint.per-file-ignores]
+"tests/*" = ["S101", "D100", "D103", "DTZ"]      # Allow assert, missing docstrings, naive dates in tests
+"**/tests.py" = ["S101", "D100", "D103", "DTZ"]  # Same for app-level tests.py files
+"**/test_*.py" = ["S101", "D100", "D103", "DTZ"] # Same for test_*.py files
+"conftest.py" = ["D100", "D103", "DOC201"] # Fixtures self-document via name
+"**/conftest.py" = ["D100", "D103", "DOC201"]
+"__init__.py" = ["D104"]                  # Allow missing docstrings in __init__.py
+# Auto-generated Django migrations: skip docstrings, line length, and mutable
+# class defaults (operations/dependencies lists). The glob must be **-anchored
+# to match apps/<app>/migrations/*.py — a bare "migrations/*" matches nothing here.
+"**/migrations/*" = ["D100", "D101", "E501", "RUF012"]
+# Django ModelForm Meta classes use plain list/dict attributes (fields, widgets,
+# exclude, …) by framework convention, which RUF012 flags as mutable class
+# defaults. That's idiom, not a bug, so silence RUF012 in form modules.
+"**/forms.py" = ["RUF012"]
+
+[format]
+# Django writes migrations itself, in its own style, and nobody reads their
+# blame or their line wrapping. Formatting them would mean every future
+# `makemigrations` lands a file that fails `ruff format --check` until someone
+# reformats it -- perpetual churn for no readability gain. Lint still applies to
+# them (see the `**/migrations/*` entry under per-file-ignores above); only the
+# formatter is opted out.
+exclude = ["**/migrations/*"]
+
+# Like Black, use double quotes for strings.
+quote-style = "double"
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+# Enable auto-formatting of code examples in docstrings. Markdown,
+# reStructuredText code/literal blocks and doctests are all supported.
+#
+# This is currently disabled by default, but it is planned for this
+# to be opt-out in the future.
+docstring-code-format = true
+
+# Set the line length limit used when formatting code snippets in
+# docstrings.
+#
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = "dynamic"

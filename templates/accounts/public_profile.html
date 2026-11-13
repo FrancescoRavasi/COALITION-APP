@@ -1,0 +1,441 @@
+{% extends "base.html" %}
+
+{% block title %}{{ profile_user.first_name }} {{ profile_user.last_name }} - Profile{% endblock %}
+
+{% block content %}
+  <div class="max-w-3xl mx-auto">
+    {% if is_own_profile %}
+      <div class="alert alert-info mb-4">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <span>This is how teammates see your profile.</span>
+        <a href="{% url 'accounts:profile' %}" class="btn btn-sm btn-primary">Edit Profile</a>
+      </div>
+    {% endif %}
+    <div class="card bg-base-200 shadow-xl">
+      <div class="card-body">
+        <!-- Header: Avatar and Name -->
+        <div class="flex items-center gap-6 mb-6">
+          {% if profile_user.discord_avatar_url %}
+            <div class="avatar">
+              <div class="w-24 rounded-full ring ring-primary ring-offset-base-100 ring-offset-2">
+                <img src="{{ profile_user.discord_avatar_url }}" alt="{{ profile_user.first_name }}'s avatar"/>
+              </div>
+            </div>
+          {% else %}
+            <div class="avatar placeholder">
+              <div
+                  class="bg-neutral text-neutral-content rounded-full w-24 ring ring-primary ring-offset-base-100 ring-offset-2">
+                <span
+                    class="text-3xl">{{ profile_user.first_name|slice:":1"|upper }}{{ profile_user.last_name|slice:":1"|upper }}</span>
+              </div>
+            </div>
+          {% endif %}
+          <div>
+            <h2 class="text-2xl font-bold">{{ profile_user.first_name }} {{ profile_user.last_name }}</h2>
+            {% if profile_user.discord_nickname %}
+              <p class="text-base-content/70">
+                        <span class="inline-flex items-center gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24"
+                                 fill="currentColor">
+                                <path
+                                    d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+                            </svg>
+                            {{ profile_user.discord_nickname }}
+                        </span>
+              </p>
+            {% elif profile_user.discord_username %}
+              <p class="text-base-content/70">
+                        <span class="inline-flex items-center gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24"
+                                 fill="currentColor">
+                                <path
+                                    d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+                            </svg>
+                            @{{ profile_user.discord_username }}
+                        </span>
+              </p>
+            {% endif %}
+            {% if profile_user.city or profile_user.country %}
+              <p class="text-base-content/70">
+                        <span class="inline-flex items-center gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                                 stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>
+                            </svg>
+                            {% if profile_user.city %}{{ profile_user.city }}{% if profile_user.country %},
+                            {% endif %}{% endif %}{{ profile_user.country.name|default:"" }}
+                        </span>
+              </p>
+            {% endif %}
+            {% if profile_user.timezone %}
+              <p class="text-base-content/50 text-sm">
+                        <span class="inline-flex items-center gap-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                                 stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                            {{ profile_user.timezone }}
+                        </span>
+              </p>
+            {% endif %}
+            {% include "accounts/partials/_team_kit_badges.html" with rider=profile_user %}
+          </div>
+        </div>
+
+        <!-- Info Cards -->
+        {% comment %}
+          Info cards, two to a row from md up. Rider and Verification come first: what the member
+          enters about themselves, and what the team has checked. The rider data cards after
+          them come from zauth's cache and refresh in place, so they are one include, shared with
+          the edit page, whose wrapper is display: contents -- its cards sit in this grid.
+
+          Groups inside a card are divided by divide-y (see rider_data_cards.html).
+        {% endcomment %}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+          <div class="card bg-base-300 p-4">
+            <h3 class="font-semibold mb-3 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><circle cx="12" cy="8" r="4" stroke-width="2"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg>
+              Rider
+            </h3>
+            <div class="text-sm divide-y divide-base-content/10">
+              {% if profile_user.gender %}
+                <div class="py-2 first:pt-0 last:pb-0">
+                  <div class="flex justify-between gap-3">
+                    <span class="text-base-content/70">Gender</span>
+                    <span class="text-right">{{ profile_user.get_gender_display }}</span>
+                  </div>
+                </div>
+              {% endif %}
+              <div class="space-y-1 py-2 first:pt-0 last:pb-0">
+                <div class="flex justify-between gap-3">
+                  <span class="text-base-content/70">Trainer</span>
+                  <span class="text-right">{{ profile_user.trainer|default:"&mdash;" }}</span>
+                </div>
+                <div class="flex justify-between gap-3">
+                  <span class="text-base-content/70">Power Meter</span>
+                  <span class="text-right">{{ profile_user.powermeter|default:"&mdash;" }}</span>
+                </div>
+                <div class="flex justify-between gap-3">
+                  <span class="text-base-content/70">HR Monitor</span>
+                  <span class="text-right">{{ profile_user.heartrate_monitor|default:"&mdash;" }}</span>
+                </div>
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-base-content/70">Dual Recording</span>
+                  {% if profile_user.dual_recording is None %}
+                    <span>&mdash;</span>
+                  {% elif profile_user.dual_recording %}
+                    <span class="badge badge-success badge-sm">Yes</span>
+                  {% else %}
+                    <span class="badge badge-ghost badge-sm">No</span>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card bg-base-300 p-4">
+            <h3 class="font-semibold mb-3 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4"/></svg>
+              Verification
+            </h3>
+            <div class="text-sm divide-y divide-base-content/10">
+              <div class="space-y-1 py-2 first:pt-0 last:pb-0">
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-base-content/70">Zwift Verified</span>
+                  {% if profile_user.has_accepted_zwid_verification %}
+                    <span class="badge badge-success badge-sm">Yes</span>
+                  {% else %}
+                    <span class="badge badge-ghost badge-sm">No</span>
+                  {% endif %}
+                </div>
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-base-content/70">Race Verified</span>
+                  {% if profile_user.is_extra_verified %}
+                    {% if site_settings.extra_verified_emoji %}
+                      <img src="{{ site_settings.extra_verified_emoji.url }}" alt="Extra Verified" class="h-5 w-5">
+                    {% else %}
+                      <span class="badge badge-warning badge-sm">EV</span>
+                    {% endif %}
+                  {% elif profile_user.is_race_ready %}
+                    {% if site_settings.verified_emoji %}
+                      <img src="{{ site_settings.verified_emoji.url }}" alt="Yes" class="h-5 w-5">
+                    {% else %}
+                      <span class="badge badge-success badge-sm">Yes</span>
+                    {% endif %}
+                  {% else %}
+                    {% if site_settings.not_verified_emoji %}
+                      <img src="{{ site_settings.not_verified_emoji.url }}" alt="No" class="h-5 w-5">
+                    {% else %}
+                      <span class="badge badge-ghost badge-sm">No</span>
+                    {% endif %}
+                  {% endif %}
+                </div>
+              </div>
+
+              {% comment %}
+                The latest verified record of each type. Days left are plain text and an expired
+                record is a solid badge: status-coloured text on the card fell under 4.5:1 in the
+                light theme. days_remaining reads the validity windows from Constance on every
+                access, so each row reads it once.
+              {% endcomment %}
+              <div class="space-y-1 py-2 first:pt-0 last:pb-0">
+                {% with record=verification_summary.weight_full %}
+                  {% if record %}
+                    <div class="flex items-center justify-between gap-3">
+                      <span class="text-base-content/70">Weight Full</span>
+                      {% with days=record.days_remaining %}
+                        {% if days is None %}
+                          <span>No expiry</span>
+                        {% elif days > 0 %}
+                          <span class="font-mono">{{ days }} day{{ days|pluralize }} left</span>
+                        {% else %}
+                          <span class="badge badge-error badge-sm">Expired</span>
+                        {% endif %}
+                      {% endwith %}
+                    </div>
+                  {% endif %}
+                {% endwith %}
+                {% with record=verification_summary.weight_light %}
+                  {% if record %}
+                    <div class="flex items-center justify-between gap-3">
+                      <span class="text-base-content/70">Weight Light</span>
+                      {% with days=record.days_remaining %}
+                        {% if days is None %}
+                          <span>No expiry</span>
+                        {% elif days > 0 %}
+                          <span class="font-mono">{{ days }} day{{ days|pluralize }} left</span>
+                        {% else %}
+                          <span class="badge badge-error badge-sm">Expired</span>
+                        {% endif %}
+                      {% endwith %}
+                    </div>
+                  {% endif %}
+                {% endwith %}
+                {% if verification_summary.height %}
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="text-base-content/70">Height</span>
+                    <span class="font-mono">{{ verification_summary.height.record_date|date:"M j, Y" }}</span>
+                  </div>
+                {% endif %}
+                {% with record=verification_summary.power %}
+                  {% if record %}
+                    <div class="flex items-center justify-between gap-3">
+                      <span class="text-base-content/70">Power</span>
+                      {% with days=record.days_remaining %}
+                        {% if days is None %}
+                          <span>No expiry</span>
+                        {% elif days > 0 %}
+                          <span class="font-mono">{{ days }} day{{ days|pluralize }} left</span>
+                        {% else %}
+                          <span class="badge badge-error badge-sm">Expired</span>
+                        {% endif %}
+                      {% endwith %}
+                    </div>
+                  {% endif %}
+                {% endwith %}
+                {% if not verification_summary %}
+                  <p class="text-base-content/70">No verified records</p>
+                {% endif %}
+              </div>
+              {% if pending_records %}
+                <div class="py-2 first:pt-0 last:pb-0">
+                  <div class="text-base-content/70">Pending</div>
+                  <div class="flex flex-wrap gap-1 mt-1">
+                    {% for record in pending_records %}
+                      <span class="badge badge-warning badge-sm">{{ record.get_verify_type_display }}</span>
+                    {% endfor %}
+                  </div>
+                </div>
+              {% endif %}
+            </div>
+          </div>
+
+          {% include "accounts/partials/rider_data_cards.html" %}
+        </div>
+        {% include "accounts/partials/_rider_data_update_script.html" %}
+
+        <!-- YouTube Videos -->
+        {% if youtube_videos %}
+          <div class="mb-6">
+            <h3 class="font-semibold mb-3 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-red-600" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+              </svg>
+              Recent Videos
+            </h3>
+            <ul class="space-y-2">
+              {% for video in youtube_videos %}
+                <li class="flex items-center justify-between gap-4">
+                  <a href="{{ video.url }}" target="_blank" rel="noopener"
+                     class="link link-hover text-sm flex-1 truncate" title="{{ video.title }}">
+                    {{ video.title }}
+                  </a>
+                  <span class="text-xs text-base-content/50 whitespace-nowrap">
+                    {% if video.published_at %}{{ video.published_at|date:"M j, Y" }}{% endif %}
+                  </span>
+                  <a aria-label="Open {{ video.title }} on YouTube" href="{{ video.url }}" target="_blank" rel="noopener" class="btn btn-ghost btn-xs">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                    </svg>
+                  </a>
+                </li>
+              {% endfor %}
+            </ul>
+            {% if profile_user.youtube_channel %}
+              <div class="mt-3">
+                <a href="{{ profile_user.youtube_channel }}" target="_blank" rel="noopener" class="btn btn-xs btn-ghost">
+                  View all on YouTube
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                  </svg>
+                </a>
+              </div>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <!-- Recent Zwift Activities (last 30 days, from the zauth service) -->
+        {% if activity_window and activity_window.activities %}
+          <div class="mb-6">
+            <h3 class="font-semibold mb-3 flex items-center gap-2">
+              <span class="px-1.5 py-0.5 text-xs font-bold text-primary-content bg-primary rounded">Z</span>
+              Recent Activities
+              <span class="text-xs font-normal text-base-content/50">· last {{ activity_window.days }} days</span>
+            </h3>
+
+            <!-- 30-day stats -->
+            <div class="flex flex-wrap gap-2 mb-3">
+              <span class="badge badge-lg">{{ activity_window.count }} activit{{ activity_window.count|pluralize:"y,ies" }}</span>
+              {% for sport, n in activity_window.sports.items %}
+                <span class="badge badge-lg badge-outline">{{ sport|title }}: {{ n }}</span>
+              {% endfor %}
+              {% if activity_window.total_distance_km %}
+                <span class="badge badge-lg badge-ghost">{{ activity_window.total_distance_km }} km total</span>
+              {% endif %}
+              {% if activity_window.total_duration %}
+                <span class="badge badge-lg badge-ghost">{{ activity_window.total_duration }} total</span>
+              {% endif %}
+            </div>
+
+            <div class="overflow-x-auto">
+              <table class="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Activity</th>
+                    <th>Sport</th>
+                    <th class="text-right">Distance</th>
+                    <th class="text-right">Time</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for a in activity_window.activities %}
+                    <tr>
+                      <td class="text-base-content/70 whitespace-nowrap">{{ a.date|default:""|slice:":10"|default:"—" }}</td>
+                      <td>{{ a.name|default:"Activity"|truncatechars:40 }}</td>
+                      <td>{% if a.sport %}<span class="badge badge-sm badge-outline">{{ a.sport|title }}</span>{% else %}—{% endif %}</td>
+                      <td class="text-right whitespace-nowrap">{% if a.distance_km %}{{ a.distance_km }} km{% else %}—{% endif %}</td>
+                      <td class="text-right whitespace-nowrap">{{ a.duration|default:"—" }}</td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {% endif %}
+
+        <!-- Recent Results -->
+        {% if recent_results %}
+          <div class="mb-6">
+            <h3 class="font-semibold mb-3 flex items-center gap-2">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+              </svg>
+              Recent Results
+            </h3>
+            <div class="overflow-x-auto">
+              <table class="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Event</th>
+                    <th>Cat</th>
+                    <th class="text-right">Pos</th>
+                    <th class="text-right">Avg Power</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for result in recent_results %}
+                    <tr>
+                      <td class="text-base-content/70 whitespace-nowrap">{{ result.event.event_date|date:"M j, Y" }}</td>
+                      <td>
+                        <a href="https://zwiftpower.com/events.php?zid={{ result.zid }}" target="_blank" rel="noopener"
+                           class="link link-hover text-sm" title="{{ result.event.title }}">
+                          {{ result.event.title|truncatechars:40 }}
+                        </a>
+                      </td>
+                      <td>
+                        {% if result.category %}
+                          <span class="badge badge-sm badge-outline">{{ result.category }}</span>
+                        {% else %}
+                          -
+                        {% endif %}
+                      </td>
+                      <td class="text-right font-mono">
+                        {% if result.position_in_cat %}
+                          {{ result.position_in_cat }}
+                        {% elif result.pos %}
+                          {{ result.pos }}
+                        {% else %}
+                          -
+                        {% endif %}
+                      </td>
+                      <td class="text-right font-mono whitespace-nowrap">
+                        {% if result.avg_power %}
+                          {{ result.avg_power }}w
+                          {% if result.avg_wkg %}
+                            <span class="text-base-content/50">({{ result.avg_wkg }})</span>
+                          {% endif %}
+                        {% else %}
+                          -
+                        {% endif %}
+                      </td>
+                    </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+            {% if profile_user.zwid %}
+              <div class="mt-2">
+                <a href="https://zwiftpower.com/profile.php?z={{ profile_user.zwid }}" target="_blank" rel="noopener"
+                   class="btn btn-xs btn-ghost">
+                  View all results on ZwiftPower
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                  </svg>
+                </a>
+              </div>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        <!-- Back Button -->
+        <div class="mt-4">
+          <a href="{% url 'team:roster' %}" class="btn btn-ghost btn-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24"
+                 stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/>
+            </svg>
+            Back to Team Roster
+          </a>
+        </div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

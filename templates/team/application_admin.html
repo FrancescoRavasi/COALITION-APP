@@ -1,0 +1,467 @@
+{% extends "base.html" %}
+{% load accounts_tags %}
+
+{% block title %}Registration - {{ application.display_name }} - The Coalition{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+  <div class="card bg-base-200 shadow-xl">
+    <div class="card-body">
+      <!-- Header -->
+      <div class="flex justify-between items-center mb-6">
+        <div class="flex items-center gap-4">
+          {% if application.avatar_url %}
+          <div class="avatar">
+            <div class="w-16 rounded-full ring ring-primary ring-offset-base-100 ring-offset-2">
+              <img src="{{ application.avatar_url }}" alt="{{ application.display_name }}" />
+            </div>
+          </div>
+          {% else %}
+          <div class="avatar placeholder">
+            <div class="bg-neutral text-neutral-content w-16 rounded-full">
+              <span class="text-xl">{{ application.discord_username|slice:":2"|upper }}</span>
+            </div>
+          </div>
+          {% endif %}
+          <div>
+            <h2 class="card-title text-2xl">{{ application.display_name }}</h2>
+            <div class="text-base-content/60">Membership Registration</div>
+          </div>
+        </div>
+        <!-- Status Badge -->
+        {% if application.status == "pending" %}
+        <span class="badge badge-warning badge-lg">Pending Review</span>
+        {% elif application.status == "in_progress" %}
+        <span class="badge badge-info badge-lg">In Progress</span>
+        {% elif application.status == "approved" %}
+        <span class="badge badge-success badge-lg">Approved</span>
+        {% elif application.status == "rejected" %}
+        <span class="badge badge-error badge-lg">Rejected</span>
+        {% endif %}
+      </div>
+
+      <!-- Registration Form Instructions -->
+      {% if application_form_instructions %}
+      <div class="bg-info/10 border border-info rounded-lg p-4 mb-6">
+        <div class="prose prose-sm max-w-none">
+          {{ application_form_instructions|render_markdown }}
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- Registration Questions (from Discord Modal) -->
+      {% if application.modal_form_data %}
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Registration Questions</h3>
+        <div class="grid grid-cols-1 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">How did you hear about The Coalition?</div>
+            <div class="font-medium">{{ application.modal_form_data.how_heard|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Reasons for Joining</div>
+            <div class="font-medium">
+              {% if application.modal_form_data.reasons %}
+              {% for reason in application.modal_form_data.reasons %}
+              <span class="badge badge-primary badge-sm mr-1">{{ reason }}</span>
+              {% endfor %}
+              {% else %}
+              -
+              {% endif %}
+            </div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Knows Someone on the Team</div>
+            <div class="font-medium">{{ application.modal_form_data.know_someone|default:"No" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Virtual Cycling Platforms</div>
+            <div class="font-medium">
+              {% if application.modal_form_data.platforms %}
+              {% for platform in application.modal_form_data.platforms %}
+              <span class="badge badge-secondary badge-sm mr-1">{{ platform }}</span>
+              {% endfor %}
+              {% else %}
+              -
+              {% endif %}
+            </div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Zwift Race Series Interest</div>
+            <div class="font-medium">
+              {% if application.modal_form_data.race_series %}
+              {% for series in application.modal_form_data.race_series %}
+              <span class="badge badge-accent badge-sm mr-1">{{ series }}</span>
+              {% endfor %}
+              {% else %}
+              None selected
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- Discord Information -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Discord Information</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">Discord ID</div>
+            <div class="font-mono">{{ application.discord_id }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Username</div>
+            <div class="font-medium">
+              <a href="https://discord.com/users/{{ application.discord_id }}" target="_blank" rel="noopener" class="link link-hover inline-flex items-center gap-1">
+                {{ application.discord_username }}
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-3 w-3 opacity-50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                </svg>
+              </a>
+            </div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Server Nickname</div>
+            <div class="font-medium">{{ application.server_nickname|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Avatar URL</div>
+            {% if application.avatar_url %}
+            <a href="{{ application.avatar_url }}" target="_blank" rel="noopener" class="link link-primary text-sm break-all">View Avatar</a>
+            {% else %}
+            <span class="text-base-content/30">-</span>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- Collapsible Raw Data -->
+        <div class="collapse collapse-arrow bg-base-200 mt-4">
+          <input type="checkbox" />
+          <div class="collapse-title font-medium">
+            Raw Discord Data
+          </div>
+          <div class="collapse-content">
+            <div class="mb-4">
+              <div class="text-sm text-base-content/60 mb-1">discord.User Data</div>
+              <pre class="bg-base-100 p-2 rounded text-xs overflow-x-auto">{{ application.discord_user_data|pprint }}</pre>
+            </div>
+            <div class="mb-4">
+              <div class="text-sm text-base-content/60 mb-1">discord.Member Data</div>
+              <pre class="bg-base-100 p-2 rounded text-xs overflow-x-auto">{{ application.discord_member_data|pprint }}</pre>
+            </div>
+            <div>
+              <div class="text-sm text-base-content/60 mb-1">Modal Form Data (Raw)</div>
+              <pre class="bg-base-100 p-2 rounded text-xs overflow-x-auto">{{ application.modal_form_data|pprint }}</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Registrant Information -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Registrant Information</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">First Name</div>
+            <div class="font-medium">{{ application.first_name|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Last Name</div>
+            <div class="font-medium">{{ application.last_name|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Privacy Policy</div>
+            {% if application.agree_privacy %}
+            <span class="badge badge-success badge-sm">Agreed</span>
+            {% else %}
+            <span class="badge badge-warning badge-sm">Not Agreed</span>
+            {% endif %}
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Terms of Service</div>
+            {% if application.agree_tos %}
+            <span class="badge badge-success badge-sm">Agreed</span>
+            {% else %}
+            <span class="badge badge-warning badge-sm">Not Agreed</span>
+            {% endif %}
+          </div>
+        </div>
+        {% if application.applicant_notes %}
+        <div class="mt-4">
+          <div class="text-sm text-base-content/60 mb-1">Registrant Notes</div>
+          <div class="bg-base-100 p-3 rounded">{{ application.applicant_notes }}</div>
+        </div>
+        {% endif %}
+
+        <div class="mt-4">
+          <div class="text-sm text-base-content/60 mb-1">Registration Complete</div>
+          {% if application.is_complete %}
+          <span class="badge badge-success">Yes - All required fields filled</span>
+          {% else %}
+          <span class="badge badge-warning">No - Missing required fields</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- ZWID Verification -->
+      {% include "team/partials/application_zwid_status.html" %}
+
+      <!-- Profile Information -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Profile Information</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">Zwift ID</div>
+            <div class="font-medium">
+              {{ application.zwift_id|default:"-" }}
+              {% if application.zwift_verified %}
+                <span class="badge badge-success badge-xs ml-1">Verified</span>
+              {% elif application.zwift_id %}
+                {# Typed in before verification became Zwift Link only; nothing is waiting on staff. #}
+                <span class="badge badge-ghost badge-xs ml-1">Not verified</span>
+              {% endif %}
+            </div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Country</div>
+            <div class="font-medium">{{ application.country.name|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Timezone</div>
+            <div class="font-medium">{{ application.timezone|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Year of Birth</div>
+            <div class="font-medium">{{ application.birth_year|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Gender</div>
+            <div class="font-medium">{{ application.get_gender_display|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Unit Preference</div>
+            <div class="font-medium">{{ application.get_unit_preference_display|default:"-" }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Equipment -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Equipment</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">Trainer</div>
+            <div class="font-medium">{{ application.trainer|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Power Meter</div>
+            <div class="font-medium">{{ application.power_meter|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Dual Recording</div>
+            <div class="font-medium">{{ application.get_dual_recording_display|default:"-" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Heart Rate Monitor</div>
+            <div class="font-medium">{{ application.heartrate_monitor|default:"-" }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Social Links -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Social Links</h3>
+        <div class="grid grid-cols-1 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">Strava Profile</div>
+            {% if application.strava_profile %}
+            <a href="{{ application.strava_profile }}" target="_blank" rel="noopener" class="link link-primary">{{ application.strava_profile }}</a>
+            {% else %}
+            <span class="text-base-content/30">-</span>
+            {% endif %}
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">TrainingPeaks Virtual</div>
+            {% if application.tpv_profile_url %}
+            <a href="{{ application.tpv_profile_url }}" target="_blank" rel="noopener" class="link link-primary">{{ application.tpv_profile_url }}</a>
+            {% else %}
+            <span class="text-base-content/30">-</span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+
+      <!-- Admin Form -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Admin Actions</h3>
+        <form method="post">
+          {% csrf_token %}
+          <div class="grid grid-cols-1 gap-4">
+            <div class="form-control">
+              <label class="label">
+                <span class="label-text">Status</span>
+              </label>
+              {{ form.status }}
+            </div>
+            <div class="form-control">
+              <label class="label">
+                <span class="label-text">Admin Notes</span>
+                <span class="label-text-alt text-base-content/50">Not visible to registrant</span>
+              </label>
+              {{ form.admin_notes }}
+            </div>
+          </div>
+          <div class="flex gap-4 mt-6">
+            <button type="submit" class="btn btn-primary">Save Changes</button>
+            <!-- Quick Action Buttons -->
+            <button type="submit" name="status" value="approved" class="btn btn-success btn-outline">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+              </svg>
+              Approve
+            </button>
+            <button type="submit" name="status" value="rejected" class="btn btn-error btn-outline">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+              Reject
+            </button>
+            <button type="button" class="btn btn-secondary btn-outline" onclick="document.getElementById('message-modal').showModal()">
+              <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+              </svg>
+              Leave Message
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <!-- Messages to Applicant -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">Messages to Applicant</h3>
+        {% if application.messages %}
+          {% for msg in application.messages %}
+          <div class="bg-base-100 rounded p-3 mb-2 last:mb-0">
+            <div class="text-xs text-base-content/60 mb-1">
+              {{ msg.author_name }} · {{ msg.created_at }}
+            </div>
+            <div class="prose prose-sm max-w-none">{{ msg.message|render_markdown_untrusted }}</div>
+          </div>
+          {% endfor %}
+        {% else %}
+          <p class="text-base-content/50 italic">No messages yet.</p>
+        {% endif %}
+      </div>
+
+      <!-- History -->
+      <div class="bg-base-300 rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-4">History</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <div class="text-sm text-base-content/60">Date Created</div>
+            <div class="font-medium">{{ application.date_created|date:"F d, Y H:i" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Date Modified</div>
+            <div class="font-medium">{{ application.date_modified|date:"F d, Y H:i" }}</div>
+          </div>
+          <div>
+            <div class="text-sm text-base-content/60">Modified By</div>
+            <div class="font-medium">{{ application.modified_by.username|default:"-" }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Public Link -->
+      <div class="bg-info/10 border border-info rounded-lg p-4 mb-6">
+        <h3 class="font-bold text-lg mb-2">Public Registration Link</h3>
+        <p class="text-sm text-base-content/70 mb-2">Share this link with the registrant to complete their registration:</p>
+        <div class="flex items-center gap-2">
+          <input type="text"
+                 value="{{ request.scheme }}://{{ request.get_host }}{% url 'team:application_public' application.pk %}"
+                 class="input input-bordered input-sm flex-1 font-mono text-xs"
+                 readonly
+                 id="public-link" />
+          <button type="button" class="btn btn-sm btn-outline" onclick="navigator.clipboard.writeText(document.getElementById('public-link').value); this.textContent='Copied!'">
+            Copy
+          </button>
+        </div>
+      </div>
+
+      <!-- Delete -->
+      <div class="bg-error/10 border border-error rounded-lg p-4 mb-6">
+        <div class="flex items-center justify-between">
+          <div>
+            <h3 class="font-bold text-error">Delete Registration</h3>
+            <p class="text-sm text-base-content/70">Permanently delete this registration record. This cannot be undone.</p>
+          </div>
+          <button type="button" class="btn btn-error btn-outline btn-sm" onclick="document.getElementById('delete-modal').showModal()">
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            Delete
+          </button>
+        </div>
+      </div>
+
+      <!-- Back Link -->
+      <div class="divider"></div>
+      <div class="text-center">
+        <a href="{% url 'team:application_list' %}" class="link link-primary">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+          </svg>
+          Back to Registrations
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Confirmation Modal -->
+<dialog id="delete-modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">Delete Registration</h3>
+    <p class="mt-2">Are you sure you want to delete the registration for <strong>{{ application.display_name }}</strong>?</p>
+    <p class="text-sm text-base-content/70 mt-1">This action cannot be undone.</p>
+    <div class="modal-action">
+      <button type="button" class="btn" onclick="document.getElementById('delete-modal').close()">Cancel</button>
+      <form method="post" action="{% url 'team:application_delete' application.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-error">Delete</button>
+      </form>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<!-- Leave Message Modal -->
+<dialog id="message-modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg">Leave Message for Applicant</h3>
+    <p class="text-base-content/60 text-sm mt-1">This message will be visible to the applicant on their registration form.</p>
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="add_message">
+      <div class="form-control mt-4">
+        <label class="label">
+          <span class="label-text">Message</span>
+          <span class="label-text-alt text-base-content/50">Markdown supported</span>
+        </label>
+        <textarea name="message" class="textarea textarea-bordered h-32" placeholder="Enter your message..." required></textarea>
+      </div>
+      <div class="modal-action">
+        <button type="button" class="btn" onclick="document.getElementById('message-modal').close()">Cancel</button>
+        <button type="submit" class="btn btn-primary">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+          </svg>
+          Send Message
+        </button>
+      </div>
+    </form>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+{% endblock %}

@@ -1,0 +1,642 @@
+<!-- Race Verified Submission Form -->
+<div id="race-ready-form-container">
+  <style>
+    .verify-picker .verify-opt {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      border: 1px solid color-mix(in oklch, var(--color-base-content) 15%, transparent);
+      border-radius: var(--radius-box, 1rem);
+      padding: 0.75rem;
+      cursor: pointer;
+      transition: background-color .15s, border-color .15s;
+    }
+    .verify-picker .verify-opt:hover { background: var(--color-base-100); }
+    .verify-picker .verify-opt:has(input:checked) {
+      border-color: var(--color-primary);
+      border-width: 2px;
+      padding: calc(0.75rem - 1px);
+      background: color-mix(in oklch, var(--color-primary) 8%, transparent);
+    }
+    .verify-picker .verify-opt__head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    .verify-picker .verify-opt__validity {
+      margin-left: auto;
+      font-size: 0.72rem;
+      white-space: nowrap;
+      color: color-mix(in oklch, var(--color-base-content) 60%, transparent);
+    }
+    .verify-picker .verify-opt__status {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      margin-top: 4px;
+      font-size: 0.75rem;
+    }
+    .verify-picker .verify-opt__status--valid { color: var(--color-success); }
+    .verify-picker .verify-opt__status--expired,
+    .verify-picker .verify-opt__status--rejected { color: var(--color-error); }
+    .verify-picker .verify-opt__status--pending { color: var(--color-warning); }
+    .verify-picker .verify-opt__status--none { color: color-mix(in oklch, var(--color-base-content) 50%, transparent); }
+  </style>
+  {% if success %}
+    <div class="alert alert-success mb-4">
+      <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+      </svg>
+      <span>Race Verified record submitted successfully!</span>
+    </div>
+  {% endif %}
+
+  <form hx-post="{% url 'accounts:submit_race_ready' %}"
+        hx-target="#race-ready-form-container"
+        hx-swap="outerHTML"
+        enctype="multipart/form-data"
+        class="space-y-4">
+    {% csrf_token %}
+
+    <!-- Same Gender Review Preference (only shown if user has gender set) -->
+    {% if request.user.gender %}
+      <div class="form-control">
+        <label class="label cursor-pointer justify-start gap-3">
+          {{ race_ready_form.same_gender }}
+          <span class="label-text">Request same-gender reviewer</span>
+        </label>
+        <label class="label pt-0">
+          <span class="label-text-alt text-base-content/70">If checked, only reviewers of the same gender can approve this record</span>
+        </label>
+      </div>
+    {% endif %}
+
+    <!-- Verification Type (radio picker: required + validity + current status per type) -->
+    <div class="form-control w-full verify-picker">
+      <label class="label">
+        <span class="label-text">Verification type</span>
+      </label>
+      <div id="verify-type-list" class="flex flex-col gap-2">
+        {% for opt in verify_type_options %}
+          <label class="verify-opt">
+            <input type="radio" name="verify_type" value="{{ opt.value }}" class="radio radio-primary radio-sm mt-1"
+                   {% if race_ready_form.verify_type.value|stringformat:'s' == opt.value or not race_ready_form.verify_type.value and forloop.first %}checked{% endif %}>
+            <span class="flex-1 min-w-0">
+              <span class="verify-opt__head">
+                <span class="font-semibold text-sm">{{ opt.label }}</span>
+                {% if opt.required %}
+                  <span class="badge badge-primary badge-sm">Required</span>
+                {% else %}
+                  <span class="badge badge-ghost badge-sm">Optional</span>
+                {% endif %}
+                <span class="verify-opt__validity">{{ opt.validity_label }}</span>
+              </span>
+              <span class="verify-opt__status verify-opt__status--{{ opt.current.state }}">{{ opt.current.text }}</span>
+            </span>
+          </label>
+        {% endfor %}
+      </div>
+      {% if race_ready_form.verify_type.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.verify_type.errors.0 }}</span>
+        </label>
+      {% endif %}
+    </div>
+
+    <!-- Media Type -->
+    <div class="form-control w-full">
+      <label class="label" for="id_media_type">
+        <span class="label-text">Media Type</span>
+      </label>
+      {{ race_ready_form.media_type }}
+      {% if race_ready_form.media_type.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.media_type.errors.0 }}</span>
+        </label>
+      {% endif %}
+    </div>
+
+    <!-- Instruction Links (shown based on verification type) -->
+    {% if weight_instructions_url %}
+      <div id="weight-instructions" class="alert alert-info {% if race_ready_form.verify_type.value != 'weight_full' and race_ready_form.verify_type.value != 'weight_light' %}hidden{% endif %}">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <span>
+                Please review the
+                <a href="{{ weight_instructions_url }}" target="_blank" rel="noopener"
+                   class="link link-primary font-medium">
+                    weight verification instructions
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline" fill="none" viewBox="0 0 24 24"
+                         stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                     d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                </a>
+                before submitting.
+            </span>
+      </div>
+    {% endif %}
+
+    {% if height_instructions_url %}
+      <div id="height-instructions" class="alert alert-info {% if race_ready_form.verify_type.value != 'height' %}hidden{% endif %}">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="stroke-current shrink-0 w-6 h-6">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <span>
+                Please review the
+                <a href="{{ height_instructions_url }}" target="_blank" rel="noopener"
+                   class="link link-primary font-medium">
+                    height verification instructions
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 inline" fill="none" viewBox="0 0 24 24"
+                         stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                     d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                </a>
+                before submitting.
+            </span>
+      </div>
+    {% endif %}
+
+    <!-- Weight Field (shown for weight_full/weight_light) -->
+    <div id="weight-field" class="form-control w-full {% if race_ready_form.verify_type.value != 'weight_full' and race_ready_form.verify_type.value != 'weight_light' %}hidden{% endif %}">
+      <label class="label" for="id_weight">
+        <span class="label-text">{{ race_ready_form.weight.label }}</span>
+      </label>
+      {{ race_ready_form.weight }}
+      <div id="weight-preview" class="text-sm text-base-content/70 mt-1 hidden">
+        <span class="font-medium">Saved as:</span> <span id="weight-preview-value"></span>
+      </div>
+      {% if race_ready_form.weight.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.weight.errors.0 }}</span>
+        </label>
+      {% endif %}
+    </div>
+
+    <!-- Height Field (shown for height) -->
+    <div id="height-field" class="form-control w-full {% if race_ready_form.verify_type.value != 'height' %}hidden{% endif %}">
+      <label class="label" for="id_height">
+        <span class="label-text">{{ race_ready_form.height.label }}</span>
+      </label>
+      {{ race_ready_form.height }}
+      <div id="height-preview" class="text-sm text-base-content/70 mt-1 hidden">
+        <span class="font-medium">Saved as:</span> <span id="height-preview-value"></span>
+      </div>
+      {% if race_ready_form.height.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.height.errors.0 }}</span>
+        </label>
+      {% endif %}
+    </div>
+
+    <!-- Record Date -->
+    <div class="form-control w-full">
+      <label class="label" for="id_record_date">
+        <span class="label-text">Record Date <span class="text-error">*</span></span>
+      </label>
+      {{ race_ready_form.record_date }}
+      {% if race_ready_form.record_date.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.record_date.errors.0 }}</span>
+        </label>
+      {% endif %}
+      <label class="label">
+        <span class="label-text-alt">Date the verification evidence was recorded</span>
+      </label>
+    </div>
+
+    {% comment %}
+      "Other" is evidence that is neither a file nor a link, so choosing it hides the two
+      fields below and makes the note the evidence. The script also DISABLES them, so a file
+      picked before switching is not sent; the server refuses one regardless.
+    {% endcomment %}
+    <div id="other-evidence-hint" class="alert alert-info hidden" role="status">
+      <span>Other evidence isn't uploaded or linked. Describe it in the notes below &mdash; what it is and how a reviewer can check it.</span>
+    </div>
+
+    <!-- Media File -->
+    <div id="media-file-field" class="form-control w-full">
+      <label class="label" for="id_media_file">
+        <span class="label-text">Upload File (optional)</span>
+      </label>
+      {{ race_ready_form.media_file }}
+      <div id="file-info" class="text-sm text-base-content/70 mt-1 hidden">
+        <span id="file-name"></span> (<span id="file-size"></span>)
+      </div>
+      {% comment %}
+        Client-side size rejection lands here. Rendered as a full alert rather than the small
+        label-text-alt used elsewhere: this one has to stop a rider before they spend minutes
+        uploading a file the server will refuse.
+      {% endcomment %}
+      <div id="file-error" class="alert alert-error mt-2 hidden" role="alert"></div>
+      {% if race_ready_form.media_file.errors %}
+        <div class="alert alert-error mt-2" role="alert">
+          <span>{{ race_ready_form.media_file.errors.0 }}</span>
+        </div>
+      {% endif %}
+      <label class="label">
+        <span id="media-file-help" class="label-text-alt">Max {{ race_ready_form.max_media_upload_mb }}MB. Allowed: {{ race_ready_form.allowed_media_extensions }}. Photos are saved without their location, and iPhone (HEIC) photos are saved as JPEG.</span>
+      </label>
+    </div>
+
+    <!-- Upload Progress -->
+    <div id="upload-progress" class="hidden">
+      <div class="flex items-center gap-3">
+        <span class="loading loading-spinner loading-sm"></span>
+        <span class="text-sm">Uploading<span id="upload-pct"></span>...</span>
+      </div>
+      <progress id="upload-bar" class="progress progress-primary w-full mt-1" value="0" max="100"></progress>
+    </div>
+
+    <!-- URL -->
+    <div id="url-field" class="form-control w-full">
+      <label class="label" for="id_url">
+        <span class="label-text">URL (optional)</span>
+      </label>
+      {{ race_ready_form.url }}
+      {% if race_ready_form.url.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.url.errors.0 }}</span>
+        </label>
+      {% endif %}
+      <label class="label">
+        <span class="label-text-alt">Link to YouTube, Vimeo, or image URL</span>
+      </label>
+    </div>
+
+    <!-- Notes -->
+    <div class="form-control w-full">
+      <label class="label" for="id_notes">
+        {# The script swaps these two when Other is chosen: the note is required then. #}
+        <span class="label-text" id="notes-label-optional">Notes (optional)</span>
+        <span class="label-text hidden" id="notes-label-required">Notes <span class="text-error">*</span></span>
+      </label>
+      {{ race_ready_form.notes }}
+      {% if race_ready_form.notes.errors %}
+        <label class="label">
+          <span class="label-text-alt text-error">{{ race_ready_form.notes.errors.0 }}</span>
+        </label>
+      {% endif %}
+    </div>
+
+    {% if race_ready_form.errors %}
+      <div class="alert alert-error">
+        <div>
+          {% for error in race_ready_form.non_field_errors %}
+            <p>{{ error }}</p>
+          {% endfor %}
+          {% for field in race_ready_form %}
+            {% if field.errors and field.name != "verify_type" and field.name != "media_type" and field.name != "record_date" and field.name != "media_file" and field.name != "url" and field.name != "notes" %}
+              {% for error in field.errors %}
+                <p>{{ field.label }}: {{ error }}</p>
+              {% endfor %}
+            {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+    {# Submit failures land here, beside the button that was just pressed. #}
+    <div id="submit-error" class="alert alert-error hidden" role="alert" aria-live="assertive"></div>
+
+    <div class="form-control">
+      <button id="submit-btn" type="submit" class="btn btn-primary">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24"
+             stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+        </svg>
+        Submit Record
+      </button>
+    </div>
+  </form>
+
+  {% comment %}
+    The evidence each verification accepts, from the form itself -- the same map clean()
+    enforces, so the picker cannot offer something the server will refuse, or hide something
+    it would take. json_script, not string interpolation, so the values arrive as data.
+  {% endcomment %}
+  {{ race_ready_form.MEDIA_TYPES_BY_VERIFY_TYPE|json_script:"media-types-by-verify-type" }}
+  <script>
+      (function () {
+          const unitPreference = '{{ unit_preference|default:"metric" }}';
+          const mediaTypesByVerifyType = JSON.parse(
+              document.getElementById('media-types-by-verify-type').textContent
+          );
+          const verifyTypeRadios = Array.from(document.querySelectorAll('input[name="verify_type"]'));
+          const getVerifyType = () => (verifyTypeRadios.find(r => r.checked) || {}).value || '';
+          const mediaTypeSelect = document.getElementById('id_media_type');
+          const allMediaOptions = Array.from(mediaTypeSelect.options).map(o => ({value: o.value, text: o.text}));
+          const weightField = document.getElementById('weight-field');
+          const heightField = document.getElementById('height-field');
+          const weightInstructions = document.getElementById('weight-instructions');
+          const heightInstructions = document.getElementById('height-instructions');
+
+          // Preview elements
+          const weightPreview = document.getElementById('weight-preview');
+          const weightPreviewValue = document.getElementById('weight-preview-value');
+          const heightPreview = document.getElementById('height-preview');
+          const heightPreviewValue = document.getElementById('height-preview-value');
+
+          // Input elements
+          const weightInput = document.getElementById('id_weight');
+          const heightInput = document.getElementById('id_height');
+
+          // Conversion constants
+          const LBS_TO_KG = 0.453592;
+          const INCHES_TO_CM = 2.54;
+
+          function toggleFields() {
+              const value = getVerifyType();
+
+              // Hide all fields and instructions first
+              weightField.classList.add('hidden');
+              heightField.classList.add('hidden');
+              if (weightInstructions) weightInstructions.classList.add('hidden');
+              if (heightInstructions) heightInstructions.classList.add('hidden');
+
+              // Offer only the evidence this verification accepts (see the json_script above).
+              // Filtered from allMediaOptions rather than rebuilt from the map, so the options
+              // keep the model's order and each type keeps the same default it always had.
+              const currentMediaValue = mediaTypeSelect.value;
+              mediaTypeSelect.innerHTML = '';
+              const accepted = mediaTypesByVerifyType[value] || allMediaOptions.map(o => o.value);
+              const allowedOptions = allMediaOptions.filter(o => accepted.includes(o.value));
+              allowedOptions.forEach(o => {
+                  const opt = document.createElement('option');
+                  opt.value = o.value;
+                  opt.text = o.text;
+                  if (o.value === currentMediaValue) opt.selected = true;
+                  mediaTypeSelect.appendChild(opt);
+              });
+              // If previous selection isn't available, select the first option
+              if (!allowedOptions.some(o => o.value === currentMediaValue)) {
+                  mediaTypeSelect.value = allowedOptions[0]?.value || '';
+              }
+              toggleEvidenceFields();
+
+              // Show appropriate field and instructions based on selection
+              if (value === 'weight_full' || value === 'weight_light') {
+                  weightField.classList.remove('hidden');
+                  if (weightInstructions) weightInstructions.classList.remove('hidden');
+              } else if (value === 'height') {
+                  heightField.classList.remove('hidden');
+                  if (heightInstructions) heightInstructions.classList.remove('hidden');
+              }
+          }
+
+          function updateWeightPreview() {
+              const value = parseFloat(weightInput.value);
+              if (!isNaN(value) && value > 0) {
+                  if (unitPreference === 'imperial') {
+                      // Convert lbs to kg for preview
+                      const kg = (value * LBS_TO_KG).toFixed(2);
+                      weightPreviewValue.textContent = kg + ' kg';
+                  } else {
+                      // Already metric, just show kg
+                      weightPreviewValue.textContent = value + ' kg';
+                  }
+                  weightPreview.classList.remove('hidden');
+              } else {
+                  weightPreview.classList.add('hidden');
+              }
+          }
+
+          function updateHeightPreview() {
+              const value = parseFloat(heightInput.value);
+              if (!isNaN(value) && value > 0) {
+                  if (unitPreference === 'imperial') {
+                      // Convert inches to cm for preview
+                      const cm = Math.round(value * INCHES_TO_CM);
+                      heightPreviewValue.textContent = cm + ' cm';
+                  } else {
+                      // Already metric, just show cm
+                      heightPreviewValue.textContent = value + ' cm';
+                  }
+                  heightPreview.classList.remove('hidden');
+              } else {
+                  heightPreview.classList.add('hidden');
+              }
+          }
+
+          // "Other" evidence is neither a file nor a link: hide and DISABLE those two -- a disabled
+          // input is not submitted, so a file picked before switching never goes -- and make the
+          // note the evidence. Values are kept, so switching back restores what was there.
+          const mediaFileField = document.getElementById('media-file-field');
+          const urlField = document.getElementById('url-field');
+          const otherHint = document.getElementById('other-evidence-hint');
+          const notesInput = document.getElementById('id_notes');
+          const notesOptional = document.getElementById('notes-label-optional');
+          const notesRequired = document.getElementById('notes-label-required');
+
+          // The file picker offers only the kind of file the chosen evidence needs -- on an
+          // iPhone, Video opens the video library -- from the lists the form puts on the widget,
+          // which are the ones its validator uses. Link keeps the full list.
+          const mediaFileInput = document.getElementById('id_media_file');
+          const acceptAny = mediaFileInput ? (mediaFileInput.getAttribute('accept') || '') : '';
+          function acceptFor(mediaType) {
+              if (!mediaFileInput) return '';
+              if (mediaType === 'photo') return mediaFileInput.dataset.acceptPhoto || acceptAny;
+              if (mediaType === 'video') return mediaFileInput.dataset.acceptVideo || acceptAny;
+              return acceptAny;
+          }
+
+          function toggleEvidenceFields() {
+              const isOther = mediaTypeSelect.value === 'other';
+              if (mediaFileInput) mediaFileInput.setAttribute('accept', acceptFor(mediaTypeSelect.value));
+              [mediaFileField, urlField].forEach(field => {
+                  if (!field) return;
+                  field.classList.toggle('hidden', isOther);
+                  field.querySelectorAll('input').forEach(input => { input.disabled = isOther; });
+              });
+              if (otherHint) otherHint.classList.toggle('hidden', !isOther);
+              if (notesInput) notesInput.required = isOther;
+              if (notesOptional) notesOptional.classList.toggle('hidden', isOther);
+              if (notesRequired) notesRequired.classList.toggle('hidden', !isOther);
+              // Re-run the size check below against the new state. An oversized file disables
+              // Submit; once Other has set that file aside, the rider must not be left stuck --
+              // and switching back must bring the check back. Dispatched rather than called,
+              // because that code is declared further down the script.
+              const fileInputEl = document.getElementById('id_media_file');
+              if (fileInputEl) fileInputEl.dispatchEvent(new Event('change'));
+          }
+
+          // Run on page load and on change
+          toggleFields();
+          verifyTypeRadios.forEach(r => r.addEventListener('change', toggleFields));
+          mediaTypeSelect.addEventListener('change', toggleEvidenceFields);
+
+          // Add input listeners for preview
+          if (weightInput) {
+              weightInput.addEventListener('input', updateWeightPreview);
+              if (weightInput.value) updateWeightPreview();
+          }
+          if (heightInput) {
+              heightInput.addEventListener('input', updateHeightPreview);
+              if (heightInput.value) updateHeightPreview();
+          }
+
+          // File info display, and the type, kind and size checks BEFORE the upload starts.
+          const fileInput = document.getElementById('id_media_file');
+          const fileInfo = document.getElementById('file-info');
+          const fileName = document.getElementById('file-name');
+          const fileSize = document.getElementById('file-size');
+          const fileError = document.getElementById('file-error');
+          const submitBtn = document.getElementById('submit-btn');
+          const submitError = document.getElementById('submit-error');
+          // Read from the widget attribute so the browser, the help text and the server
+          // validator all come from the one constant in forms.py.
+          const maxMb = fileInput ? parseInt(fileInput.dataset.maxMb || '0', 10) : 0;
+          const listFrom = value => (value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+          // The server's reading of a name (PurePath.suffix in apps/team/evidence_media.py):
+          // leading dots are ignored, then the text from the last dot on -- none for ".heic".
+          const extensionOf = name => {
+              const base = name.replace(/^\.+/, '');
+              const dot = base.lastIndexOf('.');
+              return dot >= 0 ? base.slice(dot).toLowerCase() : '';
+          };
+
+          // What is wrong with the chosen file, in the validator's own words, or '' if nothing.
+          function fileProblem(input, f, mb) {
+              const ext = extensionOf(f.name);
+              const allowed = listFrom(acceptAny);
+              const wanted = mediaTypeSelect.value;
+              if (listFrom(input.dataset.rawExtensions).includes(ext)) {
+                  return input.dataset.rawMessage;
+              }
+              if (!allowed.includes(ext)) {
+                  return f.name + ' is not an allowed file type. Allowed: ' + allowed.join(', ');
+              }
+              if (wanted === 'photo' && !listFrom(input.dataset.acceptPhoto).includes(ext)) {
+                  return input.dataset.wrongKindPhoto;
+              }
+              if (wanted === 'video' && !listFrom(input.dataset.acceptVideo).includes(ext)) {
+                  return input.dataset.wrongKindVideo;
+              }
+              if (maxMb && mb > maxMb) {
+                  return f.name + ' is ' + mb.toFixed(0) + ' MB. The limit is ' + maxMb +
+                      ' MB — please trim or compress it, then choose the file again.';
+              }
+              return '';
+          }
+
+          function showBanner(el, message) {
+              if (!el) return;
+              el.innerHTML = '';
+              const span = document.createElement('span');
+              span.textContent = message;   // textContent, not innerHTML: file names are user input
+              el.appendChild(span);
+              el.classList.remove('hidden');
+              el.scrollIntoView({behavior: 'smooth', block: 'center'});
+          }
+
+          function clearBanner(el) {
+              if (!el) return;
+              el.classList.add('hidden');
+              el.innerHTML = '';
+          }
+
+          function setSubmitEnabled(enabled) {
+              if (!submitBtn) return;
+              submitBtn.disabled = !enabled;
+              submitBtn.classList.toggle('btn-disabled', !enabled);
+          }
+
+          if (fileInput) {
+              fileInput.addEventListener('change', function () {
+                  clearBanner(fileError);
+                  clearBanner(submitError);
+                  setSubmitEnabled(true);
+
+                  // A disabled input (evidence type "Other") is not sent, so it has no size to check.
+                  if (this.disabled || !(this.files && this.files[0])) {
+                      fileInfo.classList.add('hidden');
+                      return;
+                  }
+                  const f = this.files[0];
+                  const mb = f.size / 1024 / 1024;
+                  fileName.textContent = f.name;
+                  fileSize.textContent = mb.toFixed(1) + ' MB';
+                  fileInfo.classList.remove('hidden');
+
+                  // Catch it here rather than after a long upload that the server will refuse --
+                  // a RAW photo from an iPhone is tens of megabytes.
+                  const problem = fileProblem(this, f, mb);
+                  if (problem) {
+                      showBanner(fileError, problem);
+                      setSubmitEnabled(false);
+                  }
+              });
+          }
+
+          // Upload progress via HTMX
+          const form = document.querySelector('#race-ready-form-container form');
+          const progressEl = document.getElementById('upload-progress');
+          const progressBar = document.getElementById('upload-bar');
+          const progressPct = document.getElementById('upload-pct');
+
+          function resetSubmitButton() {
+              if (!submitBtn) return;
+              setSubmitEnabled(true);
+              submitBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg> Submit Record';
+              if (progressEl) progressEl.classList.add('hidden');
+          }
+
+          if (form) {
+              form.addEventListener('htmx:xhr:progress', function (e) {
+                  if (e.detail.loaded && e.detail.total) {
+                      const pct = Math.round((e.detail.loaded / e.detail.total) * 100);
+                      progressBar.value = pct;
+                      progressPct.textContent = ' ' + pct + '%';
+                  }
+              });
+              form.addEventListener('htmx:beforeRequest', function () {
+                  clearBanner(submitError);
+                  if (fileInput && fileInput.files && fileInput.files.length > 0) {
+                      progressEl.classList.remove('hidden');
+                      progressBar.value = 0;
+                      progressPct.textContent = '';
+                  }
+                  setSubmitEnabled(false);
+                  submitBtn.innerHTML = '<span class="loading loading-spinner loading-sm"></span> Submitting...';
+              });
+              form.addEventListener('htmx:afterRequest', function () {
+                  if (progressEl) progressEl.classList.add('hidden');
+              });
+              form.addEventListener('htmx:responseError', function (e) {
+                  resetSubmitButton();
+                  // 413 is the one a rider can act on: the file got past the browser check but
+                  // the server or its proxy still refused the body.
+                  const status = (e.detail && e.detail.xhr) ? e.detail.xhr.status : 0;
+                  const message = status === 413
+                      ? 'That file was too large for the server to accept. Please trim or compress it below ' + maxMb + ' MB and try again.'
+                      : 'Your record was not submitted (server error ' + (status || 'unknown') + '). Please try again, or refresh the page if it keeps happening.';
+                  showBanner(submitError, message);
+              });
+              form.addEventListener('htmx:sendError', function () {
+                  resetSubmitButton();
+                  showBanner(submitError,
+                      'Your record was not submitted — the connection dropped. Large uploads are ' +
+                      'especially prone to this on a weak network. Please check your connection and try again.');
+              });
+              form.addEventListener('htmx:timeout', function () {
+                  resetSubmitButton();
+                  showBanner(submitError,
+                      'The upload timed out before it finished. A smaller or shorter clip will upload more reliably.');
+              });
+          }
+
+
+          // After an invalid submit HTMX swaps this whole partial back in with the errors
+          // rendered, but the page does not move -- so on a long form the rider sees the
+          // button stop spinning and nothing else. This script re-runs on every swap, so a
+          // rendered error is scrolled to exactly once, on arrival.
+          const serverError = document.querySelector('#race-ready-form-container .alert-error:not(.hidden)');
+          if (serverError) {
+              serverError.scrollIntoView({behavior: 'smooth', block: 'center'});
+          }
+      })();
+  </script>
+</div>

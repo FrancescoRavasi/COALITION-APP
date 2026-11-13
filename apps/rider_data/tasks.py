@@ -1,0 +1,344 @@
+"""Background tasks for rider_data."""
+
+from datetime import timedelta
+
+import logfire
+from constance import config
+from django.tasks import task
+from django.utils import timezone
+
+from apps.rider_data import client, services
+from apps.rider_data.models import RiderProfile
+from apps.zwift import client as zwift_client
+from gotta_bike_platform.config import settings as app_config
+
+
+@task
+def sync_rider_profiles() -> dict:
+    """Refresh cached rider profiles from zauth.
+
+    Two populations, fetched in two calls and merged here:
+
+    * everyone who races for the team -- members here, the ZwiftPower team page and the
+      ZwiftRacing club, see ``services.zwids_to_refresh``. That is roughly two thousand
+      riders, which the client sends in chunks of two hundred;
+    * everyone linked to this app, resolved by the service from ``connected_app`` so we do
+      not have to keep a local copy of that list in step.
+
+    They are two calls because the service **intersects** a zwid list with ``connected_app``
+    rather than unioning them (``riders_profiles_full`` in the zauth repo). Asking for both at
+    once would therefore return only riders who are both on our list and linked here -- which
+    would quietly drop every rider who races for the team without a linked account, the larger
+    part of the roster.
+
+    Riders the service holds no data for are absent from the response rather than returned
+    empty, so the stored count is legitimately lower than the requested count.
+
+    This task deliberately does not touch ``zwid_verified`` or any other verification field.
+    Connection status moves onto this source as its own step, because verification gates Race
+    Verified status and Discord roles, and ``zwift_connection.status`` does not mean what its
+    name suggests -- it reports whether a Zwift account exists service-wide, not whether the
+    rider is still linked to us.
+
+    Returns:
+        Counts of rows fetched, created, updated and skipped.
+
+    """
+    if not client.is_configured():
+        logfire.warning("Rider profile sync skipped: zauth service key not configured")
+        return {"fetched": 0, "created": 0, "updated": 0, "skipped": 0}
+
+    with logfire.span("sync_rider_profiles"):
+        requested = services.zwids_to_refresh()
+        by_zwid: dict[int, dict] = {}
+        for profile in client.fetch_profiles(requested):
+            by_zwid[profile.get("zwid")] = profile
+
+        connected_app = app_config.zwift_connected_app_name or None
+        connected = client.fetch_profiles(connected_app=connected_app) if connected_app else []
+        for profile in connected:
+            by_zwid[profile.get("zwid")] = profile
+
+        profiles = list(by_zwid.values())
+        result = services.store_profiles(profiles)
+        # Stamp everyone we asked about, so riders the service had nothing for do not drift
+        # toward eviction over a gap in upstream data rather than over leaving the set we have
+        # reason to hold. Only the zwid list needs this: the riders resolved from
+        # ``connected_app`` are exactly the ones that came back, and storing a row stamps it.
+        stamped = services.mark_requested(requested)
+        on_team = RiderProfile.objects.filter(zwid__in=list(by_zwid), on_zwiftpower_team=True).count()
+        if profiles and not on_team and config.ZWIFTPOWER_TEAM_ID:
+            # Every flag False or unknown: zauth does not sync our team's roster, or has not
+            # fetched it successfully, so no rider can be told apart as a team rider.
+            logfire.warning(
+                "No synced rider is on the ZwiftPower team roster",
+                team_id=config.ZWIFTPOWER_TEAM_ID,
+                fetched=len(profiles),
+            )
+        return {
+            "fetched": len(profiles),
+            "requested": len(requested),
+            "connected": len(connected),
+            "stamped": stamped,
+            "on_zwiftpower_team": on_team,
+            **result,
+        }
+
+
+@task
+def purge_rider_profiles() -> dict:
+    """Delete cached profiles we have stopped asking about, once the window has passed.
+
+    Anchored on ``last_requested_at`` -- when the rider was last INCLUDED IN A BATCH -- not on
+    ``fetched_at``, when data last came back. The two diverge for a rider the service holds
+    nothing for: we ask every cycle and store nothing every cycle, so ``fetched_at`` goes
+    stale while we are still asking. Anchoring there would evict them for a gap in upstream
+    data rather than for leaving the set, which is the one thing this sweep is meant to mean.
+
+    That works because the sync is not demand-driven. It asks about a defined set on a
+    schedule -- everyone who races for the team (``services.zwids_to_refresh``: members here,
+    the ZwiftPower team page and the ZwiftRacing club), plus every rider linked to this app -- so a
+    member is stamped every cycle whether or not anybody opens their profile. A stale
+    ``last_requested_at`` therefore does not mean "nobody looked at them", it means "we have
+    stopped having a reason to ask", which is the population worth evicting.
+
+    Race activity was the obvious-looking anchor and is the wrong one. It describes the rider
+    rather than our reason for holding them: someone who raced yesterday but has nothing to do
+    with this team should go, while a member who has not raced in two years should stay. It is
+    also derived from ZwiftPower results and excludes races with no club, so it is absent
+    entirely for anyone racing unattached -- a deletion policy resting on it would look
+    stricter than it is.
+
+    Window is ``RIDER_PROFILE_MAX_DAYS``, 120 days by default; 0 disables the sweep, matching
+    the convention the analytics and verification sweeps already use.
+
+    Returns:
+        Counts of rows ``considered`` and ``deleted``, and the cutoff applied.
+
+    """
+    max_days = config.RIDER_PROFILE_MAX_DAYS
+    if not max_days or max_days <= 0:
+        logfire.info("Rider profile retention disabled, skipping sweep")
+        return {"considered": 0, "deleted": 0, "cutoff": None}
+
+    # A broken sync looks exactly like every rider leaving at once: nothing gets stamped, so
+    # every row ages past the window together. Without this the first purge after a long
+    # outage would empty the cache, and the cause would be 120 days in the past.
+    last_sync = services.last_successful_sync()
+    if last_sync is None or timezone.now() - last_sync > timedelta(days=max_days):
+        logfire.error(
+            "Rider profile purge refused: no recent successful sync",
+            last_successful_sync=last_sync.isoformat() if last_sync else None,
+            max_days=max_days,
+        )
+        return {"considered": 0, "deleted": 0, "cutoff": None, "refused": "stale_sync"}
+
+    cutoff = timezone.now() - timedelta(days=max_days)
+    # Current members are never evicted. Ageing one out would only have the next sync
+    # re-create the row, so this is churn prevention as much as anything -- and it is what
+    # makes "removed if not a member" mean demotion rather than deletion: losing membership
+    # does not delete the row, it stops protecting it.
+    stale = RiderProfile.objects.filter(last_requested_at__lt=cutoff).exclude(
+        zwid__in=services.protected_zwids()
+    )
+    considered = stale.count()
+    total = RiderProfile.objects.count()
+
+    # Second backstop, for the case the first cannot see: a sync that succeeds while asking
+    # for the wrong set still stamps nobody. A single run should never remove most of the
+    # cache, so an unusually large sweep is treated as a symptom rather than carried out.
+    limit = config.RIDER_PROFILE_PURGE_MAX_FRACTION
+    if total and limit and (considered / total) > limit:
+        logfire.error(
+            "Rider profile purge refused: would remove an implausible share of the cache",
+            considered=considered,
+            total=total,
+            fraction=round(considered / total, 3),
+            limit=limit,
+        )
+        return {"considered": considered, "deleted": 0, "cutoff": cutoff.isoformat(), "refused": "too_many"}
+
+    deleted, _ = stale.delete()
+
+    logfire.info(
+        "Purged stale rider profiles",
+        considered=considered,
+        deleted=deleted,
+        max_days=max_days,
+        cutoff=cutoff.isoformat(),
+    )
+    return {"considered": considered, "deleted": deleted, "cutoff": cutoff.isoformat()}
+
+
+# zauth answers the refresh trigger immediately and does the actual fetching on its own
+# worker, so the updated document is not there when we ask. These bound how long we keep
+# coming back for it: three tries, roughly two minutes, then give up and let the nightly
+# sync collect whatever landed.
+PULL_DELAY_SECONDS = 40
+MAX_PULL_ATTEMPTS = 3
+
+
+SOURCES = ("zwiftpower", "zwiftracing")
+
+
+def source_stamps(zwid: int) -> dict[str, str]:
+    """Read the cached row's per-source fetch times, as the service reported them.
+
+    These are what the pull watches to tell a landed refresh from an unchanged one. Both now
+    move: zauth's zwiftpower refresh re-fetches the team roster the rider's profile row comes
+    from as well as their race history, so its stamp advances alongside zwiftracing's.
+
+    Args:
+        zwid: The rider's Zwift id.
+
+    Returns:
+        One ISO stamp per source, "" where we hold no row or the source has never been fetched.
+
+    """
+    sources = RiderProfile.objects.filter(zwid=zwid).values_list("sources", flat=True).first() or {}
+    return {source: (sources.get(source) or {}).get("fetched_at") or "" for source in SOURCES}
+
+
+@task
+def pull_rider_profile(
+    zwid: int,
+    *,
+    awaiting: list[str] | None = None,
+    baseline: dict[str, str] | None = None,
+    attempt: int = 1,
+) -> dict:
+    """Fetch one rider's profile from zauth and store it, retrying while a refresh is in flight.
+
+    Split from the trigger on purpose. ``client.request_refresh`` only asks the service to go
+    and look; this is what collects the answer, so it has to run *after* the service's own
+    worker has finished — an unknown amount of time later, which is why it re-enqueues itself
+    instead of sleeping and holding a worker slot open.
+
+    ``awaiting`` names the sources the trigger actually queued, so there is a reason to expect
+    their stamps to move. With none of them (everything was throttled upstream) a single pull
+    is correct: our cache can still be behind what the service already holds, but nothing new
+    is coming, so waiting for it would just be three identical requests.
+
+    A queued source can still fail to move its stamp — zauth debounces the roster fetch behind
+    the zwiftpower half, and a rider on none of its synced teams has no profile row to refresh
+    at all. That is what ``MAX_PULL_ATTEMPTS`` is for: the cost of guessing wrong is three
+    small requests over about two minutes, not an open-ended poll.
+
+    Args:
+        zwid: The rider's Zwift id.
+        awaiting: Sources queued upstream, whose stamps a landed refresh should move.
+        baseline: The stamps before the trigger, keyed by source.
+        attempt: 1-based try counter, used to stop re-enqueueing.
+
+    Returns:
+        Whether the refreshed data ``landed``, the ``attempt`` this ran as, and the store
+        counts.
+
+    """
+    if not client.is_configured():
+        logfire.warning("Rider profile pull skipped: zauth service key not configured", zwid=zwid)
+        return {"landed": False, "attempt": attempt, "stored": 0}
+
+    awaiting = awaiting or []
+    baseline = baseline or {}
+
+    profiles = client.fetch_profiles([zwid])
+    result = services.store_profiles(profiles)
+    services.mark_requested([zwid])
+
+    # Any one of them moving is enough: the caller asked for a refresh, not for every source
+    # to have something new, and a source with genuinely nothing new would otherwise hold the
+    # whole thing back for the full retry budget.
+    current = source_stamps(zwid)
+    landed = not awaiting or any(current[source] != baseline.get(source, "") for source in awaiting)
+
+    if not landed and attempt < MAX_PULL_ATTEMPTS:
+        pull_rider_profile.using(run_after=timezone.now() + timedelta(seconds=PULL_DELAY_SECONDS)).enqueue(
+            zwid,
+            awaiting=awaiting,
+            baseline=baseline,
+            attempt=attempt + 1,
+        )
+        logfire.info("Rider profile pull found nothing new, will retry", zwid=zwid, attempt=attempt)
+
+    logfire.info("Pulled rider profile", zwid=zwid, attempt=attempt, landed=landed, stored=len(profiles))
+    return {"landed": landed, "attempt": attempt, "stored": len(profiles), **result}
+
+
+@task
+def refresh_zwift_profile(user_id: int) -> dict:
+    """Re-read a connected rider's Zwift profile now, then bring our cached copy up to date.
+
+    Run when a rider submits a weight or height verification, and from the review page's
+    "Refresh height and weight" button, so the reviewer compares the submission with what
+    the rider has set in Zwift today rather than with the last scheduled read.
+
+    Two halves, as with ``request_profile_refresh``, but a different endpoint. This one is
+    app-scoped (our key, our user id) and only covers the Zwift API profile, where weight and
+    height live. It is also synchronous: the service has read Zwift and stored the result by
+    the time it answers. The review page's Zwift Auth panel reads that stored copy directly,
+    so it is current as soon as this returns. The pull is for ``RiderProfile``, which the
+    service builds from its stored rows on every request, so it can be enqueued straight away
+    rather than retried on a timer.
+
+    A throttled answer (``refreshed: false``, profile read under a minute ago) still pulls,
+    because our cache can be older than the service's copy. A failed one does not: the
+    service kept its stored profile, so there is nothing new to bring over.
+
+    Args:
+        user_id: The platform user's primary key.
+
+    Returns:
+        Whether the service ``reached`` us with a profile, whether it ``refreshed`` it from
+        Zwift, and the ``zwid`` pulled into the cache (None when nothing was pulled).
+
+    """
+    profile = zwift_client.refresh_racing_profile(str(user_id))
+    if profile is None:
+        # The client has logged why: not connected, rate limited, or unreachable.
+        return {"reached": False, "refreshed": False, "zwid": None}
+
+    refreshed = bool(profile.get("refreshed"))
+    raw_zwid = str(profile.get("zwid") or "")
+    # isascii as well: "٣".isdigit() is True and int() reads it as 3.
+    zwid = int(raw_zwid) if raw_zwid.isascii() and raw_zwid.isdigit() else None
+    if zwid:
+        pull_rider_profile.enqueue(zwid)
+
+    logfire.info("Refreshed Zwift profile on request", user_id=user_id, zwid=zwid, refreshed=refreshed)
+    return {"reached": True, "refreshed": refreshed, "zwid": zwid or None}
+
+
+def request_profile_refresh(zwid: int) -> dict:
+    """Ask zauth to re-check a rider upstream, and schedule the pull that brings it back.
+
+    The two halves belong together: triggering without pulling leaves the fresh data sitting
+    on the service until the nightly sync, and pulling without triggering just re-reads what
+    we already have.
+
+    Args:
+        zwid: The rider's Zwift id.
+
+    Returns:
+        ``reached`` (whether the service answered at all) and the per-source statuses it gave,
+        which are what the caller should tell the rider — "queued" means a fetch is running,
+        "skipped" means that source was refreshed too recently to check again.
+
+    """
+    baseline = source_stamps(zwid)
+    outcome = client.request_refresh(zwid)
+
+    statuses = {source: ((outcome or {}).get(source) or {}).get("status") or "unknown" for source in SOURCES}
+    queued = [source for source, status in statuses.items() if status == "queued"]
+
+    # Pull either way. A throttled trigger still means the service may hold data newer than
+    # our cache -- the button is the only thing that pulls a single rider off-schedule, so
+    # declining to pull would make "nothing was queued" look like "nothing happened".
+    delay = PULL_DELAY_SECONDS if queued else 0
+    pull_rider_profile.using(run_after=timezone.now() + timedelta(seconds=delay)).enqueue(
+        zwid,
+        awaiting=queued,
+        baseline=baseline,
+    )
+
+    return {"reached": outcome is not None, "statuses": statuses, "queued": queued}

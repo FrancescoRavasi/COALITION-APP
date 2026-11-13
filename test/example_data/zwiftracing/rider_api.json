@@ -1,0 +1,93 @@
+{
+  "riderId": 9000004,
+  "name": "Test Rider 4",
+  "gender": "M",
+  "country": "de",
+  "age": "Mas",
+  "height": 175,
+  "weight": 68.5,
+  "zpCategory": "D",
+  "zpFTP": 180,
+  "power": {
+    "wkg5": 9.4599,
+    "wkg15": 7.6204,
+    "wkg30": 6.0438,
+    "wkg60": 4.8613,
+    "wkg120": 4.073,
+    "wkg300": 3.5474,
+    "wkg1200": 2.7591,
+    "w5": 648,
+    "w15": 522,
+    "w30": 414,
+    "w60": 333,
+    "w120": 279,
+    "w300": 243,
+    "w1200": 189,
+    "CP": 185.0,
+    "AWC": 18500.5,
+    "compoundScore": 1250.5
+  },
+  "race": {
+    "last": {
+      "rating": 1516.0539,
+      "date": 1735689600,
+      "mixed": {
+        "category": "Sapphire",
+        "number": 4
+      }
+    },
+    "current": {
+      "rating": 1516.0539,
+      "date": 1735776000,
+      "mixed": {
+        "category": "Sapphire",
+        "number": 4
+      }
+    },
+    "max30": {
+      "rating": 1528.8039,
+      "date": 1735689600,
+      "expires": 1738368000,
+      "mixed": {
+        "category": "Sapphire",
+        "number": 4
+      }
+    },
+    "max90": {
+      "rating": 1536.3039,
+      "date": 1730419200,
+      "expires": 1743465600,
+      "mixed": {
+        "category": "Sapphire",
+        "number": 4
+      }
+    },
+    "finishes": 31,
+    "dnfs": 3,
+    "wins": 2,
+    "podiums": 7
+  },
+  "handicaps": {
+    "profile": {
+      "flat": -1.5,
+      "rolling": -2.25,
+      "hilly": -3.0,
+      "mountainous": -4.75
+    }
+  },
+  "phenotype": {
+    "scores": {
+      "sprinter": 3.5,
+      "puncheur": 2.75,
+      "pursuiter": 4.25,
+      "climber": 3,
+      "tt": 2.5
+    },
+    "value": "Pursuiter",
+    "bias": 6.75
+  },
+  "club": {
+    "id": 99999,
+    "name": "TEST CLUB"
+  }
+}

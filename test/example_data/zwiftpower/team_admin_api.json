@@ -1,0 +1,109 @@
+{
+  "data": [
+    {
+      "div": 30,
+      "divw": 0,
+      "flag": "us",
+      "r": "100",
+      "ftp": [
+        "250",
+        0
+      ],
+      "name": "Test Rider 1",
+      "aid": "9200001",
+      "age": "Vet",
+      "zada": 0,
+      "w": [
+        "72.5",
+        0
+      ],
+      "rank": "250.5",
+      "skill": 150,
+      "distance": 1200000,
+      "climbed": 15000,
+      "energy": 480000,
+      "time": 180000,
+      "skill_race": 60,
+      "skill_seg": 45,
+      "skill_power": 45,
+      "zwid": 9000001,
+      "status": "",
+      "reg": 1,
+      "email": "",
+      "h_1200_watts": "262",
+      "h_1200_wkg": "3.6",
+      "h_15_watts": "725",
+      "h_15_wkg": "10.0"
+    },
+    {
+      "div": 20,
+      "divw": 0,
+      "flag": "gb",
+      "r": "101",
+      "ftp": [
+        "295",
+        0
+      ],
+      "name": "Test Rider 2",
+      "aid": "9200002",
+      "age": "50+",
+      "zada": 0,
+      "w": [
+        "80.0",
+        0
+      ],
+      "rank": "260.5",
+      "skill": 151,
+      "distance": 1250000,
+      "climbed": 15500,
+      "energy": 490000,
+      "time": 185000,
+      "skill_race": 61,
+      "skill_seg": 46,
+      "skill_power": 46,
+      "zwid": 9000002,
+      "status": "",
+      "reg": 1,
+      "email": "",
+      "h_1200_watts": "310",
+      "h_1200_wkg": "3.9",
+      "h_15_watts": "856",
+      "h_15_wkg": "10.7"
+    },
+    {
+      "div": 0,
+      "divw": 40,
+      "flag": "ca",
+      "r": "102",
+      "ftp": [
+        "205",
+        0
+      ],
+      "name": "Test Rider 3",
+      "aid": "9200003",
+      "age": "Snr",
+      "zada": 0,
+      "w": [
+        "61.0",
+        0
+      ],
+      "rank": "270.5",
+      "skill": 152,
+      "distance": 1300000,
+      "climbed": 16000,
+      "energy": 500000,
+      "time": 190000,
+      "skill_race": 62,
+      "skill_seg": 47,
+      "skill_power": 47,
+      "zwid": 9000003,
+      "status": "",
+      "reg": 1,
+      "email": "",
+      "h_1200_watts": "215",
+      "h_1200_wkg": "3.5",
+      "h_15_watts": "594",
+      "h_15_wkg": "9.7"
+    }
+  ]
+}
