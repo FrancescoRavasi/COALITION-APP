@@ -22,8 +22,10 @@ echo "Seeding vELO2 route factor weights (if empty)..."
 uv run manage.py import_velo_weights --if-empty || echo "warning: vELO seed failed (retry via Load vELO weights)"
 
 # Create superuser if not exists
-#echo "Creating superuser if not exists..."
-#uv run manage.py ensuresuperuser
+if [ -n "$SUPERUSER_EMAIL" ]; then
+  echo "Creating superuser..."
+  uv run python manage.py ensuresuperuser || true
+fi
 
 # Start the background task worker
 echo "Starting background task worker..."

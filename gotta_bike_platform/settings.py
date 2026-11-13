@@ -485,7 +485,7 @@ CONSTANCE_CONFIG = {
     # Team identity
     "TEAM_NAME": ("The Coalition", "Name of the team", str),
     "GUILD_NAME": ("The Coalition", "Name of the Discord guild/server", str),
-    "GUILD_ID": (1317875072089981021, "Discord guild/server ID", int),
+    "GUILD_ID": (int(os.environ.get("GUILD_ID") or os.environ.get("DISCORD_GUILD_ID") or 1317875072089981021), "Discord guild/server ID", int),
     "UPGRADE_CHANNEL": (0, "Discord channel ID for upgrade notifications", int),
     "NEW_ARRIVALS_CHANNEL_ID": (0, "Discord channel ID for new arrival welcome messages", int),
     "USER_CHANGE_LOG": (0, "Member status changes posted to this channel", int),
