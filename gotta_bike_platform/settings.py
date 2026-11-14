@@ -445,6 +445,7 @@ CONSTANCE_ADDITIONAL_FIELDS = {
         {
             "widget": "django.forms.PasswordInput",
             "widget_kwargs": {"render_value": True},
+            "required": False,
         },
     ],
     "json_list_field": [
