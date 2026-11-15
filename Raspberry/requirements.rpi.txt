@@ -1,0 +1,63 @@
+# requirements.rpi.txt — dipendenze Python per Raspberry Pi 3 (arm32v7/arm64)
+# Generato da pyproject.toml — compatibile con Python 3.11
+#
+# DIFFERENZE rispetto all'originale:
+#   - granian rimosso      → usa gunicorn
+#   - pi-heif rimosso      → dipendenze native non disponibili su arm32v7
+#   - logfire[asgi,...] → logfire base (strumentazione ASGI/Django disabilitata via settings)
+#   - gunicorn aggiunto
+#   - django vincolato a >=4.2,<6 (Django 6 richiede Python 3.14)
+
+# Web server
+gunicorn>=21.2.0
+
+# Django e plugin core
+django>=4.2,<6
+django-allauth[mfa,socialaccount]>=0.63.0
+django-constance>=4.5.0
+django-cors-headers>=4.3.0
+django-countries>=7.5.1
+django-htmx>=1.17.0
+django-ninja>=1.0.0
+django-ratelimit>=4.0.0
+django-simple-history>=3.4.0
+django-storages>=1.14.0
+django-tailwind[honcho]>=3.8.0
+django-tasks>=0.5.0
+django-tasks-db>=0.5.0
+
+# Database
+dj-database-url>=2.1.0
+psycopg[binary]>=3.1.18
+
+# Google APIs
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+gspread>=6.0.0
+
+# HTTP & networking
+httpx>=0.26.0
+beautifulsoup4>=4.12.0
+boto3>=1.28.0
+
+# Scheduler
+apscheduler>=3.10.4
+honcho>=1.1.0
+
+# UI / templating
+datastar-py>=0.1.0
+justhtml>=0.5.0
+markdown>=3.5.0
+
+# Pydantic
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Immagini (senza pi-heif per arm32v7)
+pillow>=10.0.0
+
+# Static files
+whitenoise>=6.6.0
+
+# Osservabilità — solo logfire base, senza strumentazione ASGI/Django
+logfire>=0.50.0

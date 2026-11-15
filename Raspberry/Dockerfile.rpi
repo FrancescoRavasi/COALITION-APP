@@ -1,0 +1,44 @@
+# Dockerfile per Raspberry Pi 3 Model B+ (arm32v7 / arm64)
+# Usa python:3.11-slim — Python 3.14 non è stabile su arm32v7
+FROM python:3.11-slim
+
+# Variabili d'ambiente base
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DJANGO_SETTINGS_MODULE=gotta_bike_platform.settings_rpi
+
+WORKDIR /app
+
+# Dipendenze di sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    gcc \
+    nodejs \
+    npm \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia e installa le dipendenze Python
+COPY Raspberry/requirements.rpi.txt /app/requirements.rpi.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.rpi.txt
+
+# Copia tutto il progetto
+COPY . /app/
+
+# Copia il settings RPi nella posizione corretta
+COPY Raspberry/settings_rpi.py /app/gotta_bike_platform/settings_rpi.py
+
+# Build Tailwind CSS
+RUN python manage.py tailwind install --no-input && \
+    python manage.py tailwind build --no-input
+
+# Raccoglie i file statici
+RUN python manage.py collectstatic --no-input
+
+# Rendi eseguibile l'entrypoint
+RUN chmod +x /app/Raspberry/entrypoint.rpi.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/Raspberry/entrypoint.rpi.sh"]
