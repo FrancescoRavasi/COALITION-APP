@@ -189,13 +189,16 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
         """
         discord_id = sociallogin.account.extra_data.get("id")
         guild_id = config.GUILD_ID
+        print(f"[AUTH] Starting guild check: user_discord_id={discord_id}, target_GUILD_ID={guild_id}", flush=True)
         if not guild_id:
+            print("[AUTH] GUILD_ID is not configured (0 or empty); refusing login", flush=True)
             logfire.error("GUILD_ID is not configured; refusing Discord login", discord_id=discord_id)
             return login_help.GuildCheck(login_help.GuildStatus.UNCONFIGURED)
 
         # A login without a token is refused like any other failure, not answered with a 500.
         access_token = getattr(sociallogin.token, "token", None)
         if not access_token:
+            print("[AUTH] ERROR: Discord login carried no access token on sociallogin.token!", flush=True)
             logfire.error("Discord login carried no access token", discord_id=discord_id)
             return login_help.GuildCheck(login_help.GuildStatus.UNAVAILABLE)
 
@@ -205,8 +208,10 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
                 headers={"Authorization": f"Bearer {access_token}"},
                 timeout=10.0,
             )
+            print(f"[AUTH] Discord /users/@me/guilds HTTP response: {response.status_code}", flush=True)
         except httpx.HTTPError as e:
             # No str(e): httpx quotes the request in its message, and the type says enough.
+            print(f"[AUTH] ERROR: Exception fetching Discord guilds: {type(e).__name__} {e}", flush=True)
             logfire.error(
                 "Failed to fetch Discord guilds",
                 error_type=type(e).__name__,
@@ -221,6 +226,7 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
                 retry_after = response.json().get("retry_after")
             except ValueError, AttributeError:
                 retry_after = response.headers.get("Retry-After")
+            print(f"[AUTH] 429 RATE LIMITED by Discord during guild check! retry_after={retry_after}", flush=True)
             logfire.warning(
                 "Discord API rate limited during guild membership check",
                 discord_id=discord_id,
@@ -231,9 +237,11 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
         try:
             response.raise_for_status()
             user_guild_ids = {int(g["id"]) for g in response.json()}
+            print(f"[AUTH] User is member of {len(user_guild_ids)} servers: {list(user_guild_ids)[:10]}...", flush=True)
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as e:
             # No str(e): a 401's "Unauthorized" would have it scrubbed in production anyway,
             # and the status code and type carry what it says.
+            print(f"[AUTH] ERROR: Could not read Discord guilds: {type(e).__name__}, status={response.status_code}", flush=True)
             logfire.error(
                 "Failed to read Discord guilds",
                 error_type=type(e).__name__,
@@ -243,6 +251,7 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
             return login_help.GuildCheck(login_help.GuildStatus.UNAVAILABLE)
 
         if int(guild_id) not in user_guild_ids:
+            print(f"[AUTH] REFUSED: Configured GUILD_ID ({guild_id}) is NOT in user's servers!", flush=True)
             logfire.warning(
                 "User not in required guild",
                 discord_id=discord_id,
@@ -250,6 +259,7 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
                 user_guild_count=len(user_guild_ids),
             )
             return login_help.GuildCheck(login_help.GuildStatus.NOT_MEMBER, guild_count=len(user_guild_ids))
+        print(f"[AUTH] SUCCESS: User is a member of target guild ({guild_id})!", flush=True)
         return login_help.GuildCheck(login_help.GuildStatus.MEMBER, guild_count=len(user_guild_ids))
 
     def _check_not_blocked(self, request, sociallogin):
@@ -579,6 +589,7 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
 
         """
         exception_str = str(exception) if exception else ""
+        print(f"[AUTH] on_authentication_error: provider={provider}, error={error}, exception={exception}", flush=True)
 
         # The exception text and extra context are not logged: an OAuth error can quote the
         # callback URL or its state, and an "Unauthorized" in them gets the value scrubbed anyway.
