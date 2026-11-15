@@ -171,6 +171,14 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
         """
         return True
 
+    def get_requests_session(self):
+        """Configure requests.Session with browser User-Agent to avoid Cloudflare 1015 blocks."""
+        session = super().get_requests_session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        })
+        return session
+
     def _guild_membership(self, sociallogin) -> login_help.GuildCheck:
         """Check live, with the rider's own token, that they are in the team's Discord server.
 
@@ -205,7 +213,10 @@ class DiscordSocialAccountAdapter(DefaultSocialAccountAdapter):
         try:
             response = httpx.get(
                 "https://discord.com/api/v10/users/@me/guilds",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                },
                 timeout=10.0,
             )
             print(f"[AUTH] Discord /users/@me/guilds HTTP response: {response.status_code}", flush=True)
